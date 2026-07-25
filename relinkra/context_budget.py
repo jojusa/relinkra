@@ -82,6 +82,12 @@ Hard rules:
 - Warnings are never removed by the ladder and the budget layer never
   ADDS warnings: omissions are reported in the budget report and in
   ``diagnostics["budget"]``, keeping warning bytes identical.
+- OPTIONAL pre-budget ranking (R1G): ``apply_budget(..., relevance=...)``
+  accepts a RankedContext for the same packet. The ladder STRUCTURE is
+  unchanged (essential protected, snippet steps 1-2, class order of
+  steps 3-5); only the removal order inside steps 3-5 becomes ascending
+  relevance instead of from-end. With ``relevance=None`` the accountant
+  is byte-identical to plain R1F.
 - Hard guarantee: when status is OK, ``estimate_tokens`` of the budgeted
   packet's compact JSON is <= ``max_estimated_tokens`` (and its length is
   <= ``max_characters`` when set). The ladder targets
@@ -371,7 +377,9 @@ class ContextUsage:
 class BudgetedContext:
     """Result of applying a budget: the bounded packet (or None when
     unsatisfiable) plus the full audit trail. No timestamps: the report is
-    byte-identical for identical inputs; ``report_id`` is content-hashed."""
+    byte-identical for identical inputs; ``report_id`` is content-hashed.
+    ``relevance_version`` records the R1G ranker when one guided the
+    ladder (None otherwise)."""
 
     original_packet_id: str
     budget: ContextBudget
@@ -382,6 +390,7 @@ class BudgetedContext:
     packet: Optional[ContextPacket]
     satisfied: bool
     report_id: str = ""
+    relevance_version: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -391,6 +400,7 @@ class BudgetedContext:
             "original_packet_id": self.original_packet_id,
             "status": self.status,
             "satisfied": self.satisfied,
+            "relevance_version": self.relevance_version,
             "budget": self.budget.to_dict(),
             "original_usage": self.original_usage.to_dict(),
             "final_usage": self.final_usage.to_dict(),
@@ -419,6 +429,7 @@ class BudgetedContext:
             ),
             satisfied=bool(data.get("satisfied")),
             report_id=str(data.get("report_id") or ""),
+            relevance_version=data.get("relevance_version"),
         )
 
     def to_json(self, *, pretty: bool = False) -> str:
@@ -683,16 +694,56 @@ def _source_id(section: str, item: PacketItem) -> str:
 # -- the accountant ------------------------------------------------------------
 
 
-def apply_budget(packet: ContextPacket, budget: ContextBudget) -> BudgetedContext:
+def apply_budget(
+    packet: ContextPacket,
+    budget: ContextBudget,
+    *,
+    relevance=None,
+) -> BudgetedContext:
     """Apply the fixed reduction ladder. Returns a BudgetedContext; never
     raises for an over-budget packet (typed BUDGET_UNSATISFIABLE instead)
     and never mutates the input packet. The ladder measures the packet
     WITH its final budget diagnostics, so the hard guarantee covers the
-    exact shipped payload."""
+    exact shipped payload.
+
+    ``relevance`` is an optional R1G RankedContext for THIS packet (its
+    ``original_packet_id`` must match, and when it carries a
+    ``packet_fingerprint`` the scored-section (source_id, occurrence)
+    layout must match too — packet ids are content-insensitive). When supplied, the ladder
+    STRUCTURE is unchanged — essential stays protected, snippet steps
+    1-2 are untouched, and the class order of steps 3-5 is preserved —
+    but the REMOVAL ORDER inside steps 3, 4 and 5 becomes ascending
+    relevance (lowest total first, ties by the documented R1G chain)
+    instead of strictly-from-end. With ``relevance=None`` behavior is
+    byte-identical to plain R1F."""
     _validate_inputs(packet, budget)
+    if relevance is not None:
+        if getattr(relevance, "original_packet_id", None) != packet.packet_id:
+            raise BudgetValidationError(
+                "relevance ranking does not belong to this packet"
+            )
+        fingerprint = getattr(relevance, "packet_fingerprint", None)
+        if fingerprint:
+            from .relevance import packet_fingerprint
+
+            if fingerprint != packet_fingerprint(packet):
+                raise BudgetValidationError(
+                    "relevance ranking does not belong to this packet"
+                )
     cpt = budget.chars_per_token
     original_usage = _usage(packet, cpt)
     working = prepare_budgeted_packet(packet, budget)
+
+    # Original-packet occurrence per working item, computed BEFORE any
+    # removal: identical to the from-end prefix counting when relevance
+    # is None, and correct for arbitrary relevance-driven removal order.
+    occ_map: Dict[int, int] = {}
+    for section in _ITEM_SECTIONS:
+        counters: Dict[str, int] = {}
+        for item in getattr(working, section):
+            sid = _source_id(section, item)
+            occ_map[id(item)] = counters.get(sid, 0)
+            counters[sid] = counters.get(sid, 0) + 1
 
     actions: Dict[Tuple[str, str, int], Tuple[str, str]] = {}
 
@@ -729,7 +780,7 @@ def apply_budget(packet: ContextPacket, budget: ContextBudget) -> BudgetedContex
 
     while not fits():
         snapshot = working.to_json()
-        _ladder(working, actions, fits)
+        _ladder(working, actions, fits, occ_map, relevance)
         if working.to_json() == snapshot:
             break  # ladder exhausted: budget is unsatisfiable
 
@@ -740,7 +791,7 @@ def apply_budget(packet: ContextPacket, budget: ContextBudget) -> BudgetedContex
         satisfied = False
         _budget_stats(packet, working, budget, actions, False)
 
-    decisions = _build_decisions(packet, working, actions, cpt)
+    decisions = _build_decisions(packet, working, actions, cpt, occ_map)
     status = STATUS_OK if satisfied else STATUS_UNSATISFIABLE
     final_packet = working if satisfied else None
     final_usage = _usage(working, cpt, decisions)
@@ -753,6 +804,11 @@ def apply_budget(packet: ContextPacket, budget: ContextBudget) -> BudgetedContex
         decisions=decisions,
         packet=final_packet,
         satisfied=satisfied,
+        relevance_version=(
+            getattr(relevance, "relevance_version", None)
+            if relevance is not None
+            else None
+        ),
     )
     result.report_id = _report_id(packet.packet_id, budget, decisions)
     return result
@@ -779,6 +835,8 @@ def _ladder(
     working: ContextPacket,
     actions: Dict[Tuple[str, str, int], Tuple[str, str]],
     fits,
+    occ_map: Dict[int, int],
+    relevance,
 ) -> None:
     # Step 1: truncate oversized snippets to the fixed ladder cap.
     counters: Dict[str, int] = {}
@@ -811,6 +869,20 @@ def _ladder(
                 ACTION_REFERENCE_ONLY,
                 REASON_SNIPPET_LADDER,
             )
+    if relevance is None:
+        _ladder_fixed_order(working, actions, fits, occ_map)
+    else:
+        _ladder_ranked_order(working, actions, fits, occ_map, relevance)
+
+
+def _ladder_fixed_order(
+    working: ContextPacket,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+    fits,
+    occ_map: Dict[int, int],
+) -> None:
+    """Steps 3-5 exactly as plain R1F: removal from the END of each list.
+    Byte-identical to the pre-relevance accountant."""
     # Step 3: omit optional memories, from the END of the list first.
     index = len(working.memories) - 1
     while index >= 0:
@@ -819,11 +891,8 @@ def _ladder(
         item = working.memories[index]
         if classify_memory_type(item.data.get("memory_type")) == "optional":
             sid = _source_id("memories", item)
-            occurrence = _occurrence_index(
-                working.memories, "memories", sid, index
-            )
             working.memories.pop(index)
-            actions[("memory", sid, occurrence)] = (
+            actions[("memory", sid, occ_map[id(item)])] = (
                 ACTION_OMITTED,
                 REASON_OPTIONAL_EXHAUSTED,
             )
@@ -834,10 +903,7 @@ def _ladder(
             return
         item = working.code_facts.pop()
         sid = _source_id("code_facts", item)
-        occurrence = _occurrence_index(
-            working.code_facts, "code_facts", sid, len(working.code_facts)
-        )
-        actions[("code_fact", sid, occurrence)] = (
+        actions[("code_fact", sid, occ_map[id(item)])] = (
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
@@ -850,11 +916,7 @@ def _ladder(
             item = items.pop()
             sid = _source_id(section, item)
             actions[
-                (
-                    _SECTION_KINDS[section],
-                    sid,
-                    _occurrence_index(items, section, sid, len(items)),
-                )
+                (_SECTION_KINDS[section], sid, occ_map[id(item)])
             ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
     while len(working.code_references) > 1:
         if fits():
@@ -862,30 +924,113 @@ def _ladder(
         item = working.code_references.pop()
         sid = _source_id("code_references", item)
         actions[
-            (
-                "code_reference",
-                sid,
-                _occurrence_index(
-                    working.code_references,
-                    "code_references",
-                    sid,
-                    len(working.code_references),
-                ),
-            )
+            ("code_reference", sid, occ_map[id(item)])
         ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
 
 
-def _occurrence_index(
-    items: List[PacketItem], section: str, source_id: str, upto: int
-) -> int:
-    """0-based occurrence count of a (section, source_id) pair among the
-    first ``upto`` items. Because the ladder only ever removes items from
-    the END, the surviving prefix keeps the original packet order, so the
-    count of matching predecessors equals the occurrence index in the
-    original packet."""
-    return sum(
-        1 for j in range(upto) if _source_id(section, items[j]) == source_id
-    )
+def _rank_positions(relevance, section: str) -> Dict[Tuple[str, int], int]:
+    """(source_id, occurrence) -> best-first position in the R1G ranking."""
+    positions: Dict[Tuple[str, int], int] = {}
+    for position, score in enumerate(relevance.scores.get(section, ())):
+        positions[(score.source_id, score.occurrence_index)] = position
+    return positions
+
+
+def _worst_first(
+    items: List[PacketItem],
+    section: str,
+    positions: Dict[Tuple[str, int], int],
+    occ_map: Dict[int, int],
+) -> List[PacketItem]:
+    """Ascending relevance (worst first). The R1G best-first order already
+    encodes the full tie-break chain (total DESC -> type_rank ASC ->
+    timestamp DESC -> source_id ASC, duplicates in packet order), so
+    reversing it removes lowest-score first and, on exact ties, the
+    highest occurrence index first — matching the from-end R1F tie rule.
+    Unscored items (defensive; cannot happen for a matching packet_id)
+    sort worst so the budget sheds unknowns first."""
+
+    def position(item: PacketItem):
+        sid = _source_id(section, item)
+        return positions.get((sid, occ_map[id(item)]), float("inf"))
+
+    return sorted(items, key=position, reverse=True)
+
+
+def _remove_item(items: List[PacketItem], item: PacketItem) -> None:
+    """Remove by identity (duplicated PacketItems may compare equal)."""
+    for index, candidate in enumerate(items):
+        if candidate is item:
+            items.pop(index)
+            return
+
+
+def _ladder_ranked_order(
+    working: ContextPacket,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+    fits,
+    occ_map: Dict[int, int],
+    relevance,
+) -> None:
+    """Steps 3-5 with R1G guidance: same ladder STRUCTURE, but removal
+    inside each step is ascending relevance instead of from-end."""
+    # Step 3: omit optional memories, lowest relevance first.
+    positions = _rank_positions(relevance, "memories")
+    optional = [
+        item
+        for item in working.memories
+        if classify_memory_type(item.data.get("memory_type")) == "optional"
+    ]
+    for item in _worst_first(optional, "memories", positions, occ_map):
+        if fits():
+            return
+        sid = _source_id("memories", item)
+        _remove_item(working.memories, item)
+        actions[("memory", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_OPTIONAL_EXHAUSTED,
+        )
+    # Step 4: omit code_facts beyond the FIRST (the direct focus),
+    # lowest relevance first.
+    positions = _rank_positions(relevance, "code_facts")
+    extras = list(working.code_facts[1:])
+    for item in _worst_first(extras, "code_facts", positions, occ_map):
+        if fits():
+            return
+        if len(working.code_facts) <= 1:
+            return
+        sid = _source_id("code_facts", item)
+        _remove_item(working.code_facts, item)
+        actions[("code_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_OPTIONAL_EXHAUSTED,
+        )
+    # Step 5: omit important items, lowest relevance first per list.
+    for section in ("memories", "pending", "handoffs"):
+        items = getattr(working, section)
+        positions = _rank_positions(relevance, section)
+        for item in _worst_first(list(items), section, positions, occ_map):
+            if fits():
+                return
+            sid = _source_id(section, item)
+            _remove_item(items, item)
+            actions[
+                (_SECTION_KINDS[section], sid, occ_map[id(item)])
+            ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
+    positions = _rank_positions(relevance, "code_references")
+    ref_extras = list(working.code_references[1:])
+    for item in _worst_first(
+        ref_extras, "code_references", positions, occ_map
+    ):
+        if fits():
+            return
+        if len(working.code_references) <= 1:
+            return
+        sid = _source_id("code_references", item)
+        _remove_item(working.code_references, item)
+        actions[
+            ("code_reference", sid, occ_map[id(item)])
+        ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
 
 
 def _build_decisions(
@@ -893,21 +1038,21 @@ def _build_decisions(
     working: ContextPacket,
     actions: Dict[Tuple[str, str, int], Tuple[str, str]],
     cpt: float,
+    occ_map: Dict[int, int],
 ) -> List[BudgetDecision]:
     """Deterministic audit: one decision per original content unit, in
     fixed section order, plus the essential structural block first.
     Bookkeeping is keyed by (kind, source_id, occurrence_index) so
-    duplicated or empty source ids each get their OWN decision."""
+    duplicated or empty source ids each get their OWN decision. The
+    occurrence index is the ORIGINAL packet occurrence (``occ_map``):
+    correct both for from-end removal and for R1G relevance-driven
+    removal, which does not preserve a surviving prefix."""
     surviving: Dict[Tuple[str, str, int], PacketItem] = {}
-    counters: Dict[Tuple[str, str], int] = {}
     for section in _ITEM_SECTIONS:
         kind = _SECTION_KINDS[section]
         for item in getattr(working, section):
             source_id = _source_id(section, item)
-            key = (kind, source_id)
-            occurrence = counters.get(key, 0)
-            counters[key] = occurrence + 1
-            surviving[(kind, source_id, occurrence)] = item
+            surviving[(kind, source_id, occ_map[id(item)])] = item
 
     decisions: List[BudgetDecision] = []
     orig_essential = _essential_chars(packet)

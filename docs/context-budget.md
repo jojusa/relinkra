@@ -117,6 +117,17 @@ mutation, stopping as soon as it fits:
 6. Still over ⇒ `status=BUDGET_UNSATISFIABLE`, `packet=None`,
    `satisfied=false`, decisions retained. Never silently exceeded.
 
+**Optional pre-budget ranking (R1G).** `apply_budget(..., relevance=...)`
+(or `--relevance` on the CLI) ranks the packet first with the
+deterministic scorer from [docs/relevance-scoring.md](relevance-scoring.md).
+The ladder STRUCTURE above is unchanged — essential protected, snippet
+steps 1–2 untouched, class order of steps 3–5 preserved — but the removal
+order *inside* steps 3, 4 and 5 becomes ascending relevance (lowest score
+first) instead of strictly-from-end. The hard guarantee, the audit model
+and `BUDGET_UNSATISFIABLE` are preserved; the report gains a
+`relevance_version` field. With `relevance=None` (the default) behavior
+is byte-identical to plain R1F.
+
 Integrity rules: the truncation marker is exact; memory bodies are
 whole-in or whole-out; `memory_id`, `memory_type`, provenance and
 `code_reference_id` survive every reduction; warnings are never removed

@@ -10,10 +10,13 @@ nonzero exit code.
 Exit codes: 0 ok; 1 invalid input / build error / budget unsatisfiable;
 2 project mismatch. With --budget/--max-tokens the packet is bounded by
 the R1F accountant (see docs/context-budget.md); --budget-report writes
-the audit report JSON to stderr. Every stream carries AT MOST one JSON
-document: on an unsatisfiable budget stdout stays empty and stderr gets
-a single error object (with the report embedded as "budget_report" when
---budget-report was passed).
+the audit report JSON to stderr. --relevance ranks the packet with the
+R1G deterministic scorer first (see docs/relevance-scoring.md) and
+--relevance-report writes the RankedContext JSON to stderr; when both
+reports are requested stderr carries ONE combined object. Every stream
+carries AT MOST one JSON document: on an unsatisfiable budget stdout
+stays empty and stderr gets a single error object (with the reports
+embedded when requested).
 """
 
 from __future__ import annotations
@@ -34,10 +37,12 @@ from .context_builder import (
     ContextBuildError,
     ContextBuilder,
     ContextRequest,
+    _utcnow,
 )
 from .engram_adapter import EngramCLIAdapter
 from .memory import MemoryError, MemoryService, sanitize_error
 from .registry import DEFAULT_REGISTRY_PATH, Registry, RegistryError
+from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
 
 DEFAULT_REGISTRY = DEFAULT_REGISTRY_PATH
 
@@ -101,6 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the budget report JSON to stderr (requires --budget "
         "or --max-tokens)",
+    )
+    parser.add_argument(
+        "--relevance",
+        action="store_true",
+        help="rank the packet with the R1G deterministic scorer before "
+        "budgeting; without --budget/--max-tokens it only annotates "
+        "diagnostics",
+    )
+    parser.add_argument(
+        "--relevance-report",
+        action="store_true",
+        help="write the RankedContext JSON to stderr (requires "
+        "--relevance)",
     )
     return parser
 
@@ -178,6 +196,49 @@ def main(
     except (MemoryError, ValueError) as exc:
         return _fail(str(exc))
 
+    if args.relevance_report and not args.relevance:
+        return _fail("--relevance-report requires --relevance")
+    ranked = None
+    if args.relevance:
+        # R1G: deterministic pre-budget ranking. as_of comes from the
+        # injected clock (never an implicit wall-clock read inside the
+        # scorer); focus derives from the request and the built packet.
+        as_of = clock() if clock is not None else _utcnow()
+        focus = packet.focus or {}
+        focus_file = args.file or focus.get("file_path")
+        focus_symbol = None
+        if args.symbol and not args.symbol.strip().startswith("{"):
+            focus_symbol = args.symbol.strip()
+        elif focus.get("reference_kind") == "symbol":
+            focus_symbol = focus.get("qualified_name")
+        focus_ref_id = None
+        if packet.code_references:
+            focus_ref_id = packet.code_references[0].provenance.code_reference_id
+        try:
+            ranked = score_packet(
+                packet,
+                task=args.task,
+                focus_file=focus_file,
+                focus_symbol=focus_symbol,
+                focus_code_reference_id=focus_ref_id,
+                workspace_id=args.workspace_id,
+                as_of=as_of,
+            )
+        except RelevanceError as exc:
+            return _fail(str(exc))
+        packet.diagnostics["relevance"] = {
+            "ranked": True,
+            "relevance_version": RELEVANCE_VERSION,
+            "as_of": ranked.as_of,
+            "counts": {
+                section: len(ranked.scores.get(section, ()))
+                for section in (
+                    "memories", "code_references", "code_facts",
+                    "pending", "handoffs",
+                )
+            },
+        }
+
     budget_requested = args.budget is not None or args.max_tokens is not None
     if args.budget_report and not budget_requested:
         return _fail("--budget-report requires --budget or --max-tokens")
@@ -189,7 +250,7 @@ def main(
         except BudgetValidationError as exc:
             return _fail(str(exc))
         try:
-            result = apply_budget(packet, budget)
+            result = apply_budget(packet, budget, relevance=ranked)
         except BudgetValidationError as exc:
             return _fail(str(exc))
         if not result.satisfied:
@@ -200,11 +261,25 @@ def main(
             }
             if args.budget_report:
                 error_doc["budget_report"] = result.to_dict()
+            if args.relevance_report and ranked is not None:
+                error_doc["relevance_report"] = ranked.to_dict()
             _emit(error_doc, fh=sys.stderr)
             return 1
-        if args.budget_report:
+        if args.budget_report and args.relevance_report and ranked is not None:
+            _emit(
+                {
+                    "budget_report": result.to_dict(),
+                    "relevance_report": ranked.to_dict(),
+                },
+                fh=sys.stderr,
+            )
+        elif args.budget_report:
             _emit(result.to_dict(), fh=sys.stderr)
+        elif args.relevance_report and ranked is not None:
+            _emit(ranked.to_dict(), fh=sys.stderr)
         packet = result.packet
+    elif args.relevance_report and ranked is not None:
+        _emit(ranked.to_dict(), fh=sys.stderr)
 
     if args.format == "markdown":
         print(packet.to_markdown())
