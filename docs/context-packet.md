@@ -34,10 +34,13 @@ Powerful inside, simple outside:
 
 - It IS a **composition** of already-policy-filtered facts, with fixed
   structural limits. It is NOT a relevance engine.
-- **No embeddings. No LLM ranking. No token budgets.** Selection is:
+- **No embeddings. No LLM ranking. Composition itself is budget-free.**
+  Selection is:
   scope policy → type priority → (task mode only) a deterministic keyword
   filter (tokens of length ≥ 4, substring match on title+body) → guardrail
-  caps. Same inputs always select the same items.
+  caps. Same inputs always select the same items. Optional token budgets
+  exist as a separate post-composition layer — see
+  [Context Budget Accountant (R1F)](context-budget.md).
 - It is NOT a graph walk. Code focus resolves ONE reference and its
   directly linked memories. No recursion, no full-file ingestion.
 
@@ -70,6 +73,19 @@ Powerful inside, simple outside:
 
 - **Identity**: `project_id`, optional `workspace_id`, repository identity,
   workspace/branch/HEAD/CBM metadata from the R1B Registry when available.
+
+### Portable vs local paths
+
+Portable packet output (JSON `project_facts`, Markdown) never contains
+absolute machine infrastructure paths. An ABSOLUTE CBM cache dir (Windows
+drive/UNC or POSIX `/...`) is dropped from
+`project_facts.workspace.cbm_cache_dir` (a relative value, if ever
+recorded, is kept; `cbm_project_name` and the rest of the workspace
+metadata always survive). The absolute value is exposed ONLY under
+`diagnostics["local"].cbm_cache_dir` — a machine-local diagnostic
+channel that must NOT be shipped as portable context. Markdown never
+renders diagnostics, so `diagnostics["local"]` can never leak into a
+brief.
 - **Baseline active memories**: handoff, pending, constraint, decision,
   architecture first; then bug, discovery, verification, task_result —
   ordered by that type priority, then timestamp desc, then `memory_id` asc.

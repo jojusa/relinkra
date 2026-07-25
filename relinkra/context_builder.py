@@ -24,6 +24,11 @@ Selection rules (all deterministic, no embeddings, no LLM ranking):
   an exactly resolved symbol.
 - Fixed structural guardrails (never token budgets); omitted and
   truncated counts are reported in diagnostics and surfaced as warnings.
+- Portable output never leaks machine-local infrastructure paths: an
+  ABSOLUTE CBM cache dir (Windows drive/UNC or POSIX) is dropped from
+  ``project_facts`` and exposed only under ``diagnostics["local"]``,
+  which is a machine-local diagnostic channel that must not be shipped
+  as portable context (Markdown never renders diagnostics).
 """
 
 from __future__ import annotations
@@ -151,6 +156,20 @@ def _priority_sort(memories: List) -> List:
     return ordered
 
 
+def _is_absolute_infra_path(value: str) -> bool:
+    """True for Windows drive/UNC or POSIX absolute paths. Deliberately
+    platform-independent (no os.path.isabs): the portability policy must
+    hold for packets BUILT on one OS and READ on another."""
+    if value.startswith(("/", "\\")):
+        return True
+    return (
+        len(value) > 2
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in ("/", "\\")
+    )
+
+
 class ContextBuilder:
     """Builds ContextPackets from a MemoryService + optional CBM/Registry."""
 
@@ -203,6 +222,9 @@ class ContextBuilder:
             project.repository_identity.to_dict() if project is not None else None
         )
         project_facts = self._project_facts(project, workspace)
+        local_diagnostics = self._local_diagnostics(workspace)
+        if local_diagnostics:
+            diagnostics["local"] = local_diagnostics
 
         scope = "workspace_local" if workspace_id else "project_shared"
 
@@ -392,9 +414,24 @@ class ContextBuilder:
                 "branch": git.get("branch") or None,
                 "head_sha": git.get("head_sha") or None,
                 "cbm_project_name": cbm.get("project_name") or None,
-                "cbm_cache_dir": cbm.get("cache_dir") or None,
             }
+            cache_dir = cbm.get("cache_dir") or None
+            if cache_dir is not None and not _is_absolute_infra_path(cache_dir):
+                # Portable only when repo/machine-relative; absolute infra
+                # paths live in diagnostics["local"] instead.
+                facts["workspace"]["cbm_cache_dir"] = cache_dir
         return facts
+
+    @staticmethod
+    def _local_diagnostics(workspace) -> dict:
+        """Machine-local diagnostics channel: values that must never ship
+        in portable project_facts (absolute infrastructure paths)."""
+        local: dict[str, Any] = {}
+        if workspace is not None:
+            cache_dir = (workspace.cbm or {}).get("cache_dir") or None
+            if cache_dir is not None and _is_absolute_infra_path(cache_dir):
+                local["cbm_cache_dir"] = cache_dir
+        return local
 
     # -- memory selection -------------------------------------------------
 

@@ -1040,5 +1040,75 @@ class CLITests(unittest.TestCase):
         self.assertEqual(json.loads(out)["packet_id"], builder_packet.packet_id)
 
 
+class PortableCacheDirTests(unittest.TestCase):
+    """Portable packets never leak ABSOLUTE CBM cache paths: they are
+    dropped from project_facts and exposed only under
+    diagnostics["local"] (a machine-local channel)."""
+
+    def build_with_cache_dir(self, cache_dir):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws_dir = os.path.join(tmp.name, "ws")
+        os.makedirs(ws_dir, exist_ok=True)
+        registry = Registry(os.path.join(tmp.name, "registry.json"))
+        workspace = registry.register_workspace(
+            ws_dir,
+            IDENTITY,
+            git={"branch": "main", "head_sha": "a" * 40},
+            cbm=workspace_cbm_record(SLUG, cache_dir).to_dict(),
+        )
+        service, _ = make_service()
+        builder = ContextBuilder(
+            memory_service=service,
+            cbm_adapter=None,
+            registry=registry,
+            workspace_root=ws_dir,
+            clock=fixed_clock,
+        )
+        return builder.build(
+            ContextRequest(
+                project_id=workspace.project_id,
+                workspace_id=workspace.workspace_id,
+            )
+        )
+
+    def assert_portable(self, packet, cache_dir):
+        facts_json = json.dumps(packet.project_facts, sort_keys=True)
+        self.assertNotIn(cache_dir, facts_json)
+        self.assertNotIn("cbm_cache_dir", packet.project_facts["workspace"])
+        self.assertNotIn(cache_dir, packet.to_markdown())
+        self.assertEqual(
+            packet.diagnostics["local"]["cbm_cache_dir"], cache_dir
+        )
+        self.assertEqual(
+            packet.project_facts["workspace"]["cbm_project_name"], SLUG
+        )
+        parsed = json.loads(packet.to_json())
+        self.assertNotIn("cbm_cache_dir", parsed["project_facts"]["workspace"])
+        self.assertEqual(
+            parsed["diagnostics"]["local"]["cbm_cache_dir"], cache_dir
+        )
+
+    def test_windows_absolute_cache_dir(self):
+        packet = self.build_with_cache_dir(r"C:\Users\u\cbm")
+        self.assert_portable(packet, "C:\\Users\\u\\cbm")
+
+    def test_posix_absolute_cache_dir(self):
+        packet = self.build_with_cache_dir("/home/u/.cache/cbm")
+        self.assert_portable(packet, "/home/u/.cache/cbm")
+
+    def test_windows_unc_cache_dir(self):
+        packet = self.build_with_cache_dir(r"\\server\share\cbm")
+        self.assert_portable(packet, r"\\server\share\cbm")
+
+    def test_relative_cache_dir_stays_in_project_facts(self):
+        packet = self.build_with_cache_dir("relative/cbm")
+        self.assertEqual(
+            packet.project_facts["workspace"]["cbm_cache_dir"],
+            "relative/cbm",
+        )
+        self.assertNotIn("local", packet.diagnostics)
+
+
 if __name__ == "__main__":
     unittest.main()

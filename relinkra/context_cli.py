@@ -7,7 +7,13 @@ nonzero exit code.
     python -m relinkra.context_cli --project-id rlk_... --symbol src.calc.add \
         --cbm-bin codebase-memory-mcp --cbm-project-name <slug> --format markdown
 
-Exit codes: 0 ok; 1 invalid input / build error; 2 project mismatch.
+Exit codes: 0 ok; 1 invalid input / build error / budget unsatisfiable;
+2 project mismatch. With --budget/--max-tokens the packet is bounded by
+the R1F accountant (see docs/context-budget.md); --budget-report writes
+the audit report JSON to stderr. Every stream carries AT MOST one JSON
+document: on an unsatisfiable budget stdout stays empty and stderr gets
+a single error object (with the report embedded as "budget_report" when
+--budget-report was passed).
 """
 
 from __future__ import annotations
@@ -19,6 +25,11 @@ import sys
 from typing import Optional
 
 from .cbm_adapter import CBMCLIAdapter, CBMAdapterError
+from .context_budget import (
+    BudgetValidationError,
+    apply_budget,
+    resolve_budget,
+)
 from .context_builder import (
     ContextBuildError,
     ContextBuilder,
@@ -73,6 +84,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-agent-private", action="store_true")
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--pretty", action="store_true")
+    parser.add_argument(
+        "--budget",
+        choices=("small", "medium", "large"),
+        default=None,
+        help="apply a fixed R1F budget profile to the built packet",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="explicit estimated-token cap; wins over --budget",
+    )
+    parser.add_argument(
+        "--budget-report",
+        action="store_true",
+        help="write the budget report JSON to stderr (requires --budget "
+        "or --max-tokens)",
+    )
     return parser
 
 
@@ -148,6 +177,34 @@ def main(
         return _fail(str(exc), code=exc.exit_code)
     except (MemoryError, ValueError) as exc:
         return _fail(str(exc))
+
+    budget_requested = args.budget is not None or args.max_tokens is not None
+    if args.budget_report and not budget_requested:
+        return _fail("--budget-report requires --budget or --max-tokens")
+    if budget_requested:
+        try:
+            budget = resolve_budget(
+                profile=args.budget, max_tokens=args.max_tokens
+            )
+        except BudgetValidationError as exc:
+            return _fail(str(exc))
+        try:
+            result = apply_budget(packet, budget)
+        except BudgetValidationError as exc:
+            return _fail(str(exc))
+        if not result.satisfied:
+            error_doc = {
+                "error": "budget_unsatisfiable",
+                "packet_id": result.original_packet_id,
+                "max_estimated_tokens": budget.max_estimated_tokens,
+            }
+            if args.budget_report:
+                error_doc["budget_report"] = result.to_dict()
+            _emit(error_doc, fh=sys.stderr)
+            return 1
+        if args.budget_report:
+            _emit(result.to_dict(), fh=sys.stderr)
+        packet = result.packet
 
     if args.format == "markdown":
         print(packet.to_markdown())
