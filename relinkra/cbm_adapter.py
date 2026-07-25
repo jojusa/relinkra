@@ -127,7 +127,7 @@ class CBMCLIAdapter:
             str(cbm_project_name).strip() if cbm_project_name else None
         )
         self.workspace_root = (
-            str(workspace_root).replace("\\", "/").rstrip("/")
+            os.path.abspath(str(workspace_root)).replace("\\", "/").rstrip("/")
             if workspace_root
             else None
         )

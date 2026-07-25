@@ -288,7 +288,22 @@ class TestResolution(unittest.TestCase):
         self.assertEqual(result.state, MISSING)
         self.assertIn("no CBM adapter", result.note)
 
-    def test_adapter_errors_become_missing_not_crashes(self):
+    def test_adapter_errors_propagate_as_cbm_adapter_error(self):
+        class BoomAdapter:
+            def get_snippet(self, qn):
+                raise RuntimeError("cbm exploded token=abc123")
+
+            def search_symbols(self, **kw):
+                raise RuntimeError("cbm exploded token=abc123")
+
+        linkage = LinkageService(
+            make_memory_service()[0], cbm_adapter=BoomAdapter()
+        )
+        with self.assertRaises(CBMAdapterError) as ctx:
+            linkage.resolve_reference(ref_dict(cbm_project_name=SLUG_A))
+        self.assertNotIn("abc123", str(ctx.exception))
+
+    def test_adapter_errors_propagate_for_file_refs(self):
         class BoomAdapter:
             def get_snippet(self, qn):
                 raise RuntimeError("cbm exploded")
@@ -298,6 +313,34 @@ class TestResolution(unittest.TestCase):
 
         linkage = LinkageService(
             make_memory_service()[0], cbm_adapter=BoomAdapter()
+        )
+        file_ref = ref_dict(
+            reference_kind="file",
+            symbol_name=None,
+            qualified_name=None,
+            symbol_kind=None,
+        )
+        with self.assertRaises(CBMAdapterError):
+            linkage.resolve_reference(file_ref)
+
+    def test_typed_adapter_error_propagates_unwrapped(self):
+        class TypedBoomAdapter:
+            def get_snippet(self, qn):
+                raise CBMAdapterError("cbm timed out")
+
+            def search_symbols(self, **kw):
+                raise CBMAdapterError("cbm timed out")
+
+        linkage = LinkageService(
+            make_memory_service()[0], cbm_adapter=TypedBoomAdapter()
+        )
+        with self.assertRaises(CBMAdapterError) as ctx:
+            linkage.resolve_reference(ref_dict(cbm_project_name=SLUG_A))
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_genuine_empty_result_stays_missing(self):
+        linkage = LinkageService(
+            make_memory_service()[0], cbm_adapter=FakeCBMAdapter()
         )
         result = linkage.resolve_reference(ref_dict(cbm_project_name=SLUG_A))
         self.assertEqual(result.state, MISSING)
@@ -759,6 +802,16 @@ class TestCBMCLIAdapter(unittest.TestCase):
         )
         self.assertEqual(
             adapter._normalize_file_path("c:/WORK/WS-A/src/calculator.py"),
+            "src/calculator.py",
+        )
+
+    def test_relative_workspace_root_is_absolutized(self):
+        rel = os.path.join("tmp", "ws-a")
+        adapter = self.make_adapter(workspace_root=rel)
+        expected_root = os.path.abspath(rel).replace("\\", "/").rstrip("/")
+        self.assertEqual(adapter.workspace_root, expected_root)
+        self.assertEqual(
+            adapter._normalize_file_path(expected_root + "/src/calculator.py"),
             "src/calculator.py",
         )
 

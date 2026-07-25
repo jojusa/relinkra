@@ -25,7 +25,10 @@ Resolution rules:
 The adapter is duck-typed: any object with ``search_symbols(...)`` and
 ``get_snippet(qualified_name)`` returning normalized candidate dicts
 (see ``relinkra.cbm_adapter``) works. No adapter -> every ref reports
-``missing`` with an explanatory note.
+``missing`` with an explanatory note. A CONFIGURED adapter that fails
+(timeout, crash, bad payload) is NOT "missing": the failure is
+propagated as ``CBMAdapterError`` so callers can distinguish an outage
+from a genuinely absent symbol.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from .cbm_adapter import CBMAdapterError
 from .code_reference import (
     CodeRefError,
     CodeReference,
@@ -44,6 +48,7 @@ from .memory import (
     MemoryNotFoundError,
     MemoryService,
     MemoryValidationError,
+    sanitize_error,
     validate_project_id,
 )
 
@@ -122,6 +127,23 @@ def _last_qn_segment(qualified_name: Optional[str]) -> Optional[str]:
     if not qualified_name:
         return None
     return qualified_name.rsplit(".", 1)[-1] or None
+
+
+def _adapter_call(operation: str, func, *args, **kwargs):
+    """Invoke one CBM adapter operation with typed failure propagation.
+
+    Any exception is normalized to ``CBMAdapterError`` (an adapter
+    outage), NEVER swallowed into an empty result: an outage must not
+    masquerade as a genuinely missing symbol/file.
+    """
+    try:
+        return func(*args, **kwargs)
+    except CBMAdapterError:
+        raise
+    except Exception as exc:
+        raise CBMAdapterError(
+            f"cbm {operation} failed: {sanitize_error(str(exc))}"
+        ) from exc
 
 
 class LinkageService:
@@ -237,24 +259,25 @@ class LinkageService:
         if ref.reference_kind == "symbol":
             if ref.qualified_name and ref.cbm_project_name:
                 full_qn = f"{ref.cbm_project_name}.{ref.qualified_name}"
-                try:
-                    hit = cbm.get_snippet(full_qn)
-                except Exception:
-                    hit = None
+                hit = _adapter_call("get_snippet", cbm.get_snippet, full_qn)
                 if hit:
                     raw = [hit]
             if not raw:
                 query = ref.symbol_name or _last_qn_segment(ref.qualified_name)
                 if query:
-                    try:
-                        raw = list(cbm.search_symbols(query=query))
-                    except Exception:
-                        raw = []
+                    raw = list(
+                        _adapter_call(
+                            "search_symbols", cbm.search_symbols, query=query
+                        )
+                    )
         else:
-            try:
-                raw = list(cbm.search_symbols(file_path=ref.file_path))
-            except Exception:
-                raw = []
+            raw = list(
+                _adapter_call(
+                    "search_symbols",
+                    cbm.search_symbols,
+                    file_path=ref.file_path,
+                )
+            )
         candidates: List[CodeReference] = []
         invalid: List[dict] = []
         for node in raw:

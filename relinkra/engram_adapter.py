@@ -183,6 +183,14 @@ class EngramCLIAdapter:
     The HTTP base URL comes from ``http_url``, else the ``ENGRAM_URL``
     env var, else ``http://127.0.0.1:7437``. Pass ``http_url=""`` (or set
     ``ENGRAM_URL=""``) to disable HTTP and force the CLI path.
+
+    ``project_alias`` (optional) rewrites ONLY the physical project filter
+    of store queries: searches are sent to Engram under the alias (e.g.
+    ``relinkra``) instead of the logical ``rlk_`` id, because some MCP
+    front-ends reject unknown ``rlk_`` projects. Writes are unaffected.
+    Isolation is preserved: the R1C policy layer always re-filters parsed
+    envelopes by the logical ``project_id``, so an aliased search can
+    never leak another project's memories into a query result.
     """
 
     def __init__(
@@ -191,6 +199,7 @@ class EngramCLIAdapter:
         timeout: float = 30.0,
         http_url: Optional[str] = None,
         http_timeout: float = 2.0,
+        project_alias: Optional[str] = None,
     ):
         self.engram_bin = engram_bin
         self.timeout = timeout
@@ -198,6 +207,7 @@ class EngramCLIAdapter:
             http_url = os.environ.get(ENGRAM_URL_ENV, DEFAULT_ENGRAM_URL)
         self.http_url = (http_url or "").rstrip("/")
         self.http_timeout = http_timeout
+        self.project_alias = (project_alias or "").strip() or None
 
     def _run(self, args: List[str]) -> str:
         try:
@@ -255,7 +265,11 @@ class EngramCLIAdapter:
         limit: int = 50,
     ) -> List[StoredRecord]:
         limit = max(1, int(limit))
-        http_records = self._http_search(query, project, limit)
+        # project_alias rewrites the PHYSICAL store filter only; the R1C
+        # policy layer still filters parsed envelopes by the logical
+        # project_id, so cross-project isolation is preserved.
+        physical_project = self.project_alias or project
+        http_records = self._http_search(query, physical_project, limit)
         if http_records is not None:
             if storage_type:
                 http_records = [
@@ -263,8 +277,8 @@ class EngramCLIAdapter:
                 ]
             return http_records[:limit]
         args = ["search", query, "--limit", str(limit)]
-        if project:
-            args += ["--project", project]
+        if physical_project:
+            args += ["--project", physical_project]
         if storage_type:
             args += ["--type", storage_type]
         output = self._run(args)
