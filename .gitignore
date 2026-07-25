@@ -16,4 +16,9 @@ coverage/
 .relinkra/
 .codebase-memory/
 
+.atl/
+
+__pycache__/
+*.py[cod]
+
 .upstream/
