@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 
+from .code_reference import CodeRefError, CodeReference
 from .identity import redact_url
 
 ENVELOPE_VERSION = "rlkmem1"
@@ -175,6 +176,40 @@ def validate_repository_identity(identity: Any) -> dict:
             "repository_identity must not be a filesystem path"
         )
     return {"kind": kind, "value": value, "trust": trust}
+
+
+def validate_code_refs(code_refs: Any, project_id: Optional[str] = None) -> list:
+    """Validate/normalize a list of code references (R1D).
+
+    Each entry must be a CodeReference or a mapping accepted by
+    ``CodeReference.from_dict``; normalized dicts are returned so the
+    envelope stores canonical form. When ``project_id`` is given every
+    ref must belong to that project — a memory never links code across
+    logical projects. ``None``/empty yields ``[]`` so pre-R1D envelopes
+    parse unchanged.
+    """
+    if code_refs in (None, ""):
+        return []
+    if not isinstance(code_refs, list):
+        raise MemoryValidationError("code_refs must be a list")
+    validated = []
+    for item in code_refs:
+        try:
+            ref = (
+                item
+                if isinstance(item, CodeReference)
+                else CodeReference.from_dict(item)
+            )
+        except (CodeRefError, TypeError, ValueError) as exc:
+            raise MemoryValidationError(
+                f"invalid code reference: {exc}"
+            ) from exc
+        if project_id is not None and ref.project_id != project_id:
+            raise MemoryValidationError(
+                "code reference project_id must match the memory project_id"
+            )
+        validated.append(ref.to_dict())
+    return validated
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +376,7 @@ class Memory:
     dedup_key: str = ""
     scope_channel: str = ""
     topic_key: str = ""
+    code_refs: list = field(default_factory=list)
 
     def to_envelope(self) -> dict:
         env: dict[str, Any] = {
@@ -365,6 +401,7 @@ class Memory:
             "supersedes": self.supersedes,
             "source_tool": self.source_tool,
             "dedup_key": self.dedup_key,
+            "code_refs": list(self.code_refs or []),
         }
         return env
 
@@ -426,6 +463,10 @@ class Memory:
             dedup_key=str(data.get("dedup_key") or ""),
             scope_channel=str(data.get("scope_channel") or ""),
             topic_key=str(data.get("topic_key") or ""),
+            code_refs=validate_code_refs(
+                data.get("code_refs"),
+                project_id=validate_project_id(str(data["project_id"])),
+            ),
         )
 
 
@@ -485,11 +526,14 @@ class MemoryService:
         source_tool: str = "relinkra",
         status: str = "active",
         supersedes: Optional[str] = None,
+        code_refs: Optional[list] = None,
     ) -> tuple[Memory, bool, list[str]]:
         """Save a memory. Returns (memory, deduplicated, superseded_ids).
 
         Order of operations: validate -> redact -> dedup -> supersede
-        same-topic active -> persist.
+        same-topic active -> persist. ``code_refs`` (R1D) are validated
+        through CodeReference and bound to this memory's project; they
+        do NOT participate in the dedup key.
         """
         project_id = validate_project_id(project_id)
         scope = normalize_scope(scope)
@@ -497,6 +541,7 @@ class MemoryService:
         if status not in STATUSES:
             raise MemoryValidationError(f"unsupported status: {status!r}")
         repo = validate_repository_identity(repository_identity)
+        refs = validate_code_refs(code_refs, project_id=project_id)
         if workspace_id is not None:
             workspace_id = validate_workspace_id(workspace_id)
         if not (title or "").strip():
@@ -551,6 +596,7 @@ class MemoryService:
             dedup_key=dedup_key,
             scope_channel=channel,
             topic_key=topic_key,
+            code_refs=refs,
         )
         self.store.save_record(
             title=title,
@@ -572,16 +618,19 @@ class MemoryService:
         obsolete: bool = False,
         agent_id: str = "",
         source_tool: str = "relinkra",
+        code_refs: Optional[list] = None,
     ) -> tuple[Memory, list[str]]:
         """Supersede an existing memory with new content, or obsolete it.
 
         History is never deleted: the old record stays in the store and is
-        excluded from default retrieval by policy.
+        excluded from default retrieval by policy. Code refs carry over
+        from the target unless ``code_refs`` is given explicitly.
         """
         project_id = validate_project_id(project_id)
         target = self._find_by_id(project_id, memory_id)
         if target is None:
             raise MemoryNotFoundError(f"unknown memory_id: {memory_id}")
+        refs = target.code_refs if code_refs is None else code_refs
         if obsolete:
             memory, _, superseded = self.save(
                 project_id=project_id,
@@ -598,9 +647,10 @@ class MemoryService:
                 source_tool=source_tool,
                 status="obsolete",
                 supersedes=target.memory_id,
+                code_refs=refs,
             )
             return memory, superseded
-        if title is None and body is None:
+        if title is None and body is None and code_refs is None:
             raise MemoryValidationError(
                 "supersede requires new --title/--content or --obsolete"
             )
@@ -620,6 +670,7 @@ class MemoryService:
             source_tool=source_tool,
             status="active",
             supersedes=target.memory_id,
+            code_refs=refs,
         )
         return memory, superseded
 

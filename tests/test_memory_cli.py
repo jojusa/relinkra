@@ -468,6 +468,107 @@ class TestMemoryCLI(unittest.TestCase):
         self.assertIn("error", json.loads(err))
 
 
+CALC_REF_JSON = json.dumps(
+    {
+        "project_id": PID,
+        "reference_kind": "symbol",
+        "file_path": "src/calculator.py",
+        "symbol_name": "add",
+        "qualified_name": "src.calculator.add",
+        "symbol_kind": "Function",
+    }
+)
+
+
+class TestMemoryCLICodeLinks(unittest.TestCase):
+    def setUp(self):
+        self.store = InMemoryStore()
+
+    def test_save_with_code_ref(self):
+        code, out, err = cli_save(self.store, code_ref=CALC_REF_JSON)
+        self.assertEqual(code, 0, err)
+        memory = json.loads(out)["memory"]
+        self.assertEqual(len(memory["code_refs"]), 1)
+        ref = memory["code_refs"][0]
+        self.assertEqual(ref["qualified_name"], "src.calculator.add")
+        self.assertTrue(ref["code_reference_id"].startswith("ref_"))
+        self.assertEqual(ref["language"], "python")
+
+    def test_save_rejects_bad_code_ref_json(self):
+        code, _, err = cli_save(self.store, code_ref="{not json")
+        self.assertEqual(code, 1)
+        self.assertIn("error", json.loads(err))
+
+    def test_save_rejects_invalid_code_ref(self):
+        bad = json.dumps(
+            {
+                "project_id": PID,
+                "reference_kind": "symbol",
+                "file_path": "../escape.py",
+                "symbol_name": "x",
+            }
+        )
+        code, _, err = cli_save(self.store, code_ref=bad)
+        self.assertEqual(code, 1)
+        self.assertIn("error", json.loads(err))
+
+    def test_query_code_file_finds_linked_memory(self):
+        cli_save(self.store, title="Linked", content="L", code_ref=CALC_REF_JSON)
+        cli_save(self.store, title="Unlinked", content="U")
+        code, out, err = run_cli(
+            [
+                "query",
+                "--project-id", PID,
+                "--code-file", "src/calculator.py",
+            ],
+            store=self.store,
+        )
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["matches"][0]["memory"]["title"], "Linked")
+
+    def test_query_code_symbol_finds_linked_memory(self):
+        cli_save(self.store, title="Linked", content="L", code_ref=CALC_REF_JSON)
+        code, out, _ = run_cli(
+            ["query", "--project-id", PID, "--code-symbol", "add"],
+            store=self.store,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["count"], 1)
+        code, out, _ = run_cli(
+            ["query", "--project-id", PID, "--code-symbol", "absent"],
+            store=self.store,
+        )
+        self.assertEqual(json.loads(out)["count"], 0)
+
+    def test_query_code_file_respects_scope(self):
+        cli_save(
+            self.store,
+            title="WS note",
+            content="W",
+            scope="workspace_local",
+            workspace_id=WID,
+            code_ref=CALC_REF_JSON,
+        )
+        code, out, _ = run_cli(
+            ["query", "--project-id", PID, "--code-file", "src/calculator.py"],
+            store=self.store,
+        )
+        self.assertEqual(json.loads(out)["count"], 0)
+        code, out, _ = run_cli(
+            [
+                "query",
+                "--project-id", PID,
+                "--scope", "workspace_local",
+                "--workspace-id", WID,
+                "--code-file", "src/calculator.py",
+            ],
+            store=self.store,
+        )
+        self.assertEqual(json.loads(out)["count"], 1)
+
+
 class TestRegistryResolution(unittest.TestCase):
     def test_save_resolves_project_and_workspace_by_path(self):
         with tempfile.TemporaryDirectory() as tmp:

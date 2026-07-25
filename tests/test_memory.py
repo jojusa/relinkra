@@ -539,6 +539,98 @@ class TestQueryStorePaging(unittest.TestCase):
                 service.query(project_id=PID_A, scope="project_shared", limit=bad)
 
 
+CALC_REF = {
+    "project_id": PID_A,
+    "reference_kind": "symbol",
+    "file_path": "src/calculator.py",
+    "symbol_name": "add",
+    "qualified_name": "src.calculator.add",
+    "symbol_kind": "Function",
+}
+
+
+class TestMemoryCodeRefs(unittest.TestCase):
+    def test_save_and_envelope_roundtrip_with_refs(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service, code_refs=[CALC_REF])
+        self.assertEqual(len(memory.code_refs), 1)
+        stored = memory.code_refs[0]
+        self.assertTrue(stored["code_reference_id"].startswith("ref_"))
+        self.assertEqual(stored["language"], "python")  # derived
+        self.assertNotIn("source", stored)
+        restored = Memory.from_envelope(json.loads(memory.envelope_json()))
+        self.assertEqual(restored.code_refs, memory.code_refs)
+        self.assertEqual(restored.to_dict()["code_refs"], memory.code_refs)
+
+    def test_old_envelope_without_code_refs_parses_empty(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service)
+        data = json.loads(memory.envelope_json())
+        data.pop("code_refs")  # simulate a pre-R1D envelope
+        restored = Memory.from_envelope(data)
+        self.assertEqual(restored.code_refs, [])
+        self.assertEqual(memory.code_refs, [])
+
+    def test_invalid_ref_rejected(self):
+        service, _ = make_service()
+        with self.assertRaises(MemoryValidationError):
+            save_shared(
+                service,
+                code_refs=[
+                    {
+                        "project_id": PID_A,
+                        "reference_kind": "symbol",
+                        "file_path": r"C:\abs\path.py",
+                        "symbol_name": "x",
+                    }
+                ],
+            )
+        with self.assertRaises(MemoryValidationError):
+            save_shared(service, code_refs="not-a-list")
+
+    def test_ref_project_mismatch_rejected(self):
+        service, _ = make_service()
+        bad = dict(CALC_REF, project_id=PID_B)
+        with self.assertRaises(MemoryValidationError):
+            save_shared(service, code_refs=[bad])
+        ok, _, _ = save_shared(
+            service, project_id=PID_B, code_refs=[bad], title="Other"
+        )
+        self.assertEqual(len(ok.code_refs), 1)
+
+    def test_refs_do_not_affect_dedup(self):
+        service, store = make_service()
+        save_shared(service, title="Fact", body="Body", code_refs=[CALC_REF])
+        _, dedup, _ = save_shared(service, title="Fact", body="Body")
+        self.assertTrue(dedup)
+        self.assertEqual(len(store.saved_args), 1)
+
+    def test_supersede_carries_refs_by_default(self):
+        service, _ = make_service()
+        first, _, _ = save_shared(service, title="Doc", body="old",
+                                  code_refs=[CALC_REF])
+        replacement, _ = service.supersede(
+            memory_id=first.memory_id, project_id=PID_A, body="new"
+        )
+        self.assertEqual(replacement.code_refs, first.code_refs)
+
+    def test_supersede_can_replace_refs(self):
+        service, _ = make_service()
+        first, _, _ = save_shared(service, title="Doc", body="old",
+                                  code_refs=[CALC_REF])
+        replacement, _ = service.supersede(
+            memory_id=first.memory_id, project_id=PID_A, code_refs=[]
+        )
+        self.assertEqual(replacement.code_refs, [])
+
+    def test_zero_refs_memory_still_valid(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service)
+        result = service.query(project_id=PID_A, scope="project_shared")
+        self.assertEqual([m.memory_id for m in result.memories],
+                         [memory.memory_id])
+
+
 class TestMalformedStoredEnvelopes(unittest.TestCase):
     def test_garbage_records_skipped_and_counted(self):
         service, store = make_service()

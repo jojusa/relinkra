@@ -21,6 +21,7 @@ from typing import Optional
 
 from . import identity as identity_mod
 from .engram_adapter import EngramCLIAdapter
+from .linkage import LinkageService
 from .memory import (
     MemoryError,
     MemoryNotFoundError,
@@ -134,6 +135,18 @@ def _git_metadata(path: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+def _parse_code_refs(values) -> list:
+    refs = []
+    for raw in values or []:
+        try:
+            refs.append(json.loads(raw))
+        except ValueError as exc:
+            raise MemoryValidationError(
+                f"--code-ref is not valid JSON: {exc}"
+            ) from exc
+    return refs
+
+
 def _cmd_save(args: argparse.Namespace, store=None) -> int:
     try:
         project_id, workspace_id, repo_identity = _resolve_context(args)
@@ -153,6 +166,7 @@ def _cmd_save(args: argparse.Namespace, store=None) -> int:
             commit_sha=args.commit_sha or commit_sha,
             confidence=args.confidence,
             source_tool=args.source_tool or "relinkra-cli",
+            code_refs=_parse_code_refs(getattr(args, "code_ref", None)),
         )
     except MemoryNotFoundError as exc:
         return _fail(str(exc), code=2)
@@ -172,6 +186,20 @@ def _cmd_query(args: argparse.Namespace, store=None) -> int:
     try:
         project_id = validate_project_id(args.project_id or "")
         service = _build_service(args, store)
+        if getattr(args, "code_file", None) or getattr(args, "code_symbol", None):
+            linkage = LinkageService(service)
+            matches = linkage.code_to_memory(
+                project_id=project_id,
+                file_path=args.code_file,
+                symbol=args.code_symbol,
+                scope=args.scope,
+                workspace_id=args.workspace_id,
+                agent_type=args.agent_type,
+                include_history=args.include_history,
+                limit=args.limit,
+            )
+            _emit({"matches": matches, "count": len(matches)})
+            return 0
         result = service.query(
             project_id=project_id,
             scope=args.scope,
@@ -233,6 +261,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_save.add_argument("--commit-sha", default=None)
     p_save.add_argument("--confidence", type=float, default=None)
     p_save.add_argument("--source-tool", default=None)
+    p_save.add_argument(
+        "--code-ref",
+        action="append",
+        default=None,
+        metavar="JSON",
+        help="code reference as a JSON object (repeatable); see "
+        "docs/code-memory-linkage.md",
+    )
     p_save.set_defaults(func=_cmd_save)
 
     p_query = sub.add_parser("query", help="query memories by scope policy")
@@ -245,6 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("--memory-type", default=None)
     p_query.add_argument("--include-history", action="store_true")
     p_query.add_argument("--limit", type=int, default=50)
+    p_query.add_argument(
+        "--code-file",
+        default=None,
+        help="code -> memory: repo-relative POSIX file path",
+    )
+    p_query.add_argument(
+        "--code-symbol",
+        default=None,
+        help="code -> memory: symbol name or project-relative qualified name",
+    )
     p_query.set_defaults(func=_cmd_query)
 
     p_sup = sub.add_parser("supersede", help="supersede or obsolete a memory")
