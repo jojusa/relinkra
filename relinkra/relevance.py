@@ -48,6 +48,26 @@ Tokenizer contract (deterministic, stdlib ``re`` + ``unicodedata``):
    of non-word characters collapses to a boundary.
 4. Tokens shorter than 2 characters are dropped; duplicates are removed
    preserving first-occurrence order.
+
+Additive git signals (R2 Git Intelligence, opt-in):
+
+- ``RelevanceWeights`` carries six OPTIONAL git weights, all ``None``
+  (disabled) by default. When EVERY git weight is ``None`` the git
+  branch is never entered and the report is byte-identical to
+  relevance-v1; when ANY is set, ``score_packet`` emits
+  ``relevance-v1-git1`` and appends five signals to the explanation in
+  the fixed ``GIT_SIGNAL_ORDER``. ``GIT1_WEIGHTS`` is the ready-made
+  preset (10/8/4/6/2/6).
+- Git signals READ ``packet.git_facts`` only: git facts are NEVER
+  scored as candidates (``SCORED_SECTIONS`` is unchanged); they
+  modulate the existing memory/code candidates. Empty ``git_facts``
+  means every git signal is zero.
+- The per-candidate git SUBTOTAL is hard-capped at
+  ``GIT_SIGNAL_TOTAL_CAP`` = min(direct_code_link, symbol_match) - 1
+  = 34, so git evidence can never outweigh direct code or symbol
+  linkage. The cap sheds end-first in fixed signal order (the signal
+  that tips over is partially credited), so signals always sum to the
+  total and stay explainable.
 """
 
 from __future__ import annotations
@@ -64,6 +84,7 @@ from .context_packet import ContextPacket, PacketItem
 from .linkage import AMBIGUOUS, MISSING, RESOLVED, STALE
 
 RELEVANCE_VERSION = "relevance-v1"
+RELEVANCE_VERSION_GIT1 = "relevance-v1-git1"
 
 SCORED_SECTIONS = ("memories", "code_references", "code_facts",
                    "pending", "handoffs")
@@ -82,6 +103,21 @@ SIGNAL_ORDER = (
     "workspace_match",
     "resolution",
 )
+
+# relevance-v1-git1: the five additive git signals, appended
+# deterministically AFTER the v1 order (which stays untouched).
+GIT_SIGNAL_NAMES = (
+    "focused_file_changed",
+    "commit_touches_focused_file",
+    "recent_commit",
+    "cochange_with_focus",
+    "task_keyword_match",
+)
+GIT_SIGNAL_ORDER = SIGNAL_ORDER + GIT_SIGNAL_NAMES
+
+# Hard per-candidate cap on the git-signal subtotal: git evidence may
+# never outweigh direct code (40) or symbol (35) linkage.
+GIT_SIGNAL_TOTAL_CAP = 34  # min(direct_code_link=40, symbol_match=35) - 1
 
 # Tie-break type ordering (ascending = more preferred). Unknown memory
 # types rank just above code references; this is the documented
@@ -163,6 +199,15 @@ class RelevanceWeights:
     resolution_stale: int = -8
     resolution_ambiguous: int = -6
     resolution_missing: int = -10
+    # Additive git signals (relevance-v1-git1). ALL None = disabled:
+    # the git branch is never entered and output is byte-identical to
+    # relevance-v1. Setting ANY weight opts the whole report into git1.
+    git_focused_file_changed: Optional[int] = None
+    git_commit_touches_focus: Optional[int] = None
+    git_recent_commit: Optional[int] = None
+    git_cochange_with_focus: Optional[int] = None
+    git_task_keyword_each: Optional[int] = None
+    git_task_keyword_cap: Optional[int] = None
 
     def memory_type_points(self, memory_type: Optional[str]) -> int:
         """Per-type points; unknown/None types earn 0 (documented)."""
@@ -170,6 +215,13 @@ class RelevanceWeights:
         if field_name is None:
             return 0
         return getattr(self, field_name)
+
+    def git_enabled(self) -> bool:
+        """Git signals are opt-in: ANY set weight enables git1."""
+        return any(
+            getattr(self, field_name) is not None
+            for field_name in _GIT_WEIGHT_FIELDS
+        )
 
 
 _TYPE_POINTS_FIELDS = {
@@ -184,7 +236,29 @@ _TYPE_POINTS_FIELDS = {
     "task_result": "type_task_result",
 }
 
+_GIT_WEIGHT_FIELDS = (
+    "git_focused_file_changed",
+    "git_commit_touches_focus",
+    "git_recent_commit",
+    "git_cochange_with_focus",
+    "git_task_keyword_each",
+    "git_task_keyword_cap",
+)
+
 DEFAULT_WEIGHTS = RelevanceWeights()
+
+# Ready-made relevance-v1-git1 preset (design §4): focused file changed
+# 10, commit touches focus 8, recent commit 4, co-change with focus 6,
+# task keyword 2 each capped at 6. Its maximum git subtotal (34) is
+# exactly GIT_SIGNAL_TOTAL_CAP, so the preset never needs trimming.
+GIT1_WEIGHTS = RelevanceWeights(
+    git_focused_file_changed=10,
+    git_commit_touches_focus=8,
+    git_recent_commit=4,
+    git_cochange_with_focus=6,
+    git_task_keyword_each=2,
+    git_task_keyword_cap=6,
+)
 
 
 @dataclass
@@ -408,6 +482,142 @@ def _linked_ref_ids(
     return tuple(linked)
 
 
+# -- git signals (relevance-v1-git1) ------------------------------------------
+
+
+@dataclass(frozen=True)
+class _GitFacts:
+    """Precomputed read-only views over ``packet.git_facts``.
+
+    Git facts are never scored as candidates; they only modulate the
+    existing memory/code candidates (design §4). Every set is built
+    once per ``score_packet`` call, only when git weights are enabled.
+    """
+
+    change_states: Mapping  # current_change_state: file_path -> state
+    recent_touched_paths: frozenset  # union of recent_commit.changed_paths
+    recent_shas: frozenset  # recent_commit sha + short_sha values
+    cochange_paths: frozenset  # co_change.path values
+    keyword_paths: frozenset  # paths a candidate must reference for
+    # task_keyword_match: recent touched paths + co-change paths
+    matched_task_tokens: frozenset  # task ∩ (subject + co_change path tokens)
+
+
+def _git_facts(
+    packet: ContextPacket, task_tokens: Tuple[str, ...]
+) -> _GitFacts:
+    change_states: Dict[str, str] = {}
+    touched: set = set()
+    shas: set = set()
+    cochange: set = set()
+    token_sources: List[str] = []  # commit subjects + co_change paths
+    for item in packet.git_facts:
+        data = item.data if isinstance(item.data, Mapping) else {}
+        kind = data.get("kind")
+        if kind == "current_change_state":
+            path = data.get("file_path")
+            if (
+                isinstance(path, str)
+                and path
+                and path not in change_states  # first entry wins
+            ):
+                change_states[path] = str(data.get("state") or "")
+        elif kind == "recent_commit":
+            for key in ("sha", "short_sha"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    shas.add(value)
+            for path in data.get("changed_paths") or ():
+                if isinstance(path, str) and path:
+                    touched.add(path)
+            token_sources.append(str(data.get("subject") or ""))
+        elif kind == "co_change":
+            path = data.get("path")
+            if isinstance(path, str) and path:
+                cochange.add(path)
+                token_sources.append(path)
+    git_tokens: set = set()
+    for source in token_sources:
+        git_tokens.update(tokenize(source))
+    return _GitFacts(
+        change_states=change_states,
+        recent_touched_paths=frozenset(touched),
+        recent_shas=frozenset(shas),
+        cochange_paths=frozenset(cochange),
+        keyword_paths=frozenset(touched | cochange),
+        matched_task_tokens=frozenset(set(task_tokens) & git_tokens),
+    )
+
+
+def _git_signal_points(
+    candidate: _Candidate,
+    git: _GitFacts,
+    *,
+    focus_file: Optional[str],
+    weights: RelevanceWeights,
+) -> Dict[str, int]:
+    """The five additive git signals for one candidate (design §4).
+
+    A ``None`` weight disables its signal (0 points). The git subtotal
+    is hard-capped at GIT_SIGNAL_TOTAL_CAP, shedding END-first in fixed
+    signal order — the signal that tips over is partially credited —
+    so signals always sum to the candidate total.
+    """
+
+    def weight(value: Optional[int]) -> int:
+        return 0 if value is None else value
+
+    linked_paths = {
+        ref.get("file_path")
+        for ref in candidate.ref_fields
+        if isinstance(ref.get("file_path"), str) and ref.get("file_path")
+    }
+    focused = bool(focus_file) and focus_file in linked_paths
+
+    focused_changed = 0
+    if candidate.is_code and focused:
+        state = git.change_states.get(focus_file)
+        if state is not None and state != "unchanged":
+            focused_changed = weight(weights.git_focused_file_changed)
+
+    touches_focus = 0
+    if focused and focus_file in git.recent_touched_paths:
+        touches_focus = weight(weights.git_commit_touches_focus)
+
+    recent = 0
+    if candidate.section == "code_references":
+        for ref in candidate.ref_fields:
+            if ref.get("commit_sha") in git.recent_shas:
+                recent = weight(weights.git_recent_commit)
+                break
+
+    cochange = 0
+    if candidate.is_code and linked_paths & git.cochange_paths:
+        cochange = weight(weights.git_cochange_with_focus)
+
+    keyword = 0
+    if git.matched_task_tokens and linked_paths & git.keyword_paths:
+        keyword = min(
+            weight(weights.git_task_keyword_cap),
+            weight(weights.git_task_keyword_each)
+            * len(git.matched_task_tokens),
+        )
+
+    points = {
+        "focused_file_changed": focused_changed,
+        "commit_touches_focused_file": touches_focus,
+        "recent_commit": recent,
+        "cochange_with_focus": cochange,
+        "task_keyword_match": keyword,
+    }
+    remaining = GIT_SIGNAL_TOTAL_CAP
+    for name in GIT_SIGNAL_NAMES:  # fixed order, end-first shedding
+        points[name] = min(remaining, points[name])
+        remaining -= points[name]
+    return points
+
+
+
 # -- signals -------------------------------------------------------------------
 
 
@@ -509,6 +719,7 @@ def _score_candidate(
     workspace_channel: Optional[str],
     as_of: datetime,
     weights: RelevanceWeights,
+    git: Optional[_GitFacts] = None,
 ) -> RelevanceScore:
     direct_link = 0
     if (
@@ -565,7 +776,15 @@ def _score_candidate(
         "workspace_match": workspace,
         "resolution": resolution,
     }
-    signals = tuple((name, points[name]) for name in SIGNAL_ORDER)
+    if git is not None:
+        points.update(
+            _git_signal_points(
+                candidate, git, focus_file=focus_file, weights=weights
+            )
+        )
+        signals = tuple((name, points[name]) for name in GIT_SIGNAL_ORDER)
+    else:
+        signals = tuple((name, points[name]) for name in SIGNAL_ORDER)
     if candidate.is_code:
         type_rank = (
             TYPE_RANK_CODE_REFERENCE
@@ -680,6 +899,14 @@ def score_packet(
     workspace_channel = f"ws/{workspace_id}" if workspace_id else None
     task_tokens = tokenize(task)
 
+    # Opt-in git signals: when EVERY git weight is None the git branch
+    # is never entered and the report stays byte-identical relevance-v1.
+    git = None
+    relevance_version = RELEVANCE_VERSION
+    if weights.git_enabled():
+        relevance_version = RELEVANCE_VERSION_GIT1
+        git = _git_facts(packet, task_tokens)
+
     per_section: Dict[str, List[RelevanceScore]] = {
         section: [] for section in SCORED_SECTIONS
     }
@@ -695,11 +922,12 @@ def score_packet(
                 workspace_channel=workspace_channel,
                 as_of=as_of_dt,
                 weights=weights,
+                git=git,
             )
         )
     return RankedContext(
         original_packet_id=packet.packet_id,
-        relevance_version=RELEVANCE_VERSION,
+        relevance_version=relevance_version,
         as_of=as_of_text,
         scores={
             section: _best_first(per_section[section])

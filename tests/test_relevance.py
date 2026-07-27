@@ -23,6 +23,7 @@ from relinkra.context_budget import (
     resolve_budget,
 )
 from relinkra.context_packet import (
+    PACKET_VERSION,
     ContextPacket,
     PacketItem,
     PacketWarning,
@@ -30,7 +31,12 @@ from relinkra.context_packet import (
 )
 from relinkra.relevance import (
     DEFAULT_WEIGHTS,
+    GIT1_WEIGHTS,
+    GIT_SIGNAL_ORDER,
+    GIT_SIGNAL_TOTAL_CAP,
     RELEVANCE_VERSION,
+    RELEVANCE_VERSION_GIT1,
+    SCORED_SECTIONS,
     SIGNAL_ORDER,
     RelevanceValidationError,
     RelevanceWeights,
@@ -41,6 +47,7 @@ from test_context_budget import (
     budget_with_over,
     decisions_by_id,
     fact_item,
+    git_item,
     make_packet,
     memory_item,
     ref_item,
@@ -1195,6 +1202,443 @@ class SecurityTests(unittest.TestCase):
         report = score(packet).to_json()
         self.assertNotIn(secret, report)
         self.assertIn(saved.memory_id, report)
+
+
+class GitRelevanceTests(unittest.TestCase):
+    """relevance-v1-git1 (R2 Git Intelligence, task 3.4): additive opt-in
+    git signals read packet.git_facts only; disabled weights yield a
+    byte-identical relevance-v1 report."""
+
+    SHA_A = "a" * 40
+    SHA_C = "c" * 40
+
+    @staticmethod
+    def commit_item(sha, subject="plain commit", paths=()):
+        return git_item(
+            "recent_commit",
+            sha=sha,
+            short_sha=sha[:7],
+            committed_at="2026-01-31T00:00:00+00:00",
+            author_name="Dev",
+            subject=subject,
+            parents=[],
+            changed_paths=list(paths),
+        )
+
+    @staticmethod
+    def ref_with_commit(rid, sha, path="src/m.py"):
+        reference = {"reference_kind": "file", "file_path": path}
+        if sha is not None:
+            reference["commit_sha"] = sha
+        return PacketItem(
+            data={"reference": reference,
+                  "resolution_state": "resolved", "note": None},
+            provenance=Provenance(
+                source="cbm", why_included="git relevance fixture",
+                code_reference_id=rid),
+        )
+
+    @staticmethod
+    def fully_signaled_packet():
+        """One code_references candidate that fires ALL five git signals:
+        focused file changed, touched by a recent commit, pinned to a
+        recent sha, co-changed, and task-keyword matched."""
+        return GitRelevanceTests.v2_packet(
+            refs=[GitRelevanceTests.ref_with_commit(
+                "ref_c", GitRelevanceTests.SHA_A, path="src/calc.py")],
+            git_facts=[
+                git_item("current_change_state", file_path="src/calc.py",
+                         state="staged"),
+                GitRelevanceTests.commit_item(
+                    GitRelevanceTests.SHA_A, subject="parser module rework",
+                    paths=["src/calc.py"]),
+                git_item("co_change", path="src/calc.py",
+                         shared_commit_count=1, sampled_commit_count=2),
+            ],
+        )
+
+    @staticmethod
+    def v2_packet(**kwargs):
+        kwargs.setdefault("packet_version", PACKET_VERSION)
+        return make_packet(**kwargs)
+
+    def test_constants_and_preset(self):
+        self.assertEqual(RELEVANCE_VERSION_GIT1, "relevance-v1-git1")
+        self.assertEqual(RELEVANCE_VERSION, "relevance-v1")
+        self.assertEqual(
+            GIT_SIGNAL_ORDER,
+            SIGNAL_ORDER
+            + (
+                "focused_file_changed",
+                "commit_touches_focused_file",
+                "recent_commit",
+                "cochange_with_focus",
+                "task_keyword_match",
+            ),
+        )
+        self.assertEqual(len(SIGNAL_ORDER), 8)  # v1 order untouched
+        self.assertEqual(
+            GIT_SIGNAL_TOTAL_CAP,
+            min(DEFAULT_WEIGHTS.direct_code_link,
+                DEFAULT_WEIGHTS.symbol_match) - 1,
+        )
+        self.assertEqual(GIT_SIGNAL_TOTAL_CAP, 34)
+        self.assertEqual(GIT1_WEIGHTS.git_focused_file_changed, 10)
+        self.assertEqual(GIT1_WEIGHTS.git_commit_touches_focus, 8)
+        self.assertEqual(GIT1_WEIGHTS.git_recent_commit, 4)
+        self.assertEqual(GIT1_WEIGHTS.git_cochange_with_focus, 6)
+        self.assertEqual(GIT1_WEIGHTS.git_task_keyword_each, 2)
+        self.assertEqual(GIT1_WEIGHTS.git_task_keyword_cap, 6)
+        # the preset's max subtotal IS the cap: git can never outweigh
+        # direct code (40) or symbol (35) linkage
+        self.assertEqual(10 + 8 + 4 + 6 + 6, GIT_SIGNAL_TOTAL_CAP)
+
+    def test_git_weights_default_disabled(self):
+        for weights in (RelevanceWeights(), DEFAULT_WEIGHTS):
+            self.assertIsNone(weights.git_focused_file_changed)
+            self.assertIsNone(weights.git_commit_touches_focus)
+            self.assertIsNone(weights.git_recent_commit)
+            self.assertIsNone(weights.git_cochange_with_focus)
+            self.assertIsNone(weights.git_task_keyword_each)
+            self.assertIsNone(weights.git_task_keyword_cap)
+        self.assertEqual(DEFAULT_WEIGHTS.direct_code_link, 40)  # v1 intact
+
+    def test_git_disabled_byte_identical_v1(self):
+        git_facts = [
+            self.commit_item(self.SHA_A, subject="Fix parser",
+                             paths=["src/mod.py"]),
+            git_item("co_change", path="src/mod.py",
+                     shared_commit_count=2, sampled_commit_count=3),
+            git_item("current_change_state", file_path="src/mod.py",
+                     state="unstaged"),
+        ]
+        packet_v2 = self.v2_packet(
+            facts=[fact_item("ref_x", path="src/mod.py")],
+            git_facts=git_facts,
+        )
+        packet_v1 = make_packet(facts=[fact_item("ref_x", path="src/mod.py")])
+        kwargs = dict(task="fix parser", focus_file="src/mod.py")
+        ranked_v2 = score(packet_v2, **kwargs)
+        ranked_v1 = score(packet_v1, **kwargs)
+        self.assertEqual(ranked_v2.relevance_version, RELEVANCE_VERSION)
+        # git facts are INVISIBLE to the scorer with disabled weights:
+        # the rlkctx2 report is byte-identical to the rlkctx1 one
+        self.assertEqual(ranked_v2.to_json(), ranked_v1.to_json())
+        entry = only_score(ranked_v2, "code_facts", "ref_x")
+        self.assertEqual(
+            tuple(name for name, _ in entry.signals), SIGNAL_ORDER
+        )
+
+    def test_git_enabled_version_order_and_determinism(self):
+        packet = self.v2_packet(
+            facts=[fact_item("ref_x", path="src/mod.py")],
+            git_facts=[self.commit_item(self.SHA_A, paths=["src/mod.py"])],
+        )
+        ranked = score(packet, weights=GIT1_WEIGHTS, focus_file="src/mod.py")
+        self.assertEqual(ranked.relevance_version, RELEVANCE_VERSION_GIT1)
+        entry = only_score(ranked, "code_facts", "ref_x")
+        self.assertEqual(
+            tuple(name for name, _ in entry.signals), GIT_SIGNAL_ORDER
+        )
+        # ANY single set weight flips the version label to git1
+        partial = score(
+            packet, weights=RelevanceWeights(git_recent_commit=4)
+        )
+        self.assertEqual(partial.relevance_version, RELEVANCE_VERSION_GIT1)
+        outputs = {
+            score(packet, weights=GIT1_WEIGHTS, focus_file="src/mod.py",
+                  task="parser").to_json()
+            for _ in range(3)
+        }
+        self.assertEqual(len(outputs), 1)  # deterministic x3
+
+    def test_focused_file_changed_signal(self):
+        def build(state):
+            return self.v2_packet(
+                facts=[fact_item("ref_x", path="src/calc.py")],
+                git_facts=[git_item("current_change_state",
+                                    file_path="src/calc.py", state=state)],
+            )
+
+        entry = only_score(
+            score(build("unstaged"), weights=GIT1_WEIGHTS,
+                  focus_file="src/calc.py"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(entry, "focused_file_changed"), 10)
+        quiet = only_score(
+            score(build("unchanged"), weights=GIT1_WEIGHTS,
+                  focus_file="src/calc.py"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(quiet, "focused_file_changed"), 0)
+        unfocused = only_score(
+            score(build("conflicted"), weights=GIT1_WEIGHTS),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(unfocused, "focused_file_changed"), 0)
+        # code-only: a memory linked to the focus file never earns it
+        mem_packet = self.v2_packet(
+            memories=[mem("mem_l", "discovery",
+                          code_refs=[{"code_reference_id": "ref_x",
+                                      "file_path": "src/calc.py"}])],
+            git_facts=[git_item("current_change_state",
+                                file_path="src/calc.py", state="staged")],
+        )
+        mem_entry = only_score(
+            score(mem_packet, weights=GIT1_WEIGHTS, focus_file="src/calc.py"),
+            "memories", "mem_l",
+        )
+        self.assertEqual(sig(mem_entry, "focused_file_changed"), 0)
+
+    def test_commit_touches_focused_file_signal(self):
+        def build(paths):
+            return self.v2_packet(
+                facts=[fact_item("ref_x", path="src/calc.py")],
+                git_facts=[self.commit_item(self.SHA_A, paths=paths)],
+            )
+
+        hit = only_score(
+            score(build(["src/calc.py"]), weights=GIT1_WEIGHTS,
+                  focus_file="src/calc.py"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(hit, "commit_touches_focused_file"), 8)
+        # the delta is recorded in the explanation
+        self.assertIn(
+            "commit_touches_focused_file",
+            [s["name"] for s in hit.to_dict()["signals"]],
+        )
+        miss = only_score(
+            score(build(["src/other.py"]), weights=GIT1_WEIGHTS,
+                  focus_file="src/calc.py"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(miss, "commit_touches_focused_file"), 0)
+        # design: ANY candidate linked to the focus file earns it,
+        # including memories linked via code_refs
+        linked = self.v2_packet(
+            memories=[mem("mem_l", "discovery",
+                          code_refs=[{"code_reference_id": "ref_x",
+                                      "file_path": "src/calc.py"}])],
+            git_facts=[self.commit_item(self.SHA_A, paths=["src/calc.py"])],
+        )
+        mem_entry = only_score(
+            score(linked, weights=GIT1_WEIGHTS, focus_file="src/calc.py"),
+            "memories", "mem_l",
+        )
+        self.assertEqual(sig(mem_entry, "commit_touches_focused_file"), 8)
+
+    def test_recent_commit_signal_on_code_references(self):
+        packet = self.v2_packet(
+            refs=[self.ref_with_commit("ref_c", self.SHA_A)],
+            git_facts=[self.commit_item(self.SHA_A)],
+        )
+        entry = only_score(
+            score(packet, weights=GIT1_WEIGHTS), "code_references", "ref_c"
+        )
+        self.assertEqual(sig(entry, "recent_commit"), 4)
+        stale = self.v2_packet(
+            refs=[self.ref_with_commit("ref_c", self.SHA_C)],
+            git_facts=[self.commit_item(self.SHA_A)],
+        )
+        stale_entry = only_score(
+            score(stale, weights=GIT1_WEIGHTS), "code_references", "ref_c"
+        )
+        self.assertEqual(sig(stale_entry, "recent_commit"), 0)
+        # code_facts are NOT code_references: the signal stays silent
+        fact_packet = self.v2_packet(
+            facts=[fact_item("ref_x")],
+            git_facts=[self.commit_item(self.SHA_A)],
+        )
+        fact_packet.code_facts[0].data["commit_sha"] = self.SHA_A
+        fact_entry = only_score(
+            score(fact_packet, weights=GIT1_WEIGHTS), "code_facts", "ref_x"
+        )
+        self.assertEqual(sig(fact_entry, "recent_commit"), 0)
+
+    def test_cochange_with_focus_signal(self):
+        def build(path):
+            return self.v2_packet(
+                facts=[fact_item("ref_x", path=path)],
+                git_facts=[git_item("co_change", path="src/util.py",
+                                    shared_commit_count=3,
+                                    sampled_commit_count=5)],
+            )
+
+        hit = only_score(
+            score(build("src/util.py"), weights=GIT1_WEIGHTS),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(hit, "cochange_with_focus"), 6)
+        miss = only_score(
+            score(build("src/other.py"), weights=GIT1_WEIGHTS),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(miss, "cochange_with_focus"), 0)
+        # code-only: memories linked to a co-changed file stay silent
+        mem_packet = self.v2_packet(
+            memories=[mem("mem_l", "discovery",
+                          code_refs=[{"code_reference_id": "ref_x",
+                                      "file_path": "src/util.py"}])],
+            git_facts=[git_item("co_change", path="src/util.py",
+                                shared_commit_count=3,
+                                sampled_commit_count=5)],
+        )
+        mem_entry = only_score(
+            score(mem_packet, weights=GIT1_WEIGHTS), "memories", "mem_l"
+        )
+        self.assertEqual(sig(mem_entry, "cochange_with_focus"), 0)
+
+    def test_task_keyword_match_on_subject(self):
+        packet = self.v2_packet(
+            facts=[fact_item("ref_x", path="src/parser.py")],
+            git_facts=[self.commit_item(
+                self.SHA_A, subject="Fix parser bug",
+                paths=["src/parser.py"])],
+        )
+        entry = only_score(
+            score(packet, weights=GIT1_WEIGHTS, task="fix parser"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(entry, "task_keyword_match"), 4)  # 2 tokens x 2
+        # a candidate NOT referencing git-tracked paths earns nothing
+        packet_off = self.v2_packet(
+            facts=[fact_item("ref_y", path="src/unrelated.py")],
+            git_facts=[self.commit_item(
+                self.SHA_A, subject="Fix parser bug",
+                paths=["src/parser.py"])],
+        )
+        off_entry = only_score(
+            score(packet_off, weights=GIT1_WEIGHTS, task="fix parser"),
+            "code_facts", "ref_y",
+        )
+        self.assertEqual(sig(off_entry, "task_keyword_match"), 0)
+
+    def test_task_keyword_match_on_cochange_path_and_cap(self):
+        packet = self.v2_packet(
+            facts=[fact_item("ref_x", path="src/invoice/generate.py")],
+            git_facts=[git_item("co_change", path="src/invoice/generate.py",
+                                shared_commit_count=1,
+                                sampled_commit_count=2)],
+        )
+        entry = only_score(
+            score(packet, weights=GIT1_WEIGHTS, task="invoice generate"),
+            "code_facts", "ref_x",
+        )
+        self.assertEqual(sig(entry, "task_keyword_match"), 4)
+        # cap: 4 distinct matching tokens x 2 = 8 -> capped at 6
+        capped = self.v2_packet(
+            facts=[fact_item("ref_y", path="src/alpha/bravo/charlie/delta.py")],
+            git_facts=[git_item("co_change",
+                                path="src/alpha/bravo/charlie/delta.py",
+                                shared_commit_count=1,
+                                sampled_commit_count=2)],
+        )
+        capped_entry = only_score(
+            score(capped, weights=GIT1_WEIGHTS,
+                  task="alpha bravo charlie delta"),
+            "code_facts", "ref_y",
+        )
+        self.assertEqual(sig(capped_entry, "task_keyword_match"), 6)
+        taskless = only_score(
+            score(packet, weights=GIT1_WEIGHTS), "code_facts", "ref_x"
+        )
+        self.assertEqual(sig(taskless, "task_keyword_match"), 0)
+
+    def test_git_subtotal_hard_cap_34(self):
+        heavy = RelevanceWeights(
+            git_focused_file_changed=20,
+            git_commit_touches_focus=20,
+            git_recent_commit=20,
+            git_cochange_with_focus=20,
+            git_task_keyword_each=10,
+            git_task_keyword_cap=40,
+        )
+        packet = self.fully_signaled_packet()
+        entry = only_score(
+            score(packet, weights=heavy, focus_file="src/calc.py",
+                  task="parser module rework"),
+            "code_references", "ref_c",
+        )
+        # raw git subtotal would be 20+20+20+20+30 = 110; the cap sheds
+        # END-first in fixed order: focused_file_changed kept at 20,
+        # commit_touches_focused_file trimmed to 14, the rest 0.
+        self.assertEqual(sig(entry, "focused_file_changed"), 20)
+        self.assertEqual(sig(entry, "commit_touches_focused_file"), 14)
+        self.assertEqual(sig(entry, "recent_commit"), 0)
+        self.assertEqual(sig(entry, "cochange_with_focus"), 0)
+        self.assertEqual(sig(entry, "task_keyword_match"), 0)
+        git_subtotal = sum(
+            points
+            for name, points in entry.signals
+            if name in GIT_SIGNAL_ORDER[len(SIGNAL_ORDER):]
+        )
+        self.assertEqual(git_subtotal, GIT_SIGNAL_TOTAL_CAP)
+        # explainability invariant survives the cap: signals sum to total
+        self.assertEqual(
+            sum(points for _, points in entry.signals), entry.total
+        )
+        # v1 part intact: file_match 25 + resolution_resolved 4
+        self.assertEqual(entry.total, 25 + 4 + GIT_SIGNAL_TOTAL_CAP)
+
+    def test_preset_subtotal_never_exceeds_cap(self):
+        packet = self.fully_signaled_packet()
+        entry = only_score(
+            score(packet, weights=GIT1_WEIGHTS, focus_file="src/calc.py",
+                  task="parser module rework"),
+            "code_references", "ref_c",
+        )
+        for name, points in (
+            ("focused_file_changed", 10),
+            ("commit_touches_focused_file", 8),
+            ("recent_commit", 4),
+            ("cochange_with_focus", 6),
+            ("task_keyword_match", 6),  # 3 matched tokens x 2, at cap
+        ):
+            self.assertEqual(sig(entry, name), points, name)
+
+    def test_empty_git_facts_zero_git_signals(self):
+        packet = self.v2_packet(facts=[fact_item("ref_x", path="src/calc.py")])
+        kwargs = dict(focus_file="src/calc.py", task="parser")
+        ranked = score(packet, weights=GIT1_WEIGHTS, **kwargs)
+        self.assertEqual(ranked.relevance_version, RELEVANCE_VERSION_GIT1)
+        entry = only_score(ranked, "code_facts", "ref_x")
+        for name in GIT_SIGNAL_ORDER[len(SIGNAL_ORDER):]:
+            self.assertEqual(sig(entry, name), 0, name)
+        # totals match the disabled-weights run on the same packet
+        plain = only_score(score(packet, **kwargs), "code_facts", "ref_x")
+        self.assertEqual(entry.total, plain.total)
+
+    def test_git_facts_never_scored_as_candidates(self):
+        packet = self.v2_packet(
+            facts=[fact_item("ref_x")],
+            git_facts=[self.commit_item(self.SHA_A)],
+        )
+        ranked = score(packet, weights=GIT1_WEIGHTS)
+        self.assertEqual(set(ranked.scores), set(SCORED_SECTIONS))
+        self.assertNotIn("git_facts", ranked.scores)
+        # the fingerprint ignores git facts entirely
+        plain = score(make_packet(facts=[fact_item("ref_x")]))
+        self.assertEqual(ranked.packet_fingerprint, plain.packet_fingerprint)
+
+    def test_zero_git_signals_omitted_from_json(self):
+        packet = self.v2_packet(
+            facts=[fact_item("ref_x", path="src/util.py")],
+            git_facts=[git_item("co_change", path="src/util.py",
+                                shared_commit_count=1,
+                                sampled_commit_count=2)],
+        )
+        entry = only_score(
+            score(packet, weights=GIT1_WEIGHTS), "code_facts", "ref_x"
+        )
+        names = [s["name"] for s in entry.to_dict()["signals"]]
+        self.assertIn("cochange_with_focus", names)
+        for silent in ("focused_file_changed", "commit_touches_focused_file",
+                       "recent_commit", "task_keyword_match"):
+            self.assertNotIn(silent, names)
+        full = entry.to_dict(include_zero=True)
+        self.assertEqual(len(full["signals"]), len(GIT_SIGNAL_ORDER))
 
 
 if __name__ == "__main__":

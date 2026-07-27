@@ -48,6 +48,7 @@ from .code_reference import (
 )
 from .context_packet import (
     PACKET_VERSION,
+    PACKET_VERSION_V1,
     ContextPacket,
     PacketItem,
     PacketValidationError,
@@ -64,6 +65,10 @@ from .linkage import (
     LinkageService,
     ResolvedReference,
     candidate_to_reference,
+)
+from .git_intelligence import (
+    GIT_DEFAULT_COMMITS,
+    GitIntelligenceService,
 )
 from .memory import (
     STORE_PAGE_LIMIT,
@@ -98,6 +103,22 @@ WARN_WORKSPACE_MISMATCH = "workspace_mismatch"
 WARN_WORKSPACE_NOT_REGISTERED = "workspace_not_registered"
 WARN_ITEMS_OMITTED = "items_omitted"
 WARN_CONTENT_TRUNCATED = "content_truncated"
+WARN_GIT_CONFLICTS = "git_conflicts"
+
+# Git-fact cap priority (quality-first, handoff Phase 18): essential repo
+# state and focused-file/anchored kinds outrank bulk listing kinds when
+# the total cap trims. Everything not listed here (working_tree_change,
+# recent_commit) is bulk and is shed first.
+GIT_FACT_CAP_PRIORITY_KINDS = frozenset(
+    {
+        "repository_state",
+        "head_facts",
+        "current_change_state",
+        "file_history",
+        "diff_fact",
+        "co_change",
+    }
+)
 
 _TASK_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -128,6 +149,9 @@ class Guardrails:
     max_pending: int = 5
     max_handoffs: int = 3
     max_warnings: int = 10
+    max_git_facts: int = 24
+    max_git_diff_entries: int = 8
+    max_git_cochange: int = 10
 
 
 @dataclass
@@ -139,6 +163,9 @@ class ContextRequest:
     symbol: Optional[str] = None
     requesting_agent: str = ""
     include_agent_private: bool = False
+    include_git: bool = False
+    git_history_limit: Optional[int] = None
+    git_include_diff_snippets: bool = False
 
 
 def _type_rank(memory_type: str) -> int:
@@ -181,6 +208,7 @@ class ContextBuilder:
         workspace_root: Optional[str] = None,
         guardrails: Optional[Guardrails] = None,
         clock=_utcnow,
+        git_service: Any = None,
     ):
         self.memories = memory_service
         self.cbm = cbm_adapter
@@ -189,6 +217,7 @@ class ContextBuilder:
         self.guardrails = guardrails or Guardrails()
         self._clock = clock
         self.linkage = LinkageService(memory_service, cbm_adapter)
+        self.git = git_service if git_service is not None else GitIntelligenceService()
 
     # -- public API -----------------------------------------------------
 
@@ -214,6 +243,15 @@ class ContextBuilder:
 
         mode = self._mode_for(request, workspace_id)
         task = (request.task or "").strip() or None
+        # Packet identity stays in the rlkctx1 namespace: compute_packet_id
+        # is always fed PACKET_VERSION_V1 so a git-off packet is
+        # byte-identical to a pre-git build AND a git-on packet with the
+        # same selected sources yields the SAME packet_id (git facts never
+        # participate in identity). The emitted packet_version field alone
+        # reflects rlkctx2 when git facts are requested.
+        packet_version = (
+            PACKET_VERSION if request.include_git else PACKET_VERSION_V1
+        )
 
         project, workspace = self._registry_context(
             project_id, workspace_id, warnings
@@ -239,6 +277,11 @@ class ContextBuilder:
             )
         )
         linked_ids |= focus_linked_ids
+
+        git_items = self._collect_git_facts(
+            request, mode, focus, project_id, workspace_id,
+            warnings, omitted, diagnostics,
+        )
 
         matched_tokens = self._task_token_map(mode, task, candidates)
         ordered = _priority_sort(candidates)
@@ -268,6 +311,7 @@ class ContextBuilder:
             task=task,
             focus=focus,
             source_ids=tuple(source_ids),
+            packet_version=PACKET_VERSION_V1,
         )
 
         omission_warnings: List[PacketWarning] = []
@@ -285,23 +329,26 @@ class ContextBuilder:
         sources = sorted(
             {item.provenance.source for item in (
                 memory_items + pending_items + handoff_items
-                + code_ref_items + code_fact_items
+                + code_ref_items + code_fact_items + git_items
             )}
             | ({"registry"} if project is not None else set())
             | {"relinkra"}
         )
+        counts = {
+            "memories": len(memory_items),
+            "pending": len(pending_items),
+            "handoffs": len(handoff_items),
+            "code_references": len(code_ref_items),
+            "code_facts": len(code_fact_items),
+            "warnings": len(warnings),
+            "snippets": snip_stats["snippets"],
+        }
+        if request.include_git:
+            counts["git_facts"] = len(git_items)
         diagnostics.update(
             {
                 "mode": mode,
-                "counts": {
-                    "memories": len(memory_items),
-                    "pending": len(pending_items),
-                    "handoffs": len(handoff_items),
-                    "code_references": len(code_ref_items),
-                    "code_facts": len(code_fact_items),
-                    "warnings": len(warnings),
-                    "snippets": snip_stats["snippets"],
-                },
+                "counts": counts,
                 "omitted": {k: v for k, v in sorted(omitted.items())},
                 "truncated_snippets": snip_stats["truncated"],
                 "selected_source_ids": source_ids,
@@ -313,6 +360,7 @@ class ContextBuilder:
             created_at=self._clock(),
             mode=mode,
             project_id=project_id,
+            packet_version=packet_version,
             workspace_id=workspace_id,
             repository_identity=repository_identity,
             requesting_agent=(request.requesting_agent or ""),
@@ -324,10 +372,11 @@ class ContextBuilder:
             code_facts=code_fact_items,
             pending=pending_items,
             handoffs=handoff_items,
+            git_facts=git_items,
             warnings=warnings,
             provenance={
                 "builder": "relinkra.context_builder",
-                "packet_version": PACKET_VERSION,
+                "packet_version": packet_version,
                 "sources": sources,
                 "ranking": "deterministic (type priority + keyword filter); "
                 "no embeddings, no LLM ranking, no token budgets",
@@ -432,6 +481,221 @@ class ContextBuilder:
             if cache_dir is not None and _is_absolute_infra_path(cache_dir):
                 local["cbm_cache_dir"] = cache_dir
         return local
+
+    # -- git facts (R2, opt-in) --------------------------------------------
+
+    def _collect_git_facts(
+        self, request, mode, focus, project_id, workspace_id,
+        warnings, omitted, diagnostics,
+    ) -> List[PacketItem]:
+        """Collect opt-in git facts as typed PacketItems (source="git").
+
+        Mode mapping (design §2): every mode gets repository_state +
+        head_facts; workspace-and-above adds working_tree_change entries
+        and recent_commit; file/symbol add current_change_state,
+        file_history, diff_fact (focused file first) and co_change anchored
+        at FILE level; task adds co_change only with a file anchor. Every
+        section degrades to partial facts + WARN_GIT_* warnings — the
+        packet always stays valid. The absolute repository root is exposed
+        ONLY under diagnostics["local"] (machine-local channel).
+        """
+        if not request.include_git:
+            return []
+        if not self.workspace_root:
+            # No resolvable workspace root: git is silently skipped.
+            return []
+        g = self.guardrails
+        root = self.workspace_root
+        caps, cap_warnings = self.git.collect_capabilities(root)
+        for git_warning in cap_warnings:
+            warnings.append(PacketWarning(git_warning.code, git_warning.message))
+        if caps.repository_root:
+            local = diagnostics.setdefault("local", {})
+            local["git_repository_root"] = caps.repository_root
+        if not (caps.git_available and caps.repository_detected):
+            return []
+
+        items: List[PacketItem] = []
+
+        def add(kind, data, why, ref_id=None):
+            payload = {"kind": kind}
+            payload.update(data)
+            items.append(
+                PacketItem(
+                    data=payload,
+                    provenance=Provenance(
+                        source="git",
+                        why_included=why,
+                        code_reference_id=ref_id,
+                    ),
+                )
+            )
+
+        def extend_warnings(section_warnings):
+            for git_warning in section_warnings:
+                warnings.append(
+                    PacketWarning(git_warning.code, git_warning.message)
+                )
+
+        state, state_warnings = self.git.collect_repository_state(root)
+        extend_warnings(state_warnings)
+        if state is not None:
+            add(
+                "repository_state",
+                state.to_dict(),
+                f"git repository state (mode={mode})",
+            )
+        head, head_warnings = self.git.collect_head_facts(root)
+        extend_warnings(head_warnings)
+        if head is not None:
+            add("head_facts", head.to_dict(), f"git HEAD facts (mode={mode})")
+        if mode == "project":
+            return self._cap_git_facts(items, omitted)
+
+        tree, tree_warnings = self.git.collect_working_tree(root)
+        extend_warnings(tree_warnings)
+        if tree is not None:
+            if tree.conflicted:
+                warnings.append(
+                    PacketWarning(
+                        WARN_GIT_CONFLICTS,
+                        f"{len(tree.conflicted)} conflicted path(s) in the "
+                        "working tree",
+                    )
+                )
+            buckets = (
+                ("conflicted", tree.conflicted),
+                ("staged", tree.staged),
+                ("unstaged", tree.unstaged),
+                ("untracked", tree.untracked),
+                ("deleted", tree.deleted),
+            )
+            for bucket_state, paths in buckets:
+                for path in paths:
+                    add(
+                        "working_tree_change",
+                        {"path": path, "state": bucket_state, "old_path": None},
+                        f"git working tree change (mode={mode})",
+                    )
+            for old_path, new_path in tree.renamed:
+                add(
+                    "working_tree_change",
+                    {"path": new_path, "state": "renamed", "old_path": old_path},
+                    f"git working tree change (mode={mode})",
+                )
+        limit = (
+            request.git_history_limit
+            if request.git_history_limit is not None
+            else GIT_DEFAULT_COMMITS
+        )
+        commits, commit_warnings = self.git.collect_recent_commits(
+            root, limit=limit
+        )
+        extend_warnings(commit_warnings)
+        for commit in commits:
+            add(
+                "recent_commit",
+                commit.to_dict(),
+                f"git recent commit (mode={mode})",
+            )
+
+        anchor = None
+        if mode in ("file", "symbol") and focus:
+            anchor = focus.get("file_path")
+        elif mode == "task" and (request.file or "").strip():
+            anchor = normalize_repo_path(request.file)
+        if anchor is None:
+            return self._cap_git_facts(items, omitted)
+        anchor_ref_id = CodeReference(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            reference_kind="file",
+            file_path=anchor,
+        ).code_reference_id
+
+        if mode in ("file", "symbol"):
+            change, change_warnings = self.git.collect_current_change_state(
+                root, anchor
+            )
+            extend_warnings(change_warnings)
+            if change is not None:
+                add(
+                    "current_change_state",
+                    {"file_path": anchor, "state": change.value},
+                    f"git current change state for the focused file "
+                    f"(mode={mode})",
+                    anchor_ref_id,
+                )
+            history, history_warnings = self.git.collect_file_history(
+                root, anchor, limit=request.git_history_limit
+            )
+            extend_warnings(history_warnings)
+            if history:
+                add(
+                    "file_history",
+                    {
+                        "file_path": anchor,
+                        "commits": [c.to_dict() for c in history],
+                    },
+                    f"git file history for the focused file (mode={mode})",
+                    anchor_ref_id,
+                )
+            diffs, diff_warnings = self.git.collect_diff(
+                root, include_snippets=request.git_include_diff_snippets
+            )
+            extend_warnings(diff_warnings)
+            # Stable partition: the focused file's diff facts lead, the
+            # rest keep git's path order.
+            ordered_diffs = [f for f in diffs if f.path == anchor] + [
+                f for f in diffs if f.path != anchor
+            ]
+            for fact in ordered_diffs[: g.max_git_diff_entries]:
+                add(
+                    "diff_fact",
+                    fact.to_dict(),
+                    f"git diff fact (mode={mode})",
+                )
+        cochange, cochange_warnings = self.git.collect_cochange(root, anchor)
+        extend_warnings(cochange_warnings)
+        for fact in cochange[: g.max_git_cochange]:
+            add(
+                "co_change",
+                fact.to_dict(),
+                f"git co-changed path for the focused file (mode={mode})",
+                anchor_ref_id,
+            )
+        return self._cap_git_facts(items, omitted)
+
+    def _cap_git_facts(self, items, omitted) -> List[PacketItem]:
+        """Total git-fact guardrail: deterministic priority-first
+        shedding, reported through the shared omission channel.
+
+        Essentials (repository_state/head_facts) and focused-file kinds
+        (current_change_state, file_history, diff_fact, co_change) are
+        kept before bulk listing kinds (working_tree_change,
+        recent_commit); within each class the original append order is
+        preserved and shedding is from the end of the class. Survivors
+        keep their original append order in the packet.
+        """
+        limit = self.guardrails.max_git_facts
+        if len(items) <= limit:
+            return items
+        omitted["git_facts"] = (
+            omitted.get("git_facts", 0) + len(items) - limit
+        )
+        priority_idx = [
+            i
+            for i, item in enumerate(items)
+            if item.data.get("kind") in GIT_FACT_CAP_PRIORITY_KINDS
+        ]
+        bulk_idx = [
+            i
+            for i, item in enumerate(items)
+            if item.data.get("kind") not in GIT_FACT_CAP_PRIORITY_KINDS
+        ]
+        keep = set(priority_idx[:limit])
+        keep.update(bulk_idx[: max(0, limit - len(keep))])
+        return [item for i, item in enumerate(items) if i in keep]
 
     # -- memory selection -------------------------------------------------
 

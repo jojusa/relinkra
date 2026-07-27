@@ -25,7 +25,9 @@ from relinkra.context_budget import (
     TRUNCATION_MARKER,
     BudgetValidationError,
     ContextBudget,
+    _usage,
     apply_budget,
+    classify_git_fact,
     classify_memory_type,
     estimate_tokens,
     prepare_budgeted_packet,
@@ -38,6 +40,7 @@ from relinkra.context_packet import (
     PacketWarning,
     Provenance,
     compute_packet_id,
+    PACKET_VERSION_V1,
 )
 from test_context_packet import (
     FIXED_NOW,
@@ -116,13 +119,28 @@ def ref_item(rid):
     )
 
 
+def git_item(kind, ref=None, **data):
+    payload = {"kind": kind}
+    payload.update(data)
+    return PacketItem(
+        data=payload,
+        provenance=Provenance(
+            source="git",
+            why_included="budget git fixture",
+            code_reference_id=ref,
+        ),
+    )
+
+
 def make_packet(*, memories=(), facts=(), refs=(), pending=(), handoffs=(),
-                warnings=(), task="budget fixture task"):
+                git_facts=(), warnings=(), task="budget fixture task",
+                packet_version=PACKET_VERSION_V1):
     return ContextPacket(
         packet_id=compute_packet_id(project_id=PID, mode="project"),
         created_at=FIXED_NOW,
         mode="project",
         project_id=PID,
+        packet_version=packet_version,
         requesting_agent="opencode",
         task=task,
         project_facts={"registered": True, "display_name": "fixture"},
@@ -131,10 +149,11 @@ def make_packet(*, memories=(), facts=(), refs=(), pending=(), handoffs=(),
         code_facts=list(facts),
         pending=list(pending),
         handoffs=list(handoffs),
+        git_facts=list(git_facts),
         warnings=list(warnings),
         provenance={
             "builder": "relinkra.context_builder",
-            "packet_version": PACKET_VERSION,
+            "packet_version": packet_version,
             "sources": ["engram", "relinkra"],
         },
         diagnostics={"mode": "project"},
@@ -948,7 +967,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual(report["status"], "OK")
         self.assertTrue(report["decisions"])
         packet = json.loads(out)  # stdout stays the packet
-        self.assertEqual(packet["packet_version"], PACKET_VERSION)
+        # git-off builds keep emitting rlkctx1 (byte-compatible); the
+        # PACKET_VERSION constant now denotes the LATEST version (rlkctx2).
+        self.assertEqual(packet["packet_version"], PACKET_VERSION_V1)
 
     def test_unsatisfiable_exit_1_with_stderr_json(self):
         code, out, err = self.run_cli(self.base_argv("--max-tokens", "1"))
@@ -1413,6 +1434,176 @@ class CLIUnsatisfiableContractTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")  # no markdown on unsatisfiable
         self.assert_single_error_doc(err, expect_report=True)
+
+
+class GitBudgetTests(unittest.TestCase):
+    """rlkctx2 git_facts budget integration (R2 Git Intelligence, B3)."""
+
+    def v2_packet(self, **kwargs):
+        kwargs.setdefault("packet_version", PACKET_VERSION)
+        return make_packet(**kwargs)
+
+    def budget_over(self, packet, over):
+        return ContextBudget(
+            max_estimated_tokens=budget_with_over(packet, over)
+        )
+
+    def test_classify_git_fact_mapping(self):
+        for kind in (
+            "repository_state",
+            "head_facts",
+            "current_change_state",
+            "working_tree_change",
+            "recent_commit",
+            "file_history",
+        ):
+            self.assertEqual(classify_git_fact(kind), "important", kind)
+        for kind in ("diff_fact", "co_change", "unknown_future_kind"):
+            self.assertEqual(classify_git_fact(kind), "optional", kind)
+
+    def test_git_facts_measured_in_usage_for_rlkctx2_only(self):
+        packet = self.v2_packet(
+            git_facts=[git_item("repository_state", head_sha="a" * 40)]
+        )
+        usage = _usage(packet, DEFAULT_CHARS_PER_TOKEN)
+        self.assertGreater(usage.sections["git_facts"]["chars"], 0)
+        # rlkctx1 packets never carry the section: budget accounting stays
+        # byte-compatible with pre-git behavior.
+        legacy = make_packet(packet_version=PACKET_VERSION_V1)
+        legacy_usage = _usage(legacy, DEFAULT_CHARS_PER_TOKEN)
+        self.assertNotIn("git_facts", legacy_usage.sections)
+
+    def test_optional_git_shed_before_important_git(self):
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("repository_state", ref="ref_state",
+                         head_sha="a" * 40),
+                git_item("co_change", ref="ref_co", path="src/co.py",
+                         shared_commit_count=3, note="x" * 900),
+                git_item("diff_fact", ref="ref_diff", path="src/d.py",
+                         note="y" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        # Optional git facts shed from the END first; the important
+        # repository_state is never touched by the optional step.
+        self.assertEqual(surviving, ["repository_state", "co_change"])
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["ref_diff"].action, "omitted")
+        self.assertEqual(
+            decisions["ref_diff"].reason,
+            "optional_section_budget_exhausted",
+        )
+
+    def test_optional_memories_shed_before_optional_git(self):
+        packet = self.v2_packet(
+            memories=[memory_item("mem_opt", "discovery", "x" * 900)],
+            git_facts=[
+                git_item("co_change", ref="ref_co", path="src/co.py",
+                         note="y" * 900),
+            ],
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.packet.memories, [])
+        self.assertEqual(len(result.packet.git_facts), 1)
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["mem_opt"].action, "omitted")
+        self.assertEqual(
+            decisions["mem_opt"].reason,
+            "optional_section_budget_exhausted",
+        )
+
+    def test_important_git_shed_after_important_memories(self):
+        packet = self.v2_packet(
+            memories=[memory_item("mem_dec", "decision", "d" * 900)],
+            git_facts=[
+                git_item("repository_state", ref="ref_state",
+                         head_sha="a" * 40, note="z" * 900),
+            ],
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        # Important memories are shed BEFORE important git facts.
+        self.assertEqual(result.packet.memories, [])
+        self.assertEqual(len(result.packet.git_facts), 1)
+        decisions = decisions_by_id(result)
+        self.assertEqual(
+            decisions["mem_dec"].reason,
+            "important_section_budget_exhausted",
+        )
+
+    def test_important_git_shed_before_code_references_beyond_first(self):
+        packet = self.v2_packet(
+            refs=[ref_item("ref_focus"), ref_item("ref_extra")],
+            git_facts=[
+                git_item("repository_state", ref="ref_state",
+                         head_sha="a" * 40, note="z" * 900),
+            ],
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.packet.git_facts, [])
+        self.assertEqual(len(result.packet.code_references), 2)
+        decisions = decisions_by_id(result)
+        self.assertEqual(
+            decisions["ref_state"].reason,
+            "important_section_budget_exhausted",
+        )
+
+    def test_hard_guarantee_holds_with_git_facts(self):
+        packet = self.v2_packet(
+            memories=[memory_item("mem_dec", "decision", "d" * 700)],
+            git_facts=[
+                git_item("repository_state", ref="ref_state", note="s" * 700),
+                git_item("recent_commit", ref="ref_c1", subject="one",
+                         note="t" * 700),
+                git_item("co_change", ref="ref_co", note="u" * 700),
+            ],
+        )
+        budget = self.budget_over(packet, 40)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        payload = result.packet.to_json()
+        self.assertLessEqual(
+            estimate_tokens(payload, budget.chars_per_token),
+            budget.max_estimated_tokens,
+        )
+
+    def test_input_packet_never_mutated_with_git_facts(self):
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("repository_state", ref="ref_state", note="s" * 700),
+                git_item("co_change", ref="ref_co", note="u" * 700),
+            ],
+        )
+        snapshot = packet.to_json()
+        budget = self.budget_over(packet, 20)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(packet.to_json(), snapshot)
+        self.assertEqual(len(packet.git_facts), 2)
+
+    def test_git_fact_decisions_are_audited(self):
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("repository_state", ref="ref_state"),
+                git_item("diff_fact", ref="ref_diff"),
+            ]
+        )
+        budget = self.budget_over(packet, 0)
+        result = apply_budget(packet, budget)
+        self.assertEqual(result.status, "OK")
+        sections = {
+            d.section for d in result.decisions if d.source_id != "essential"
+        }
+        self.assertEqual(sections, {"git_facts"})
 
 
 if __name__ == "__main__":

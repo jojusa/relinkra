@@ -13,7 +13,10 @@ the R1F accountant (see docs/context-budget.md); --budget-report writes
 the audit report JSON to stderr. --relevance ranks the packet with the
 R1G deterministic scorer first (see docs/relevance-scoring.md) and
 --relevance-report writes the RankedContext JSON to stderr; when both
-reports are requested stderr carries ONE combined object. Every stream
+reports are requested stderr carries ONE combined object. --git opts in
+to R2 read-only git facts (rlkctx2 packet with a git_facts section;
+--git-history-limit bounds commit history) — git-off output stays
+byte-identical to R1E. Every stream
 carries AT MOST one JSON document: on an unsatisfiable budget stdout
 stays empty and stderr gets a single error object (with the reports
 embedded when requested).
@@ -120,6 +123,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the RankedContext JSON to stderr (requires "
         "--relevance)",
     )
+    parser.add_argument(
+        "--git",
+        action="store_true",
+        help="opt in to R2 read-only git facts: the packet becomes "
+        "rlkctx2 with a git_facts section (see docs/git-intelligence.md)",
+    )
+    parser.add_argument(
+        "--git-history-limit",
+        type=int,
+        default=None,
+        help="max commits for git recent-commit/file-history facts "
+        "(requires --git; service default and clamps apply)",
+    )
     return parser
 
 
@@ -188,6 +204,8 @@ def main(
         symbol=args.symbol,
         requesting_agent=args.requesting_agent or "",
         include_agent_private=bool(args.include_agent_private),
+        include_git=bool(args.git),
+        git_history_limit=args.git_history_limit,
     )
     try:
         packet = builder.build(request)

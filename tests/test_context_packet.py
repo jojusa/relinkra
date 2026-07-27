@@ -24,17 +24,26 @@ from relinkra.context_builder import (
     Guardrails,
 )
 from relinkra.context_packet import (
+    ACCEPTED_PACKET_VERSIONS,
     PACKET_VERSION,
+    PACKET_VERSION_V1,
     ContextPacket,
     PacketItem,
+    PacketValidationError,
     PacketWarning,
     Provenance,
+    SOURCES,
     compute_packet_id,
 )
 from relinkra.engram_adapter import EngramCLIAdapter, InMemoryStore
 from relinkra.identity import derive_project_id, normalize_remote_url
 from relinkra.memory import MemoryService, MemoryStoreError
 from relinkra.registry import Registry
+
+try:
+    from tests import git_fixtures as gf
+except ImportError:  # pragma: no cover - discover vs module invocation
+    import git_fixtures as gf
 
 IDENTITY = normalize_remote_url("https://github.com/org/repo")
 PID = derive_project_id(IDENTITY.value)
@@ -288,7 +297,9 @@ class SerializationTests(unittest.TestCase):
                                          separators=(",", ":"),
                                          ensure_ascii=False))
         parsed = json.loads(raw)
-        self.assertEqual(parsed["packet_version"], PACKET_VERSION)
+        # git-off builds keep emitting rlkctx1 (byte-compatible); the
+        # PACKET_VERSION constant now denotes the LATEST version (rlkctx2).
+        self.assertEqual(parsed["packet_version"], PACKET_VERSION_V1)
         self.assertEqual(parsed["packet_id"], packet.packet_id)
 
     def test_json_round_trip(self):
@@ -1002,7 +1013,7 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         packet = json.loads(out)
-        self.assertEqual(packet["packet_version"], PACKET_VERSION)
+        self.assertEqual(packet["packet_version"], PACKET_VERSION_V1)
 
     def test_invalid_input_exit_1(self):
         code, out, err = self.run_cli(
@@ -1108,6 +1119,177 @@ class PortableCacheDirTests(unittest.TestCase):
             "relative/cbm",
         )
         self.assertNotIn("local", packet.diagnostics)
+
+
+class GitPacketTests(unittest.TestCase):
+    """rlkctx2 optional git_facts section (R2 Git Intelligence, B3)."""
+
+    def git_item(self, kind="repository_state", **data):
+        payload = {"kind": kind}
+        payload.update(data)
+        return PacketItem(
+            data=payload,
+            provenance=Provenance(source="git", why_included="git fixture"),
+        )
+
+    def make_packet(self, *, packet_version=PACKET_VERSION, git_facts=()):
+        return ContextPacket(
+            packet_id=compute_packet_id(project_id=PID, mode="project"),
+            created_at=FIXED_NOW,
+            mode="project",
+            project_id=PID,
+            packet_version=packet_version,
+            git_facts=list(git_facts),
+        )
+
+    def test_version_constants(self):
+        self.assertEqual(PACKET_VERSION, "rlkctx2")
+        self.assertEqual(PACKET_VERSION_V1, "rlkctx1")
+        self.assertEqual(ACCEPTED_PACKET_VERSIONS, ("rlkctx1", "rlkctx2"))
+        self.assertIn("git", SOURCES)
+
+    def test_rlkctx2_to_dict_emits_git_facts(self):
+        packet = self.make_packet(
+            git_facts=[self.git_item(head_sha="a" * 40, branch="main")]
+        )
+        raw = packet.to_dict()
+        self.assertEqual(raw["packet_version"], "rlkctx2")
+        self.assertEqual(len(raw["git_facts"]), 1)
+        entry = raw["git_facts"][0]
+        self.assertEqual(entry["data"]["kind"], "repository_state")
+        self.assertEqual(entry["data"]["branch"], "main")
+        self.assertEqual(entry["provenance"]["source"], "git")
+
+    def test_rlkctx1_to_dict_omits_git_facts_key(self):
+        # Even when git facts are attached, an rlkctx1 packet never
+        # serializes the section (byte-compatible git-off output).
+        packet = self.make_packet(
+            packet_version=PACKET_VERSION_V1,
+            git_facts=[self.git_item()],
+        )
+        self.assertNotIn("git_facts", packet.to_dict())
+
+    def test_rlkctx2_without_facts_emits_empty_section(self):
+        packet = self.make_packet()
+        self.assertEqual(packet.to_dict()["git_facts"], [])
+
+    def test_from_dict_accepts_rlkctx1_missing_section(self):
+        packet = self.make_packet(packet_version=PACKET_VERSION_V1)
+        clone = ContextPacket.from_dict(packet.to_dict())
+        self.assertEqual(clone.packet_version, "rlkctx1")
+        self.assertEqual(clone.git_facts, [])
+        self.assertEqual(clone.to_dict(), packet.to_dict())
+
+    def test_from_dict_rlkctx2_round_trip(self):
+        packet = self.make_packet(
+            git_facts=[
+                self.git_item(),
+                self.git_item("co_change", path="src/b.py",
+                              shared_commit_count=3),
+            ]
+        )
+        clone = ContextPacket.from_dict(packet.to_dict())
+        self.assertEqual(clone.to_dict(), packet.to_dict())
+        kinds = [item.data["kind"] for item in clone.git_facts]
+        self.assertEqual(kinds, ["repository_state", "co_change"])
+
+    def test_from_dict_rejects_unknown_version(self):
+        raw = self.make_packet().to_dict()
+        raw["packet_version"] = "rlkctx3"
+        with self.assertRaises(PacketValidationError):
+            ContextPacket.from_dict(raw)
+
+
+class ContextCliGitFlagTests(unittest.TestCase):
+    """context_cli --git / --git-history-limit (R2 Git Intelligence, B4 4.2)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.cleanup)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = gf.make_repo(os.path.join(self.tmp.name, "repo"))
+        gf.scenario_abcd(self.repo)
+
+    def run_cli(self, argv, **kwargs):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = context_cli.main(argv, **kwargs)
+        return code, out.getvalue(), err.getvalue()
+
+    def base_argv(self):
+        return [
+            "--project-id", self.env.project_id,
+            "--registry", self.env.registry_path,
+        ]
+
+    def test_git_flag_emits_rlkctx2_with_git_facts(self):
+        code, out, err = self.run_cli(
+            self.base_argv() + ["--workspace-root", self.repo, "--git"],
+            store=self.env.store, clock=fixed_clock,
+        )
+        self.assertEqual(code, 0, err)
+        packet = json.loads(out)
+        self.assertEqual(packet["packet_version"], PACKET_VERSION)
+        kinds = [item["data"]["kind"] for item in packet["git_facts"]]
+        self.assertIn("repository_state", kinds)
+        self.assertIn("head_facts", kinds)
+        for item in packet["git_facts"]:
+            self.assertEqual(item["provenance"]["source"], "git")
+        # absolute repo root is local-diagnostics only, never in git facts
+        self.assertNotIn(self.repo, json.dumps(packet["git_facts"]))
+        self.assertEqual(
+            packet["diagnostics"]["local"]["git_repository_root"],
+            os.path.abspath(self.repo).replace("\\", "/").rstrip("/"),
+        )
+
+    def test_git_off_default_byte_identical(self):
+        argv = self.base_argv()
+        code_a, out_a, err_a = self.run_cli(
+            argv, store=self.env.store, clock=fixed_clock
+        )
+        code_b, out_b, err_b = self.run_cli(
+            argv + ["--workspace-root", self.repo],
+            store=self.env.store, clock=fixed_clock,
+        )
+        self.assertEqual(code_a, 0, err_a)
+        self.assertEqual(code_b, 0, err_b)
+        packet = json.loads(out_b)
+        self.assertEqual(packet["packet_version"], PACKET_VERSION_V1)
+        self.assertNotIn("git_facts", packet)
+        # --workspace-root alone changes nothing when --git is absent
+        self.assertEqual(out_a, out_b)
+        self.assertEqual(err_a, err_b)
+
+    def test_git_history_limit_maps_to_recent_commits(self):
+        argv = self.base_argv() + [
+            "--workspace-root", self.repo,
+            "--task", "investigate alpha",
+            "--git",
+        ]
+        code, out, err = self.run_cli(
+            argv + ["--git-history-limit", "2"],
+            store=self.env.store, clock=fixed_clock,
+        )
+        self.assertEqual(code, 0, err)
+        packet = json.loads(out)
+        recent = [
+            item for item in packet["git_facts"]
+            if item["data"]["kind"] == "recent_commit"
+        ]
+        self.assertEqual(len(recent), 2)
+        self.assertEqual(recent[0]["data"]["subject"], "D")
+
+        code, out, err = self.run_cli(
+            argv, store=self.env.store, clock=fixed_clock
+        )
+        self.assertEqual(code, 0, err)
+        packet = json.loads(out)
+        recent = [
+            item for item in packet["git_facts"]
+            if item["data"]["kind"] == "recent_commit"
+        ]
+        self.assertEqual(len(recent), 4)  # default 10, repo has 4 commits
 
 
 if __name__ == "__main__":

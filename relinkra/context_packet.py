@@ -25,7 +25,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
 
-PACKET_VERSION = "rlkctx1"
+PACKET_VERSION = "rlkctx2"
+PACKET_VERSION_V1 = "rlkctx1"
+ACCEPTED_PACKET_VERSIONS = (PACKET_VERSION_V1, PACKET_VERSION)
 PACKET_ID_PREFIX = "pkt_"
 PACKET_ID_RE = re.compile(r"^pkt_[0-9a-f]{32}$")
 _PACKET_NAMESPACE = b"relinkra/context-packet/v1\x00"
@@ -34,7 +36,7 @@ MODES = ("project", "workspace", "task", "file", "symbol")
 # Highest first: a more specific focus always wins over a broader one.
 MODE_PRECEDENCE = ("symbol", "file", "task", "workspace", "project")
 
-SOURCES = ("registry", "engram", "cbm", "relinkra")
+SOURCES = ("registry", "engram", "cbm", "relinkra", "git")
 
 PROJECT_ID_RE = re.compile(r"^rlk_[0-9a-f]{32}$")
 WORKSPACE_ID_RE = re.compile(r"^ws_[0-9a-f]{32}$")
@@ -207,12 +209,13 @@ class ContextPacket:
     code_facts: List[PacketItem] = field(default_factory=list)
     pending: List[PacketItem] = field(default_factory=list)
     handoffs: List[PacketItem] = field(default_factory=list)
+    git_facts: List[PacketItem] = field(default_factory=list)
     warnings: List[PacketWarning] = field(default_factory=list)
     provenance: dict = field(default_factory=dict)
     diagnostics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "packet_version": self.packet_version,
             "packet_id": self.packet_id,
             "created_at": self.created_at,
@@ -233,6 +236,11 @@ class ContextPacket:
             "provenance": self.provenance,
             "diagnostics": self.diagnostics,
         }
+        # The git_facts section is emitted ONLY by rlkctx2 packets; rlkctx1
+        # output never carries the key (byte-compatible git-off behavior).
+        if self.packet_version == PACKET_VERSION:
+            data["git_facts"] = [item.to_dict() for item in self.git_facts]
+        return data
 
     @staticmethod
     def from_dict(data: Mapping) -> "ContextPacket":
@@ -243,7 +251,7 @@ class ContextPacket:
                 raise PacketValidationError(
                     f"packet missing required field: {required}"
                 )
-        if str(data.get("packet_version") or "") != PACKET_VERSION:
+        if str(data.get("packet_version") or "") not in ACCEPTED_PACKET_VERSIONS:
             raise PacketValidationError("unsupported packet_version")
         return ContextPacket(
             packet_version=str(data["packet_version"]),
@@ -267,6 +275,9 @@ class ContextPacket:
             pending=[PacketItem.from_dict(i) for i in data.get("pending") or []],
             handoffs=[
                 PacketItem.from_dict(i) for i in data.get("handoffs") or []
+            ],
+            git_facts=[
+                PacketItem.from_dict(i) for i in data.get("git_facts") or []
             ],
             warnings=[
                 PacketWarning.from_dict(w) for w in data.get("warnings") or []

@@ -106,7 +106,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .context_packet import ContextPacket, PacketItem
+from .context_packet import PACKET_VERSION, ContextPacket, PacketItem
 
 ESTIMATION_METHOD = "chars-per-token"
 ESTIMATION_VERSION = "cpt1"
@@ -140,10 +140,25 @@ REPORT_ID_PREFIX = "bgr_"
 _REPORT_NAMESPACE = b"relinkra/budget-report/v1\x00"
 
 _ITEM_SECTIONS = ("memories", "code_references", "code_facts", "pending",
-                  "handoffs")
+                  "handoffs", "git_facts")
 _SECTION_KINDS = {"memories": "memory", "code_references": "code_reference",
                   "code_facts": "code_fact", "pending": "pending",
-                  "handoffs": "handoff"}
+                  "handoffs": "handoff", "git_facts": "git_fact"}
+
+# Git fact policy classes (design §3): repository state, HEAD facts, the
+# focused file's change state, working-tree changes, commit lists and file
+# history are IMPORTANT; co-change and diff facts are OPTIONAL. Unknown
+# future kinds default to optional (shed first, safest).
+IMPORTANT_GIT_FACT_KINDS = frozenset(
+    {
+        "repository_state",
+        "head_facts",
+        "current_change_state",
+        "working_tree_change",
+        "recent_commit",
+        "file_history",
+    }
+)
 
 
 class BudgetError(Exception):
@@ -182,6 +197,19 @@ def classify_memory_type(memory_type: Optional[str]) -> str:
     if memory_type in IMPORTANT_MEMORY_TYPES:
         return "important"
     return "optional"
+
+
+def classify_git_fact(kind: Optional[str]) -> str:
+    """Fixed git-fact class (see IMPORTANT_GIT_FACT_KINDS)."""
+    if kind in IMPORTANT_GIT_FACT_KINDS:
+        return "important"
+    return "optional"
+
+
+def _carries_git_section(packet: ContextPacket) -> bool:
+    """Only rlkctx2 packets serialize a git_facts section; rlkctx1 packets
+    must keep byte-identical pre-git accounting (no section anywhere)."""
+    return packet.packet_version == PACKET_VERSION
 
 
 @dataclass
@@ -465,7 +493,8 @@ def _essential_chars(packet: ContextPacket) -> int:
     and warnings emptied."""
     data = packet.to_dict()
     for key in _ITEM_SECTIONS + ("warnings",):
-        data[key] = []
+        if key in data:  # rlkctx1 packets have no git_facts key at all
+            data[key] = []
     return len(_compact_json(data))
 
 
@@ -547,6 +576,8 @@ def _budget_stats(
         "handoffs": len(working.handoffs),
         "warnings": len(working.warnings),
     }
+    if _carries_git_section(working):
+        diag["final_counts"]["git_facts"] = len(working.git_facts)
     diag["included_source_ids"] = [
         _source_id(section, item)
         for section in _ITEM_SECTIONS
@@ -615,6 +646,8 @@ def _usage(
         "item_count": 1,
     }
     for section in _ITEM_SECTIONS:
+        if section == "git_facts" and not _carries_git_section(packet):
+            continue
         chars = sum(_item_chars(item) for item in getattr(packet, section))
         items = len(getattr(packet, section))
         snippets = 0
@@ -687,6 +720,11 @@ def _source_id(section: str, item: PacketItem) -> str:
             item.provenance.code_reference_id
             or item.data.get("code_reference_id")
             or ""
+        )
+    if section == "git_facts":
+        return (
+            item.provenance.code_reference_id
+            or str(item.data.get("kind") or "")
         )
     return item.provenance.memory_id or ""
 
@@ -765,6 +803,7 @@ def apply_budget(
             len(working.code_facts),
             len(working.pending),
             len(working.handoffs),
+            len(working.git_facts),
             len(working.warnings),
             sum(
                 len(fact.data["snippet"])
@@ -897,6 +936,21 @@ def _ladder_fixed_order(
                 REASON_OPTIONAL_EXHAUSTED,
             )
         index -= 1
+    # Step 3b: omit OPTIONAL git facts (co_change, diff_fact, unknown
+    # kinds), from the END of the list first.
+    index = len(working.git_facts) - 1
+    while index >= 0:
+        if fits():
+            return
+        item = working.git_facts[index]
+        if classify_git_fact(item.data.get("kind")) == "optional":
+            sid = _source_id("git_facts", item)
+            working.git_facts.pop(index)
+            actions[("git_fact", sid, occ_map[id(item)])] = (
+                ACTION_OMITTED,
+                REASON_OPTIONAL_EXHAUSTED,
+            )
+        index -= 1
     # Step 4: omit code_facts beyond the FIRST (the direct focus), end first.
     while len(working.code_facts) > 1:
         if fits():
@@ -918,6 +972,15 @@ def _ladder_fixed_order(
             actions[
                 (_SECTION_KINDS[section], sid, occ_map[id(item)])
             ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
+    while working.git_facts:
+        if fits():
+            return
+        item = working.git_facts.pop()
+        sid = _source_id("git_facts", item)
+        actions[("git_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_IMPORTANT_EXHAUSTED,
+        )
     while len(working.code_references) > 1:
         if fits():
             return
@@ -990,6 +1053,24 @@ def _ladder_ranked_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
+    # Step 3b: omit OPTIONAL git facts, lowest relevance first (unscored
+    # section: relevance has no git_facts positions, so this degrades to
+    # the deterministic end-first order).
+    positions = _rank_positions(relevance, "git_facts")
+    optional_git = [
+        item
+        for item in working.git_facts
+        if classify_git_fact(item.data.get("kind")) == "optional"
+    ]
+    for item in _worst_first(optional_git, "git_facts", positions, occ_map):
+        if fits():
+            return
+        sid = _source_id("git_facts", item)
+        _remove_item(working.git_facts, item)
+        actions[("git_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_OPTIONAL_EXHAUSTED,
+        )
     # Step 4: omit code_facts beyond the FIRST (the direct focus),
     # lowest relevance first.
     positions = _rank_positions(relevance, "code_facts")
@@ -1017,6 +1098,18 @@ def _ladder_ranked_order(
             actions[
                 (_SECTION_KINDS[section], sid, occ_map[id(item)])
             ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
+    positions = _rank_positions(relevance, "git_facts")
+    for item in _worst_first(
+        list(working.git_facts), "git_facts", positions, occ_map
+    ):
+        if fits():
+            return
+        sid = _source_id("git_facts", item)
+        _remove_item(working.git_facts, item)
+        actions[("git_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_IMPORTANT_EXHAUSTED,
+        )
     positions = _rank_positions(relevance, "code_references")
     ref_extras = list(working.code_references[1:])
     for item in _worst_first(
