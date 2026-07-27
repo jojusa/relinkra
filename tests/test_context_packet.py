@@ -1121,6 +1121,83 @@ class PortableCacheDirTests(unittest.TestCase):
         self.assertNotIn("local", packet.diagnostics)
 
 
+class PortableLocalDiagnosticsTests(unittest.TestCase):
+    """Portable output strips the machine-local diagnostics channel so
+    absolute repository roots or infrastructure paths never leave the
+    local machine."""
+
+    def packet_with_local_root(self, root):
+        return ContextPacket(
+            packet_id=compute_packet_id(project_id=PID, mode="project"),
+            created_at=FIXED_NOW,
+            mode="project",
+            project_id=PID,
+            diagnostics={
+                "local": {"git_repository_root": root},
+                "counts": {"memories": 0},
+            },
+        )
+
+    def _assert_portable_strips_root(self, root):
+        packet = self.packet_with_local_root(root)
+        portable = packet.to_portable_dict()
+        portable_json = packet.to_portable_json()
+        # Default serialization keeps the channel for local tooling.
+        self.assertIn("local", packet.to_dict()["diagnostics"])
+        self.assertEqual(packet.diagnostics["local"]["git_repository_root"], root)
+        # Portable serialization drops it.
+        self.assertNotIn("local", portable.get("diagnostics", {}))
+        self.assertNotIn(root, portable_json)
+        self.assertNotIn("git_repository_root", portable_json)
+
+    def test_portable_json_strips_windows_root(self):
+        self._assert_portable_strips_root(r"C:\Users\dev\relinkra")
+
+    def test_portable_json_strips_posix_root(self):
+        self._assert_portable_strips_root("/home/dev/relinkra")
+
+    def test_portable_json_strips_unc_root(self):
+        self._assert_portable_strips_root(r"\\server\share\relinkra")
+
+    def test_portable_json_without_local_diagnostics_is_identical(self):
+        packet = ContextPacket(
+            packet_id=compute_packet_id(project_id=PID, mode="project"),
+            created_at=FIXED_NOW,
+            mode="project",
+            project_id=PID,
+            diagnostics={"counts": {"memories": 0}},
+        )
+        self.assertEqual(packet.to_dict(), packet.to_portable_dict())
+        self.assertEqual(packet.to_json(), packet.to_portable_json())
+
+    def test_portable_dict_strips_local_nested_under_composition(self):
+        """Budget composition may nest the original diagnostics; portable
+        output must strip ``local`` at every level."""
+        packet = ContextPacket(
+            packet_id=compute_packet_id(project_id=PID, mode="project"),
+            created_at=FIXED_NOW,
+            mode="project",
+            project_id=PID,
+            diagnostics={
+                "composition": {
+                    "local": {"git_repository_root": "/home/dev/relinkra"},
+                    "budget": {"status": "ok"},
+                },
+                "counts": {"memories": 0},
+            },
+        )
+        portable = packet.to_portable_dict()
+        self.assertNotIn("local", portable.get("diagnostics", {}))
+        self.assertNotIn(
+            "local", portable["diagnostics"].get("composition", {})
+        )
+        self.assertNotIn("/home/dev/relinkra", packet.to_portable_json())
+        self.assertEqual(
+            portable["diagnostics"]["composition"]["budget"],
+            {"status": "ok"},
+        )
+
+
 class GitPacketTests(unittest.TestCase):
     """rlkctx2 optional git_facts section (R2 Git Intelligence, B3)."""
 
@@ -1236,12 +1313,11 @@ class ContextCliGitFlagTests(unittest.TestCase):
         self.assertIn("head_facts", kinds)
         for item in packet["git_facts"]:
             self.assertEqual(item["provenance"]["source"], "git")
-        # absolute repo root is local-diagnostics only, never in git facts
+        # absolute repo root is local-diagnostics only; it must not leak
+        # into the portable JSON/Markdown emitted by the CLI.
         self.assertNotIn(self.repo, json.dumps(packet["git_facts"]))
-        self.assertEqual(
-            packet["diagnostics"]["local"]["git_repository_root"],
-            os.path.abspath(self.repo).replace("\\", "/").rstrip("/"),
-        )
+        self.assertNotIn("git_repository_root", out)
+        self.assertNotIn("local", packet.get("diagnostics", {}))
 
     def test_git_off_default_byte_identical(self):
         argv = self.base_argv()

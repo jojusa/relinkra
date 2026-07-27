@@ -20,7 +20,6 @@ except ModuleNotFoundError:  # pragma: no cover - import-mode fallback
 from relinkra.git_intelligence import (
     GIT_CHANGED_PATHS_PER_COMMIT,
     GitParseError,
-    parse_head_fields,
     parse_log_z,
     parse_name_status_z,
     parse_numstat_z,
@@ -29,7 +28,6 @@ from relinkra.git_intelligence import (
 
 _SHA_A = "a" * 40
 _SHA_B = "b" * 40
-_SHA_C = "c" * 40
 
 
 class PorcelainZTests(unittest.TestCase):
@@ -197,36 +195,6 @@ class NameStatusZTests(unittest.TestCase):
     def test_rename_missing_paths_raise(self):
         with self.assertRaises(GitParseError):
             parse_name_status_z("R100\x00only-old.py\x00")
-
-
-class HeadFieldsTests(unittest.TestCase):
-    """HEAD field record: sha, committed_at, author_name, subject, parents."""
-
-    def test_full_fields(self):
-        text = f"{_SHA_C}\x002024-01-03T00:00:00Z\x00Carol\x00subject line\x00{_SHA_A} {_SHA_B}\x00"
-        head = parse_head_fields(text)
-        self.assertEqual(head.head_sha, _SHA_C)
-        self.assertEqual(head.short_head_sha, "c" * 7)
-        self.assertEqual(head.committed_at, "2024-01-03T00:00:00Z")
-        self.assertEqual(head.author_name, "Carol")
-        self.assertEqual(head.subject, "subject line")
-        self.assertEqual(head.parents, (_SHA_A, _SHA_B))
-        # branch/detached are resolved service-side; parser leaves defaults.
-        self.assertIsNone(head.branch)
-        self.assertFalse(head.detached)
-
-    def test_subject_redacted(self):
-        text = f"{_SHA_C}\x002024-01-03T00:00:00Z\x00Carol\x00token=sk-live-abcdef123456\x00\x00"
-        head = parse_head_fields(text)
-        self.assertNotIn("sk-live-abcdef123456", head.subject)
-
-    def test_missing_fields_raise(self):
-        with self.assertRaises(GitParseError):
-            parse_head_fields(f"{_SHA_C}\x002024-01-03T00:00:00Z\x00")
-
-    def test_invalid_sha_raises(self):
-        with self.assertRaises(GitParseError):
-            parse_head_fields("nope\x002024-01-03T00:00:00Z\x00Carol\x00s\x00\x00")
 
 
 @unittest.skipUnless(shutil.which("git"), "git binary required for fixture tests")

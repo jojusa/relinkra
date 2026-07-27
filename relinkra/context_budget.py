@@ -67,6 +67,15 @@ Hard rules:
   ladder always measures the packet WITH its final diagnostics and the
   hard guarantee covers them (``final_total_chars`` is self-referential
   and resolved by deterministic fixed-point iteration).
+  Measurement basis: the ladder always measures ``to_json()`` — the form
+  that KEEPS ``diagnostics["local"]``. Portable emission
+  (``to_portable_json()``) strips that channel, so the shipped document
+  is always <= the measured size. The hard budget therefore still holds
+  as a strict upper bound; ``final_total_chars`` describes the measured
+  (local) form, which over-states the portable bytes by exactly the
+  stripped channel. Measuring the superset is deliberate: the same
+  packet may also be persisted in local form, and a budget that only
+  covered the portable projection would under-count that case.
 - Audit bookkeeping is collision-free: decisions/actions are keyed
   internally by (kind, source_id, occurrence_index) where the occurrence
   index is the deterministic 0-based occurrence count of that
@@ -159,6 +168,25 @@ IMPORTANT_GIT_FACT_KINDS = frozenset(
         "file_history",
     }
 )
+
+# Within-class deterministic shedding order for git facts when relevance
+# has no position for them (git_facts is currently unscored). Lower rank
+# = lower value = shed first. Repository/HEAD state are essential-ish and
+# are kept until the very end of the important class.
+_GIT_FACT_SHED_RANK = {
+    "co_change": 10,
+    "diff_fact": 20,
+    "working_tree_change": 30,
+    "recent_commit": 40,
+    "file_history": 50,
+    "current_change_state": 60,
+    "head_facts": 70,
+    "repository_state": 80,
+}
+
+
+def _git_fact_shed_rank(item: PacketItem) -> int:
+    return _GIT_FACT_SHED_RANK.get(item.data.get("kind"), 0)
 
 
 class BudgetError(Exception):
@@ -435,6 +463,15 @@ class BudgetedContext:
             "decisions": [d.to_dict() for d in self.decisions],
             "packet": self.packet.to_dict() if self.packet is not None else None,
         }
+
+    def to_portable_dict(self) -> dict:
+        """Portable budget report: strips machine-local diagnostics from
+        the embedded packet so absolute paths do not leak via CLI stderr.
+        """
+        data = self.to_dict()
+        if data.get("packet") is not None:
+            data["packet"] = self.packet.to_portable_dict()
+        return data
 
     @staticmethod
     def from_dict(data: Mapping) -> "BudgetedContext":
@@ -1004,20 +1041,27 @@ def _worst_first(
     section: str,
     positions: Dict[Tuple[str, int], int],
     occ_map: Dict[int, int],
+    fallback_rank=None,
 ) -> List[PacketItem]:
     """Ascending relevance (worst first). The R1G best-first order already
     encodes the full tie-break chain (total DESC -> type_rank ASC ->
     timestamp DESC -> source_id ASC, duplicates in packet order), so
     reversing it removes lowest-score first and, on exact ties, the
     highest occurrence index first — matching the from-end R1F tie rule.
-    Unscored items (defensive; cannot happen for a matching packet_id)
-    sort worst so the budget sheds unknowns first."""
 
-    def position(item: PacketItem):
+    For unscored sections (git_facts), ``fallback_rank`` provides a
+    deterministic value order; lower rank means lower value, so the
+    reverse sort removes the lowest-value fact first.
+    """
+
+    def key(item: PacketItem):
         sid = _source_id(section, item)
-        return positions.get((sid, occ_map[id(item)]), float("inf"))
+        pos = positions.get((sid, occ_map[id(item)]), float("inf"))
+        if fallback_rank is None:
+            return (pos,)
+        return (pos, -fallback_rank(item))
 
-    return sorted(items, key=position, reverse=True)
+    return sorted(items, key=key, reverse=True)
 
 
 def _remove_item(items: List[PacketItem], item: PacketItem) -> None:
@@ -1062,7 +1106,9 @@ def _ladder_ranked_order(
         for item in working.git_facts
         if classify_git_fact(item.data.get("kind")) == "optional"
     ]
-    for item in _worst_first(optional_git, "git_facts", positions, occ_map):
+    for item in _worst_first(
+        optional_git, "git_facts", positions, occ_map, _git_fact_shed_rank
+    ):
         if fits():
             return
         sid = _source_id("git_facts", item)
@@ -1100,7 +1146,11 @@ def _ladder_ranked_order(
             ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
     positions = _rank_positions(relevance, "git_facts")
     for item in _worst_first(
-        list(working.git_facts), "git_facts", positions, occ_map
+        list(working.git_facts),
+        "git_facts",
+        positions,
+        occ_map,
+        _git_fact_shed_rank,
     ):
         if fits():
             return

@@ -133,10 +133,10 @@ class FakeGitService:
     def collect_capabilities(self, path):
         return self._record("capabilities", path)
 
-    def collect_repository_state(self, path):
+    def collect_repository_state(self, path, capabilities=None):
         return self._record("repository_state", path)
 
-    def collect_head_facts(self, path):
+    def collect_head_facts(self, path, state=None):
         return self._record("head_facts", path)
 
     def collect_working_tree(self, path):

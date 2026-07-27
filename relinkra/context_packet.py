@@ -19,11 +19,30 @@ Hard rules:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
+
+
+def _strip_local_diagnostics(value: Any) -> Any:
+    """Recursively remove machine-local diagnostics channels from a value.
+
+    Used by ``ContextPacket.to_portable_dict`` so that absolute repository
+    roots and infrastructure paths are dropped no matter how deeply nested
+    they are in the diagnostics structure.
+    """
+    if isinstance(value, dict):
+        return {
+            k: _strip_local_diagnostics(v)
+            for k, v in value.items()
+            if k != "local"
+        }
+    if isinstance(value, list):
+        return [_strip_local_diagnostics(v) for v in value]
+    return value
 
 PACKET_VERSION = "rlkctx2"
 PACKET_VERSION_V1 = "rlkctx1"
@@ -295,6 +314,30 @@ class ContextPacket:
         return json.dumps(
             self.to_dict(), sort_keys=True, separators=(",", ":"),
             ensure_ascii=False,
+        )
+
+    def to_portable_dict(self) -> dict:
+        """Portable serialization: drops the machine-local diagnostics
+        channel so absolute repository roots and infrastructure paths do
+        not leave the local machine. Internal/bookkeeping serialization
+        via ``to_dict`` still carries the channel for local tooling.
+        """
+        data = copy.deepcopy(self.to_dict())
+        if "diagnostics" in data:
+            data["diagnostics"] = _strip_local_diagnostics(data["diagnostics"])
+        return data
+
+    def to_portable_json(self, *, pretty: bool = False) -> str:
+        """Deterministic portable JSON: keys sorted and local diagnostics
+        stripped.
+        """
+        data = self.to_portable_dict()
+        if pretty:
+            return json.dumps(
+                data, indent=2, sort_keys=True, ensure_ascii=False
+            )
+        return json.dumps(
+            data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
 
     def to_markdown(self) -> str:

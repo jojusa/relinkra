@@ -66,6 +66,7 @@ from relinkra.relevance import (
 )
 
 REPO_ROOT = os.path.dirname(_TESTS_DIR)
+GIT_BIN = gf.GIT_BIN
 PROOF_COMMIT_PREFIX = "f54aac2b"
 PROOF_COMMIT_SUBJECT = "feat(relevance): add deterministic relevance scoring v1"
 PROOF_FILE = "relinkra/relevance.py"
@@ -95,8 +96,10 @@ def _git_guard(*args):
     Returns stripped stdout, or None when the command fails (repo or git
     unavailable) so callers can skip gracefully.
     """
+    if GIT_BIN is None:
+        return None
     result = subprocess.run(
-        ["git", "-C", REPO_ROOT, *args],
+        [GIT_BIN, "-C", REPO_ROOT, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",

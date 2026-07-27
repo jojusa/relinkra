@@ -42,6 +42,11 @@ from relinkra.context_packet import (
     compute_packet_id,
     PACKET_VERSION_V1,
 )
+from relinkra.relevance import (
+    RankedContext,
+    RelevanceScore,
+    packet_fingerprint,
+)
 from test_context_packet import (
     FIXED_NOW,
     PID,
@@ -1604,6 +1609,159 @@ class GitBudgetTests(unittest.TestCase):
             d.section for d in result.decisions if d.source_id != "essential"
         }
         self.assertEqual(sections, {"git_facts"})
+
+    def _ranked_empty(self, packet):
+        """A RankedContext that matches the packet but scores nothing."""
+        return RankedContext(
+            original_packet_id=packet.packet_id,
+            relevance_version="relevance-v1-test",
+            as_of=FIXED_NOW,
+            packet_fingerprint=packet_fingerprint(packet),
+        )
+
+    def test_optional_git_sheds_lower_value_focus_before_higher(self):
+        """Within the OPTIONAL class, co_change (broad) goes before
+        diff_fact (focused file)."""
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("co_change", ref="ref_co", path="src/co.py",
+                         note="x" * 900),
+                git_item("diff_fact", ref="ref_diff", path="src/d.py",
+                         note="y" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(
+            packet, budget, relevance=self._ranked_empty(packet)
+        )
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        self.assertEqual(surviving, ["diff_fact"])
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["ref_co"].action, "omitted")
+
+    def test_important_git_sheds_bulk_before_focused_file_context(self):
+        """Within the IMPORTANT class, working_tree_change (bulk) goes
+        before file_history (focused)."""
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("working_tree_change", ref="ref_wt", path="a.py",
+                         note="x" * 900),
+                git_item("file_history", ref="ref_hist", path="a.py",
+                         note="y" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(
+            packet, budget, relevance=self._ranked_empty(packet)
+        )
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        self.assertEqual(surviving, ["file_history"])
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["ref_wt"].action, "omitted")
+
+    def test_optional_git_shed_rank_beats_packet_order(self):
+        """Value rank, not packet position, decides which git fact goes.
+
+        The two tests above list the facts in an order that already
+        matches the intended shed order, so they pass with or without
+        ``_GIT_FACT_SHED_RANK`` (a stable reverse sort over equal keys
+        preserves packet order). Here the packet order is the OPPOSITE of
+        the rank order, so only the rank can produce this result.
+        """
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("diff_fact", ref="ref_diff", path="src/d.py",
+                         note="y" * 900),
+                git_item("co_change", ref="ref_co", path="src/co.py",
+                         note="x" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(
+            packet, budget, relevance=self._ranked_empty(packet)
+        )
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        self.assertEqual(surviving, ["diff_fact"])
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["ref_co"].action, "omitted")
+
+    def test_important_git_shed_rank_beats_packet_order(self):
+        """Same discrimination for the IMPORTANT class: file_history is
+        listed first but outranks working_tree_change, so the bulk fact
+        still goes first."""
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("file_history", ref="ref_hist", path="a.py",
+                         note="y" * 900),
+                git_item("working_tree_change", ref="ref_wt", path="a.py",
+                         note="x" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(
+            packet, budget, relevance=self._ranked_empty(packet)
+        )
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        self.assertEqual(surviving, ["file_history"])
+        decisions = decisions_by_id(result)
+        self.assertEqual(decisions["ref_wt"].action, "omitted")
+
+    def test_unknown_git_fact_kind_is_shed_before_known_kinds(self):
+        """An unregistered kind ranks 0 and is treated as least valuable,
+        so a future kind added without a rank entry degrades safely."""
+        packet = self.v2_packet(
+            git_facts=[
+                git_item("co_change", ref="ref_co", path="src/co.py",
+                         note="x" * 900),
+                git_item("brand_new_kind", ref="ref_new", path="src/n.py",
+                         note="z" * 900),
+            ]
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(
+            packet, budget, relevance=self._ranked_empty(packet)
+        )
+        self.assertEqual(result.status, "OK")
+        surviving = [item.data["kind"] for item in result.packet.git_facts]
+        self.assertEqual(surviving, ["co_change"])
+
+    def test_optional_memory_cannot_displace_important_git_by_relevance(self):
+        """Class order wins over relevance: an OPTIONAL memory with a high
+        relevance score is still shed before an IMPORTANT git fact."""
+        packet = self.v2_packet(
+            memories=[memory_item("mem_opt", "discovery", "x" * 900)],
+            git_facts=[
+                git_item("repository_state", ref="ref_state",
+                         head_sha="a" * 40, note="y" * 900),
+            ],
+        )
+        ranked = RankedContext(
+            original_packet_id=packet.packet_id,
+            relevance_version="relevance-v1-test",
+            as_of=FIXED_NOW,
+            packet_fingerprint=packet_fingerprint(packet),
+            scores={
+                "memories": (
+                    RelevanceScore(
+                        source_id="mem_opt",
+                        section="memories",
+                        occurrence_index=0,
+                        total=1000,
+                        signals=(),
+                        type_rank=5,
+                    ),
+                )
+            },
+        )
+        budget = self.budget_over(packet, 1)
+        result = apply_budget(packet, budget, relevance=ranked)
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.packet.memories, [])
+        self.assertEqual(len(result.packet.git_facts), 1)
 
 
 if __name__ == "__main__":

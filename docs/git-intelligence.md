@@ -56,6 +56,18 @@ Every git invocation goes through one runner with a hard boundary:
   (GitHub/GitLab), no ahead/behind computation.
 - **No `.git` internals access** and **no environment-variable reads**:
   facts come from porcelain output only.
+- **No diff-driver program execution**: every `diff` call passes both
+  `--no-ext-diff` (blocks `GIT_EXTERNAL_DIFF` / `diff.external`) and
+  `--no-textconv` (blocks per-attribute `diff.<driver>.textconv`, which
+  `--no-ext-diff` alone still runs). Neither a hostile `.gitattributes`
+  nor a hostile diff config can get a program spawned by a scan.
+  **Known gap (v1)**: `core.fsmonitor` in a repository's *local* config
+  still names a program that `git status` runs. Closing it needs a `-c`
+  override ahead of the verb, which the verb allowlist does not model
+  yet — tracked as R2.1 deferred debt, not closed here.
+- **Sanitized stderr**: git failure detail is stripped of the working
+  directory and the home directory (masked as `~`) before it reaches a
+  typed error, so error messages stay portable.
 - **Redaction at the parse boundary**: commit subjects and diff snippets
   pass through `redact_text` (tokens, keys, passwords → `[REDACTED]`);
   authors are emitted as **names only, never emails**; the absolute
@@ -74,7 +86,8 @@ V1 is deliberately small. Know the edges:
 - **No mutation**: the CLI and service cannot change your repository,
   index, or config — by construction (allowlist above), not by policy.
 - **Bounded scans**: `GIT_MAX_COMMITS=100` recent-commit cap (default
-  10), co-change scans at most 100 commits × 50 changed paths each,
+  10) with at most 50 changed paths per commit, co-change scans the
+  latest 100 commits (paths per commit are not capped separately in v1),
   file history bounded at 100, diff snippets opt-in and ≤ 400 chars,
   top-10 co-change entries. Large histories are sampled, not exhausted.
 - **No ahead/behind in v1**: the fields exist but are always `null`

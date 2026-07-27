@@ -278,7 +278,7 @@ def main(
                 "max_estimated_tokens": budget.max_estimated_tokens,
             }
             if args.budget_report:
-                error_doc["budget_report"] = result.to_dict()
+                error_doc["budget_report"] = result.to_portable_dict()
             if args.relevance_report and ranked is not None:
                 error_doc["relevance_report"] = ranked.to_dict()
             _emit(error_doc, fh=sys.stderr)
@@ -286,13 +286,13 @@ def main(
         if args.budget_report and args.relevance_report and ranked is not None:
             _emit(
                 {
-                    "budget_report": result.to_dict(),
+                    "budget_report": result.to_portable_dict(),
                     "relevance_report": ranked.to_dict(),
                 },
                 fh=sys.stderr,
             )
         elif args.budget_report:
-            _emit(result.to_dict(), fh=sys.stderr)
+            _emit(result.to_portable_dict(), fh=sys.stderr)
         elif args.relevance_report and ranked is not None:
             _emit(ranked.to_dict(), fh=sys.stderr)
         packet = result.packet
@@ -302,7 +302,7 @@ def main(
     if args.format == "markdown":
         print(packet.to_markdown())
     else:
-        print(packet.to_json(pretty=args.pretty))
+        print(packet.to_portable_json(pretty=args.pretty))
     return 0
 
 

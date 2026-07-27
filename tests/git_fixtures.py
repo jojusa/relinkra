@@ -9,8 +9,12 @@ wall-clock time. Requires the real ``git`` binary.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import unittest
 from typing import Dict
+
+GIT_BIN = shutil.which("git")
 
 GIT_TEST_USER_NAME = "Relinkra Test"
 GIT_TEST_USER_EMAIL = "relinkra-test@example.invalid"
@@ -34,9 +38,11 @@ def git(
     env = os.environ.copy()
     env["GIT_AUTHOR_DATE"] = author_date
     env["GIT_COMMITTER_DATE"] = committer_date
+    if GIT_BIN is None:
+        raise unittest.SkipTest("git binary not available")
     result = subprocess.run(
         [
-            "git",
+            GIT_BIN,
             "-C",
             str(repo_path),
             "-c",
@@ -63,6 +69,8 @@ def git(
 
 def make_repo(path) -> str:
     """Create a fresh repository at ``path`` on branch ``main``."""
+    if GIT_BIN is None:
+        raise unittest.SkipTest("git binary not available")
     os.makedirs(path, exist_ok=True)
     git(path, "init", "-q", "-b", "main")
     return str(path)

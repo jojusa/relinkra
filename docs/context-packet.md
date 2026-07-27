@@ -81,11 +81,24 @@ absolute machine infrastructure paths. An ABSOLUTE CBM cache dir (Windows
 drive/UNC or POSIX `/...`) is dropped from
 `project_facts.workspace.cbm_cache_dir` (a relative value, if ever
 recorded, is kept; `cbm_project_name` and the rest of the workspace
-metadata always survive). The absolute value is exposed ONLY under
+metadata always survive). The absolute value is held ONLY under
 `diagnostics["local"].cbm_cache_dir` — a machine-local diagnostic
-channel that must NOT be shipped as portable context. Markdown never
-renders diagnostics, so `diagnostics["local"]` can never leak into a
-brief.
+channel that must NOT be shipped as portable context. The absolute git
+repository root (`diagnostics["local"].git_repository_root`) lives in the
+same channel.
+
+Two serializations exist, and the difference is the whole point:
+
+| Method | Keeps `diagnostics["local"]` | Use for |
+| --- | --- | --- |
+| `to_dict` / `to_json` | yes | in-process and local bookkeeping |
+| `to_portable_dict` / `to_portable_json` | no | anything that leaves the machine |
+
+`relinkra-context` emits the **portable** form on every surface (stdout
+JSON, stderr budget report, the unsatisfiable error document), and
+Markdown never renders diagnostics at all. The local channel is
+therefore not reachable from the CLI by design — read it in-process via
+`to_dict()` if you need to debug a resolved root or cache dir.
 - **Baseline active memories**: handoff, pending, constraint, decision,
   architecture first; then bug, discovery, verification, task_result —
   ordered by that type priority, then timestamp desc, then `memory_id` asc.

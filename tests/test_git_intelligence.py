@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -460,6 +462,94 @@ class DiffFactsTests(unittest.TestCase):
         gf._write_file(self.repo, "alpha.py", f"line1\n{long_line}\n")
         facts, _ = self.service.collect_diff(self.repo, include_snippets=True)
         self.assertEqual(len(facts[0].snippet), GIT_SNIPPET_MAX_CHARS)
+
+    def test_external_diff_command_cannot_execute(self):
+        """A hostile GIT_EXTERNAL_DIFF is neutralized: internal diff still
+        runs and the external program is never invoked."""
+        gf.commit_file(self.repo, "alpha.py", "line1\n", "add alpha")
+        gf._write_file(self.repo, "alpha.py", "line1\nline2\n")
+        marker_dir = tempfile.mkdtemp(prefix="relinkra-ext-diff-")
+        self.addCleanup(lambda: shutil.rmtree(marker_dir, ignore_errors=True))
+        marker_path = os.path.join(marker_dir, "marker.txt")
+        script_path = os.path.join(marker_dir, "hostile_diff.py")
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import os, pathlib\n"
+                "path = os.environ.get('RELINKRA_DIFF_MARKER')\n"
+                "if path:\n"
+                "    pathlib.Path(path).write_text('executed')\n"
+            )
+        previous = os.environ.get("GIT_EXTERNAL_DIFF")
+        previous_marker = os.environ.get("RELINKRA_DIFF_MARKER")
+        try:
+            os.environ["GIT_EXTERNAL_DIFF"] = f"{sys.executable} {script_path}"
+            os.environ["RELINKRA_DIFF_MARKER"] = marker_path
+            # Snippets on: this is the only path that asks git to render a
+            # real diff, so it is where an external driver would run.
+            facts, warnings = self.service.collect_diff(
+                self.repo, include_snippets=True
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("GIT_EXTERNAL_DIFF", None)
+            else:
+                os.environ["GIT_EXTERNAL_DIFF"] = previous
+            if previous_marker is None:
+                os.environ.pop("RELINKRA_DIFF_MARKER", None)
+            else:
+                os.environ["RELINKRA_DIFF_MARKER"] = previous_marker
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(facts), 1)
+        self.assertFalse(os.path.exists(marker_path))
+
+    def test_textconv_driver_cannot_execute(self):
+        """A hostile ``diff.<driver>.textconv`` is neutralized too.
+
+        ``--no-ext-diff`` does NOT disable textconv — only ``--no-textconv``
+        does — so a repository that configures a textconv command could
+        otherwise get an arbitrary program spawned by a read-only scan.
+        """
+        gf.commit_file(self.repo, "alpha.py", "line1\n", "add alpha")
+        marker_dir = tempfile.mkdtemp(prefix="relinkra-textconv-")
+        self.addCleanup(lambda: shutil.rmtree(marker_dir, ignore_errors=True))
+        marker_path = os.path.join(marker_dir, "marker.txt")
+        script_path = os.path.join(marker_dir, "hostile_textconv.py")
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import os, pathlib, sys\n"
+                "path = os.environ.get('RELINKRA_TEXTCONV_MARKER')\n"
+                "if path:\n"
+                "    pathlib.Path(path).write_text('executed')\n"
+                "sys.stdout.write(open(sys.argv[1], encoding='utf-8').read())\n"
+            )
+        gf._write_file(self.repo, ".gitattributes", "*.py diff=hostile\n")
+        gf.commit_file(
+            self.repo, "beta.txt", "seed\n", "add attributes and seed"
+        )
+        gf.git(
+            self.repo,
+            "config",
+            "diff.hostile.textconv",
+            f'"{sys.executable}" "{script_path}"',
+        )
+        gf._write_file(self.repo, "alpha.py", "line1\nline2\n")
+
+        previous_marker = os.environ.get("RELINKRA_TEXTCONV_MARKER")
+        try:
+            os.environ["RELINKRA_TEXTCONV_MARKER"] = marker_path
+            facts, warnings = self.service.collect_diff(
+                self.repo, include_snippets=True
+            )
+        finally:
+            if previous_marker is None:
+                os.environ.pop("RELINKRA_TEXTCONV_MARKER", None)
+            else:
+                os.environ["RELINKRA_TEXTCONV_MARKER"] = previous_marker
+
+        self.assertEqual(warnings, [])
+        self.assertEqual([fact.path for fact in facts], ["alpha.py"])
+        self.assertFalse(os.path.exists(marker_path))
 
     def test_non_repo_returns_empty_with_warning(self):
         facts, warnings = self.service.collect_diff(_tmp_dir(self))

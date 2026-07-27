@@ -537,7 +537,9 @@ class ContextBuilder:
                     PacketWarning(git_warning.code, git_warning.message)
                 )
 
-        state, state_warnings = self.git.collect_repository_state(root)
+        state, state_warnings = self.git.collect_repository_state(
+            root, capabilities=caps
+        )
         extend_warnings(state_warnings)
         if state is not None:
             add(
@@ -545,7 +547,7 @@ class ContextBuilder:
                 state.to_dict(),
                 f"git repository state (mode={mode})",
             )
-        head, head_warnings = self.git.collect_head_facts(root)
+        head, head_warnings = self.git.collect_head_facts(root, state=state)
         extend_warnings(head_warnings)
         if head is not None:
             add("head_facts", head.to_dict(), f"git HEAD facts (mode={mode})")

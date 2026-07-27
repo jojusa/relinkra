@@ -1,19 +1,23 @@
-"""Read-only git intelligence (R2): data models, subprocess runner, pure parsers.
-
-Batch B1 scope: foundation only (limits, typed errors, data models,
-``_GitRunner``, pure ``-z`` parsers). The collection service lands in B2.
+"""Read-only git intelligence (R2): data models, subprocess runner, pure
+parsers, and a hardened collection service.
 
 Read-only guarantee: ``_GitRunner`` spawns ONLY the allowlisted verbs in
 ``READ_ONLY_VERBS`` via argv arrays — no shell, explicit cwd, explicit
 timeout, UTF-8 decoding. Any other verb raises before spawn, so mutating
-git commands are unreachable from every public API.
+git commands are unreachable from every public API. Machine-local paths
+are stripped from stderr, external diff drivers *and* textconv drivers are
+neutralized for controlled diff calls, and absolute repository roots never
+enter portable output.
 """
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from relinkra.memory import redact_text, sanitize_error
@@ -77,6 +81,120 @@ class GitCommandError(GitError):
 
 class GitParseError(GitError):
     """git output could not be parsed into typed facts."""
+
+
+def _sanitize_stderr(
+    text: str,
+    cwd: Optional[str] = None,
+    home: Optional[str] = None,
+) -> str:
+    """Strip machine-local paths from git stderr before surfacing.
+
+    Removes the repository-root/working-directory prefix and masks the
+    user's home directory with ``~``. Typed error classes remain intact;
+    only the human-readable detail is rewritten. The result is passed
+    through ``sanitize_error`` so any credential-bearing tokens are also
+    redacted.
+    """
+    if not text:
+        return text
+    out = text
+
+    def _path_variants(prefix: Optional[str]) -> List[str]:
+        if not prefix:
+            return []
+        prefix = str(prefix)
+        variants = {prefix, os.path.normpath(prefix)}
+        # A relative root (``.``, ``src``) strips nothing useful and, worse,
+        # ``.`` would match ordinary sentence punctuation and mangle the
+        # message. Resolve it so the real machine-local prefix is covered.
+        try:
+            variants.add(os.path.abspath(prefix))
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            pass
+        # Git normalizes separators on Windows, so also cover both variants.
+        variants.update(p.replace("\\", "/") for p in list(variants))
+        return [p for p in variants if _is_strippable(p)]
+
+    def _is_strippable(prefix: str) -> bool:
+        """Reject roots too short/generic to be a machine-local prefix.
+
+        ``.``, ``..``, ``/`` and a bare drive root would match almost
+        anything and destroy the diagnostic instead of anonymizing it.
+        """
+        if not prefix or prefix in {".", "..", "/", "\\"}:
+            return False
+        stripped = prefix.rstrip("/\\")
+        # "C:" / "C:/" — a drive root is not a meaningful prefix.
+        if re.fullmatch(r"[A-Za-z]:", stripped):
+            return False
+        return bool(stripped)
+
+    def _replace_prefix(
+        text: str, prefix: str, replacement: str = ""
+    ) -> str:
+        """Replace ``prefix`` with ``replacement`` only when it appears as
+        a whole path root.
+
+        This avoids mangling unrelated strings that merely start with the
+        same characters (e.g. ``/repo_sibling`` when cwd is ``/repo``).
+        """
+        if not prefix:
+            return text
+        esc = re.escape(prefix)
+        # The prefix only counts as a whole path root when the character
+        # after it cannot continue a path component. Anchoring on a
+        # separator or end-of-string alone is not enough: git quotes and
+        # punctuates paths (``'/repo': No such file``, ``/repo;``) and
+        # emits multi-line stderr, so those occurrences would survive.
+        # A negative lookahead on path-component characters strips all of
+        # them while still leaving ``/repo_sibling`` and ``/repo.bak``
+        # (different directories) intact.
+        pattern = re.compile(esc + r"(?![\w.\-])")
+        return pattern.sub(replacement, text)
+
+    for prefix in _path_variants(cwd):
+        out = _replace_prefix(out, prefix)
+
+    if home is None:
+        try:
+            home = str(Path.home())
+        except (RuntimeError, OSError):
+            home = ""
+    for prefix in _path_variants(home):
+        if prefix and prefix != cwd:
+            out = _replace_prefix(out, prefix, "~")
+
+    return sanitize_error(out)
+
+
+# Argv flags that make a `git diff` call incapable of spawning a
+# user-configured program. Both are required: `--no-ext-diff` blocks
+# external diff drivers, `--no-textconv` blocks per-attribute textconv
+# commands (which `--no-ext-diff` alone still executes). Every diff call
+# in this module must pass the full tuple.
+_DIFF_NO_EXEC_FLAGS: Tuple[str, ...] = ("--no-ext-diff", "--no-textconv")
+
+
+def _diff_env() -> Dict[str, str]:
+    """Neutralize pager configuration for controlled diff calls.
+
+    GIT_PAGER/PAGER are set to empty strings so Git disables paging
+    entirely. A no-op executable such as ``cat`` is not used because it
+    may be unavailable on some platforms (e.g. Windows without MSYS).
+
+    Command execution is blocked with argv flags rather than environment
+    variables, because an empty GIT_EXTERNAL_DIFF value is interpreted as
+    an executable path on some platforms. Two flags are required and they
+    are not interchangeable: ``--no-ext-diff`` disables external diff
+    drivers (GIT_EXTERNAL_DIFF / ``diff.external``), while
+    ``--no-textconv`` disables per-attribute ``diff.<driver>.textconv``
+    commands, which ``--no-ext-diff`` still runs.
+    """
+    env = os.environ.copy()
+    env["GIT_PAGER"] = ""
+    env["PAGER"] = ""
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +569,19 @@ class _GitRunner:
                 f"git --version failed to spawn: {exc.strerror or type(exc).__name__}"
             ) from exc
         if result.returncode != 0:
-            raise GitUnavailable("git --version failed; binary unusable")
+            raise GitUnavailable(
+                _sanitize_stderr(result.stderr or "git --version failed", cwd=None)
+            )
         out = result.stdout.strip()
         prefix = "git version "
         return out[len(prefix):] if out.startswith(prefix) else out
 
-    def run(self, cwd, *argv: str) -> str:
+    def run(
+        self,
+        cwd,
+        *argv: str,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
         if not argv:
             raise GitCommandError("no git verb provided", verb=None, returncode=None)
         verb = argv[0]
@@ -476,6 +601,7 @@ class _GitRunner:
                 errors="replace",
                 timeout=self.timeout,
                 check=False,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise GitUnavailable(
@@ -490,11 +616,13 @@ class _GitRunner:
                 f"git {verb} failed to spawn: {exc.strerror or type(exc).__name__}"
             ) from exc
         if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
+            stderr = _sanitize_stderr((result.stderr or "").strip(), cwd)
             if verb == "rev-parse":
-                raise NotGitRepository(
-                    stderr or f"not a git repository: {cwd}"
-                )
+                # The fallback must not interpolate cwd: git can exit
+                # non-zero with empty stderr (and sanitization can empty
+                # it), and this message becomes a packet warning that
+                # ships in portable output.
+                raise NotGitRepository(stderr or "not a git repository")
             raise GitCommandError(
                 stderr or f"git {verb} failed with code {result.returncode}",
                 verb=verb,
@@ -612,34 +740,6 @@ def parse_log_z(text: str) -> List[GitCommitFact]:
         commit, i = _parse_commit_record(tokens, i)
         commits.append(commit)
     return commits
-
-
-def parse_head_fields(text: str) -> GitHeadFacts:
-    """Parse a single HEAD field record (sha, committed_at, author_name,
-    subject, parents). branch/detached are resolved service-side."""
-    if not isinstance(text, str):
-        raise GitParseError("HEAD input must be text")
-    tokens = text.split("\0")
-    if tokens and tokens[-1] == "":
-        tokens.pop()  # single optional record terminator
-    if len(tokens) != 5:
-        raise GitParseError(
-            f"HEAD record must have exactly 5 fields, got {len(tokens)}"
-        )
-    sha, committed_at, author_name, subject, parents = tokens
-    _validate_sha(sha)
-    if not committed_at:
-        raise GitParseError("HEAD record missing committed_at")
-    return GitHeadFacts(
-        head_sha=sha,
-        short_head_sha=sha[:_SHORT_SHA_LEN],
-        branch=None,
-        detached=False,
-        committed_at=committed_at,
-        author_name=author_name,
-        subject=redact_text(subject),
-        parents=tuple(p for p in parents.split(" ") if p),
-    )
 
 
 def _parse_count(raw: str) -> Tuple[int, bool]:
@@ -889,6 +989,11 @@ class GitIntelligenceService:
 
     def __init__(self, runner: Optional[_GitRunner] = None) -> None:
         self._runner = runner if runner is not None else _GitRunner()
+        # Working directories that have already passed a repo-positive
+        # probe in this service instance. This is deliberately NOT a
+        # persistent cache: it only avoids redundant rev-parse calls
+        # within a single context-build pass.
+        self._repo_verified: set[str] = set()
 
     # -- capabilities ---------------------------------------------------
 
@@ -936,6 +1041,7 @@ class GitIntelligenceService:
             head_available = True
         except GitError:
             head_available = False  # unborn HEAD (or unverifiable ref)
+        self._repo_verified.add(cwd)
         return (
             GitCapabilities(
                 git_available=True,
@@ -951,8 +1057,29 @@ class GitIntelligenceService:
     def _ensure_repository(self, cwd: str) -> None:
         """Cheap typed repo probe: raises NotGitRepository for non-repos so
         every section degrades with the correct warning code (a failing
-        status/log/diff would otherwise surface as git_command_failed)."""
+        status/log/diff would otherwise surface as git_command_failed).
+        Successful probes are memoized for the current service instance to
+        avoid duplicate spawns during a single context-build pass.
+        """
+        if cwd in self._repo_verified:
+            return
         self._runner.run(cwd, "rev-parse", "--is-bare-repository")
+        self._repo_verified.add(cwd)
+
+    def reset_probe_cache(self) -> None:
+        """Forget memoized repository probes.
+
+        The memo is only valid for the duration of one collection pass: a
+        directory can stop being a repository between passes, and skipping
+        the probe would then downgrade ``not_a_git_repository`` into a
+        generic ``git_command_failed`` warning.
+
+        Any caller that reuses one service across passes — a reused
+        ``ContextBuilder`` (which builds its service once, in ``__init__``)
+        or the shared module-level service — must call this between passes.
+        The module-level convenience API does so automatically.
+        """
+        self._repo_verified.clear()
 
     # -- working tree ----------------------------------------------------
 
@@ -968,12 +1095,21 @@ class GitIntelligenceService:
     # -- repository state --------------------------------------------------
 
     def collect_repository_state(
-        self, path
+        self, path, capabilities: Optional[GitCapabilities] = None
     ) -> Tuple[Optional[GitRepositoryState], List[GitWarning]]:
         cwd = str(path)
-        caps, warnings = self.collect_capabilities(cwd)
+        if capabilities is None:
+            caps, warnings = self.collect_capabilities(cwd)
+        else:
+            caps = capabilities
+            warnings = []
         if not caps.git_available or not caps.repository_detected:
             return None, warnings
+        # Deliberately NOT memoizing cwd here: when ``capabilities`` is
+        # injected no probe ran in this service, and trusting a
+        # caller-supplied object would suppress the rev-parse probe for
+        # every later section. The self-collected path already memoized
+        # cwd inside collect_capabilities.
         head_sha: Optional[str] = None
         short_head_sha: Optional[str] = None
         branch: Optional[str] = None
@@ -1028,7 +1164,9 @@ class GitIntelligenceService:
 
     # -- HEAD facts --------------------------------------------------------
 
-    def collect_head_facts(self, path) -> Tuple[Optional[GitHeadFacts], List[GitWarning]]:
+    def collect_head_facts(
+        self, path, state: Optional[GitRepositoryState] = None
+    ) -> Tuple[Optional[GitHeadFacts], List[GitWarning]]:
         cwd = str(path)
         try:
             self._ensure_repository(cwd)
@@ -1041,7 +1179,10 @@ class GitIntelligenceService:
         if not commits:
             return None, [GitWarning(WARN_GIT_PARSE_FAILED, "empty HEAD log record")]
         head = commits[0]
-        branch, detached = self._resolve_branch(cwd)
+        if state is not None:
+            branch, detached = state.branch, state.detached
+        else:
+            branch, detached = self._resolve_branch(cwd)
         return (
             GitHeadFacts(
                 head_sha=head.sha,
@@ -1079,13 +1220,19 @@ class GitIntelligenceService:
         self, cwd: str, *, cached: bool, include_snippets: bool
     ) -> List[GitDiffFact]:
         side = ["--cached"] if cached else []
+        env = _diff_env()
+        safe = list(_DIFF_NO_EXEC_FLAGS)
         numstat = parse_numstat_z(
-            self._runner.run(cwd, "diff", "--numstat", "-z", *side)
+            self._runner.run(
+                cwd, "diff", *safe, "--numstat", "-z", *side, env=env
+            )
         )
         statuses = {
             entry.path: entry
             for entry in parse_name_status_z(
-                self._runner.run(cwd, "diff", "--name-status", "-z", *side)
+                self._runner.run(
+                    cwd, "diff", *safe, "--name-status", "-z", *side, env=env
+                )
             )
         }
         facts: List[GitDiffFact] = []
@@ -1097,7 +1244,8 @@ class GitIntelligenceService:
             snippet: Optional[str] = None
             if include_snippets and not entry.binary:
                 raw = self._runner.run(
-                    cwd, "diff", "--unified=0", *side, "--", entry.path
+                    cwd, "diff", *safe, "--unified=0", *side, "--", entry.path,
+                    env=env,
                 )
                 snippet = redact_text(raw)[:GIT_SNIPPET_MAX_CHARS]
             facts.append(
@@ -1237,9 +1385,18 @@ _default_service: Optional[GitIntelligenceService] = None
 
 
 def _get_default_service() -> GitIntelligenceService:
+    """Shared service for the module-level convenience API.
+
+    Each convenience call is an independent one-shot collection, so the
+    per-instance repository-probe memo is dropped on entry. Without this
+    the process-wide service would keep trusting a probe indefinitely and
+    a directory that stopped being a repository would degrade with the
+    wrong warning code.
+    """
     global _default_service
     if _default_service is None:
         _default_service = GitIntelligenceService()
+    _default_service.reset_probe_cache()
     return _default_service
 
 
