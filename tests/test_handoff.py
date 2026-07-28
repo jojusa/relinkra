@@ -20,6 +20,7 @@ from relinkra.handoff import (
     build_handoff,
     contains_absolute_path,
     handoff_title,
+    scrub_absolute_paths,
 )
 from test_context_packet import FIXED_NOW, Env
 
@@ -226,9 +227,38 @@ class AbsolutePathDetectionTests(unittest.TestCase):
         self.assertTrue(contains_absolute_path("see /home/me/repo"))
         self.assertTrue(contains_absolute_path("\\\\server\\share"))
 
+    def test_detects_root_relative_windows_paths(self):
+        """A single leading backslash is still absolute.
+
+        os.path.join(os.sep + "opt", ...) produces this on Windows: no
+        drive letter, only one backslash, no forward slashes — so it
+        slips past drive, UNC, and POSIX matching alike.
+        """
+        self.assertTrue(contains_absolute_path("\\opt\\tools\\engram.exe"))
+        self.assertTrue(
+            contains_absolute_path("failed reading \\etc\\relinkra\\conf")
+        )
+
     def test_ignores_relative(self):
         self.assertFalse(contains_absolute_path("src/relinkra/mcp_server.py"))
         self.assertFalse(contains_absolute_path(""))
+        # Relative Windows fragments are not absolute.
+        self.assertFalse(contains_absolute_path("src\\relinkra\\mcp_server.py"))
+        self.assertFalse(contains_absolute_path("the ratio is 3 /4"))
+
+    def test_every_absolute_shape_round_trips_through_the_scrubber(self):
+        for raw in (
+            "C:\\Users\\me\\repo",
+            "D:/build/out",
+            "\\\\fileserver\\share\\tool.exe",
+            "\\opt\\tools\\engram.exe",
+            "/home/me/repo",
+        ):
+            scrubbed = scrub_absolute_paths(f"failed at {raw} today")
+            self.assertFalse(
+                contains_absolute_path(scrubbed),
+                f"{raw!r} survived scrubbing as {scrubbed!r}",
+            )
 
 
 class HandoffServiceTests(unittest.TestCase):

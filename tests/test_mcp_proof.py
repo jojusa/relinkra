@@ -59,19 +59,34 @@ class StdioClient:
         self._lines: "queue.Queue[str]" = queue.Queue()
         self._stderr: list = []
         self._next_id = 0
+        self._closed = False
+        #: Set by close() when shutdown did not complete cleanly. Tests
+        #: assert these stay False rather than close() raising.
+        self.kill_timed_out = False
+        self.threads_timed_out = False
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
         self._errors = threading.Thread(target=self._pump_stderr, daemon=True)
         self._errors.start()
 
     def _pump(self):
-        for line in self.process.stdout:
-            self._lines.put(line)
+        # Tolerate the stream being closed underneath us. close() joins
+        # these threads first, but a join can time out; without this
+        # guard that would surface as an unraisable exception in a daemon
+        # thread rather than a clean shutdown.
+        try:
+            for line in self.process.stdout:
+                self._lines.put(line)
+        except (ValueError, OSError):
+            pass
         self._lines.put("")
 
     def _pump_stderr(self):
-        for line in self.process.stderr:
-            self._stderr.append(line)
+        try:
+            for line in self.process.stderr:
+                self._stderr.append(line)
+        except (ValueError, OSError):
+            pass
 
     def request(self, method, params=None, timeout=CALL_TIMEOUT):
         self._next_id += 1
@@ -109,16 +124,70 @@ class StdioClient:
         assert not result.get("isError"), result["content"][0]["text"]
         return json.loads(result["content"][0]["text"])
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def close(self):
-        try:
-            self.process.stdin.close()
-        except (OSError, ValueError):
-            pass
+        """Shut the server down and release every handle deterministically.
+
+        Order matters and is the whole point:
+
+        1. Close stdin  -> the server sees EOF and leaves its serve loop.
+        2. wait()       -> the process exits, so its stdout/stderr reach
+                           EOF and the pump threads end on their own.
+        3. join()       -> no thread is still touching a stream when we
+                           close it, which would otherwise be a race.
+        4. Close stdout/stderr -> Popen does NOT close PIPE handles for
+                           you unless you go through communicate(); the
+                           earlier version closed only stdin, so every
+                           client leaked two TextIOWrappers and the suite
+                           reported them as ResourceWarnings at GC time.
+
+        Idempotent: tests call it via addCleanup and sometimes explicitly.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        self._safe_close(self.process.stdin)
         try:
             self.process.wait(timeout=20)
         except subprocess.TimeoutExpired:
             self.process.kill()
-            self.process.wait(timeout=10)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # Teardown must not raise: close() runs from addCleanup,
+                # where an exception turns a real assertion failure into
+                # a confusing teardown error. Record and keep going.
+                self.kill_timed_out = True
+
+        for thread in (self._reader, self._errors):
+            thread.join(timeout=10)
+            if thread.is_alive():
+                # The pumps tolerate a closed stream (see _pump), so
+                # closing under a straggler is safe rather than racy.
+                self.threads_timed_out = True
+
+        self._safe_close(self.process.stdout)
+        self._safe_close(self.process.stderr)
+
+    @staticmethod
+    def _safe_close(stream):
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def returncode(self):
+        return self.process.returncode
 
     @property
     def stderr_text(self):
@@ -337,6 +406,212 @@ class LiveMCPProofTests(unittest.TestCase):
 
         # The server is still alive and correct after all of that.
         self.assertEqual(client.request("ping")["result"], {})
+
+
+@unittest.skipUnless(_HAS_GIT, "git is required to build a workspace root")
+class ProcessLifecycleTests(unittest.TestCase):
+    """R3.2: the server must start, serve, and die cleanly, every time.
+
+    Deliberately independent of Engram: `initialize`, `ping`, and
+    `tools/list` never touch the memory store, so these run anywhere and
+    exercise the process contract itself rather than the data path.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "repo")
+        os.makedirs(self.root, exist_ok=True)
+        _git(self.root, "init", "-q")
+
+    def _spawn(self):
+        """Spawn a server, always registering teardown.
+
+        Cleanup is registered unconditionally even for tests that close
+        explicitly to inspect the exit code: close() is idempotent, so
+        the second call is free, and without this an assertion failing
+        before the explicit close would strand a child process blocked
+        on stdin forever.
+        """
+        client = StdioClient(
+            ["--workspace-root", self.root,
+             "--registry", os.path.join(self.tmp.name, "absent.json")],
+            cwd=REPO_ROOT,
+        )
+        self.addCleanup(client.close)
+        return client
+
+    def _handshake(self, client):
+        init = client.request(
+            "initialize",
+            {"protocolVersion": "2025-06-18", "capabilities": {},
+             "clientInfo": {"name": "lifecycle", "version": "1"}},
+            timeout=STARTUP_TIMEOUT,
+        )
+        self.assertIn("result", init, init)
+        client.notify("notifications/initialized")
+        return init["result"]
+
+    def test_full_lifecycle_then_clean_exit(self):
+        """initialize -> tools/list -> call -> EOF -> exit 0."""
+        client = self._spawn()
+        self._handshake(client)
+        tools = client.request("tools/list")["result"]["tools"]
+        self.assertEqual(len(tools), 9)
+        health = client.request(
+            "tools/call",
+            {"name": "relinkra_health", "arguments": {}},
+        )["result"]
+        self.assertIn("content", health)
+
+        client.close()  # closes stdin -> server sees EOF
+        self.assertEqual(
+            client.returncode, 0, f"unclean exit; stderr={client.stderr_text}"
+        )
+
+    def test_eof_while_idle_exits_cleanly(self):
+        client = self._spawn()
+        self._handshake(client)
+        # No further traffic; just disconnect.
+        client.close()
+        self.assertEqual(client.returncode, 0, client.stderr_text)
+
+    def test_eof_without_any_handshake_exits_cleanly(self):
+        client = self._spawn()
+        client.close()
+        self.assertEqual(client.returncode, 0, client.stderr_text)
+
+    def test_malformed_json_does_not_corrupt_the_session(self):
+        client = self._spawn()
+        self._handshake(client)
+        client.process.stdin.write("{ this is not json\n")
+        client.process.stdin.flush()
+        raw = client._lines.get(timeout=CALL_TIMEOUT)
+        self.assertEqual(json.loads(raw)["error"]["code"], -32700)
+        # The very next request must be served normally.
+        self.assertEqual(client.request("ping")["result"], {})
+        self.assertEqual(
+            len(client.request("tools/list")["result"]["tools"]), 9
+        )
+
+    def test_oversized_request_is_rejected_and_session_survives(self):
+        client = self._spawn()
+        self._handshake(client)
+        giant = "x" * (5 * 1024 * 1024)
+        client.process.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping",
+                 "params": {"pad": giant}}
+            )
+            + "\n"
+        )
+        client.process.stdin.flush()
+        raw = client._lines.get(timeout=CALL_TIMEOUT)
+        self.assertEqual(json.loads(raw)["error"]["code"], -32600)
+        self.assertEqual(client.request("ping")["result"], {})
+
+    def test_invalid_utf8_does_not_kill_the_server(self):
+        """One bad byte must cost one message, not the whole process.
+
+        The bytes are decoded with errors="replace", so the line becomes
+        undecodable-but-safe text, fails JSON parsing, and is answered
+        with a single parse error — exactly one message lost.
+        """
+        client = self._spawn()
+        self._handshake(client)
+        raw_stdin = client.process.stdin.buffer
+        raw_stdin.write(b"\xff\xfe not valid utf-8\n")
+        raw_stdin.flush()
+
+        raw = client._lines.get(timeout=CALL_TIMEOUT)
+        self.assertEqual(json.loads(raw)["error"]["code"], -32700)
+        # The session continues normally.
+        self.assertEqual(client.request("ping")["result"], {})
+        self.assertEqual(
+            len(client.request("tools/list")["result"]["tools"]), 9
+        )
+
+    def test_server_survives_a_long_mixed_sequence(self):
+        """A long-running host mixes good, bad, and notification traffic."""
+        client = self._spawn()
+        self._handshake(client)
+        for index in range(15):
+            client.notify("notifications/progress", {"n": index})
+            self.assertEqual(client.request("ping")["id"], client._next_id)
+            bad = client.request("no/such/method")
+            self.assertEqual(bad["error"]["code"], -32601)
+        self.assertEqual(
+            len(client.request("tools/list")["result"]["tools"]), 9
+        )
+
+    def test_repeated_start_stop_leaves_no_process_behind(self):
+        codes = []
+        for _ in range(3):
+            client = self._spawn()
+            self._handshake(client)
+            self.assertEqual(client.request("ping")["result"], {})
+            client.close()
+            codes.append(client.returncode)
+            self.assertIsNotNone(
+                client.process.poll(), "process still running after close()"
+            )
+        self.assertEqual(codes, [0, 0, 0])
+
+    def test_close_is_idempotent(self):
+        client = self._spawn()
+        self._handshake(client)
+        client.close()
+        client.close()  # must not raise
+        self.assertEqual(client.returncode, 0)
+
+    def test_write_to_a_dead_peer_raises_broken_pipe_not_a_hang(self):
+        """A genuine EPIPE: the peer is gone but our handle is still open.
+
+        Deliberately does NOT close our own stdin first — that would make
+        Python's own closed-stream guard raise ValueError before any
+        syscall, and the test would pass without ever exercising a real
+        broken pipe.
+        """
+        client = self._spawn()
+        self._handshake(client)
+
+        client.process.kill()
+        client.process.wait(timeout=20)
+        self.assertFalse(client.process.stdin.closed)
+
+        # A few writes may be needed: the first can land in a local
+        # buffer before the OS reports the dead reader.
+        with self.assertRaises((BrokenPipeError, OSError)) as caught:
+            for _ in range(200):
+                client.process.stdin.write(
+                    '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+                )
+                client.process.stdin.flush()
+        self.assertNotIsInstance(
+            caught.exception,
+            ValueError,
+            "closed-stream guard fired instead of a real broken pipe",
+        )
+        client.close()
+
+    def test_close_reports_clean_shutdown(self):
+        client = self._spawn()
+        self._handshake(client)
+        client.close()
+        self.assertFalse(client.kill_timed_out, "server needed a hard kill")
+        self.assertFalse(client.threads_timed_out, "a reader thread hung")
+
+    def test_every_pipe_is_closed_after_close(self):
+        """The ResourceWarning regression guard."""
+        client = self._spawn()
+        self._handshake(client)
+        client.close()
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(client.process, name)
+            self.assertTrue(
+                stream is None or stream.closed,
+                f"{name} was left open after close()",
+            )
 
 
 if __name__ == "__main__":

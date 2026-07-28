@@ -50,6 +50,7 @@ from .handoff import (
     HandoffError,
     HandoffService,
     HandoffValidationError,
+    scrub_absolute_paths,
 )
 from .identity import AmbiguousIdentityError
 from .identity import GitError as IdentityGitError
@@ -77,13 +78,26 @@ ERR_UNAVAILABLE = "unavailable"
 ERR_INTERNAL = "internal_error"
 
 
+def sanitize_wire_text(text: str) -> str:
+    """Make free-form text safe to put on the wire.
+
+    ``sanitize_error`` removes credentials but NOT paths, and the text
+    that reaches an agent is frequently an underlying error message that
+    embeds one — ``engram executable not found: C:\\Users\\me\\...`` is a
+    real example from a misconfigured binary. Every free-text field this
+    layer emits therefore goes through BOTH filters: redact secrets, then
+    replace machine-local absolute paths.
+    """
+    return scrub_absolute_paths(sanitize_error(text or ""))
+
+
 class ServiceError(Exception):
     """A typed, already-sanitized application error."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
-        self.message = sanitize_error(message)
+        self.message = sanitize_wire_text(message)
 
     def to_dict(self) -> dict:
         return {"error": {"code": self.code, "message": self.message}}
@@ -101,7 +115,7 @@ class ServiceWarning:
     message: str
 
     def to_dict(self) -> dict:
-        return {"code": self.code, "message": sanitize_error(self.message)}
+        return {"code": self.code, "message": sanitize_wire_text(self.message)}
 
 
 @dataclass
@@ -137,7 +151,7 @@ class _Probe:
         return {
             "available": self.available,
             "checked": self.checked,
-            "detail": sanitize_error(self.detail),
+            "detail": sanitize_wire_text(self.detail),
         }
 
 
@@ -188,7 +202,8 @@ class RelinkraServices:
         try:
             return Registry(path)
         except RegistryError as exc:
-            self._registry_error = sanitize_error(str(exc))
+            # A RegistryError commonly embeds the registry file path.
+            self._registry_error = sanitize_wire_text(str(exc))
             return None
 
     def _now(self) -> str:
@@ -895,16 +910,42 @@ class RelinkraServices:
                 ).to_dict(),
             },
             "degraded": sorted(set(degraded)),
+            # Each flag must describe something the server can actually
+            # execute RIGHT NOW, not something it implements in principle.
+            # Anything that needs a working memory write path is reported
+            # against Engram's real availability, because advertising
+            # "handoffs" while Engram is down would be a lie an agent
+            # only discovers by failing.
             "capabilities": {
                 "tools": True,
+                # Degrades to a partial packet plus warnings rather than
+                # failing, so it stays available even with engines down.
                 "context_packets": True,
                 "budgeting": True,
                 "relevance_ranking": True,
+                "memory_read": engram.available,
+                "memory_write": engram.available,
+                "handoffs": engram.available,
+                "code_resolution": cbm.available,
                 "git_intelligence": git.available,
-                "handoffs": True,
+                # Deliberate, permanent absences — not degradations.
                 "agent_private_access": False,
                 "git_write": False,
             },
+            # Capabilities whose backing component was NOT liveness-probed
+            # this call. Listed explicitly so a caller can tell "verified
+            # working" from "configured, unverified".
+            "capabilities_unchecked": sorted(
+                name
+                for name, probe in (
+                    ("memory_read", engram),
+                    ("memory_write", engram),
+                    ("handoffs", engram),
+                    ("code_resolution", cbm),
+                    ("git_intelligence", git),
+                )
+                if not probe.checked
+            ),
             # Boolean, never the path itself.
             "workspace_root_configured": bool(self.config.workspace_root),
         }
@@ -920,7 +961,7 @@ class RelinkraServices:
         except MemoryError as exc:
             return _Probe(available=False, detail=str(exc))
         except Exception as exc:
-            return _Probe(available=False, detail=sanitize_error(str(exc)))
+            return _Probe(available=False, detail=sanitize_wire_text(str(exc)))
 
     def _probe_cbm(self) -> _Probe:
         """Configuration check only — deliberately NOT a liveness probe.

@@ -157,6 +157,31 @@ tool.
 broken, so it never fails itself — a project-resolution error is reported
 as a degraded component rather than raised.
 
+**Recovery needs no restart.** Components are probed per `health` call
+and every tool resolves its engine at call time, so a component that
+comes back is usable on the very next request from the same process.
+
+## Capability honesty
+
+`health.capabilities` describes what the server can execute **right
+now**, not what it implements in principle. Anything requiring a working
+memory write path (`memory_read`, `memory_write`, `handoffs`) is reported
+against Engram's real, liveness-probed availability — advertising
+`handoffs` while Engram is down would be a claim an agent only discovers
+by failing. `context_packets` stays available because it degrades to a
+partial packet plus warnings rather than failing.
+
+`agent_private_access` and `git_write` are permanent, deliberate
+absences, not degradations.
+
+`capabilities_unchecked` names any capability whose backing component was
+**not** liveness-probed on this call, so a caller can tell "verified
+working" from "configured, unverified". Today that is `code_resolution`
+when a CBM binary is configured: probing the code indexer on every status
+request would be too expensive, so it is advertised and labelled rather
+than silently implying verification. A component known to be absent is a
+checked negative, not an unchecked one.
+
 ## Security properties
 
 Re-proven by tests in this delta:
@@ -168,6 +193,14 @@ Re-proven by tests in this delta:
   `workspace_root_configured` as a boolean, never the path.
   `project_resolve` projects `Workspace` field-by-field, because that
   object also carries `absolute_path` / `canonical_path`.
+- **Every free-text field the service layer emits** — typed error
+  messages, warnings, and component probe details — goes through
+  `sanitize_wire_text`, which redacts secrets *and* replaces machine-local
+  absolute paths. This matters because the text reaching an agent is
+  often an underlying error that embeds a path: a missing binary produces
+  `engram executable not found: <path>`, and a broken registry produces
+  the registry's own path. Redaction alone does not remove paths, so both
+  filters are applied.
 - `AGENT_PRIVATE` is unreachable: never returned by search, never in a
   context packet, not writable through the surface, and dropped (with a
   warning) if referenced from a handoff. This matters because

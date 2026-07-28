@@ -71,7 +71,15 @@ _ABS_PATH_RES = (
     # C:\x or C:/x. The lookbehind keeps URL schemes out: the "e:/" in
     # "remote://git/..." is not a drive letter.
     re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s]*"),
-    re.compile(r"\\\\[^\s\\]+(?:\\[^\s\\]+)*"),                # UNC share
+    # UNC share. Must run BEFORE the root-relative pattern below so that
+    # \\server\share is consumed here rather than half-matched there.
+    re.compile(r"\\\\[^\s\\]+(?:\\[^\s\\]+)*"),
+    # Root-relative Windows path: a SINGLE leading backslash, as produced
+    # by os.path.join(os.sep + "opt", ...) on Windows. Drive-less but
+    # still absolute, and missed by every other pattern here. The
+    # lookbehind excludes UNC (already consumed) and relative fragments
+    # like "src\mod\file.py"; 2+ segments keeps stray escapes out.
+    re.compile(r"(?<![\\A-Za-z0-9_])\\[A-Za-z0-9_.\-]+(?:\\[A-Za-z0-9_.\-]*)+"),
     # POSIX absolute. Must not follow a non-space (so "http://h/p" and
     # "a/b" are excluded) and needs 2+ segments (so "3 /4" is excluded).
     re.compile(r"(?<!\S)/[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]*)+"),

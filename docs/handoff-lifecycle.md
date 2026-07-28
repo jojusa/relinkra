@@ -129,6 +129,38 @@ already `PROJECT_SHARED` and readable by any agent on the project;
 filtering by target is a convenience for "what was left for me", never a
 permission.
 
+## Reachability and the store page
+
+`get()` and supersede-target validation issue a **targeted** store search
+on the handoff id, so a handoff stays reachable no matter how much other
+memory the project accumulates. `list()` searches on the envelope version
+(`rlkho1`), which appears in every handoff body and no other memory type,
+so its page is spent on handoffs instead of unrelated decisions.
+
+`list()` is nonetheless **bounded by one store page** and returns the most
+recent handoffs only. True cursor pagination is deliberately **deferred**:
+the `MemoryStore` protocol exposes `query`, `project`, `storage_type`, and
+`limit` with no offset or cursor, and the Engram CLI's search offers none
+either — adding one would change adapter semantics, not just this module.
+The important property is unaffected: *reachability by id is unbounded*,
+so no handoff becomes permanently invisible and no supersede target is
+lost.
+
+## Concurrency
+
+Identity is a content hash, so concurrent creates of the same logical
+handoff agree on `handoff_id` by construction rather than by coordination
+— there is no lock and none is needed for identity. R1C's dedup then
+collapses the replays: in a four-way race exactly one write is fresh and
+the rest report `deduplicated=True`, leaving one record and one active
+handoff.
+
+The residual window is honest and small: between R1C's duplicate check
+and its write, a genuinely parallel store could admit a second record.
+That costs a redundant history entry which the topic-supersede path
+collapses in the active view — it cannot fork identity or corrupt
+history, because the id does not depend on timing.
+
 ## Policy isolation
 
 `MemoryService.get()` resolves by id *without* applying a scope filter,
