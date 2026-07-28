@@ -93,6 +93,12 @@ def _interprocess_lock(registry_path: str):
         fh.close()
 
 
+#: Public alias. The same advisory-lock discipline guards connector
+#: config writes (R4B ``safe_write``); exporting the one implementation
+#: keeps a second, subtly different copy from appearing there.
+interprocess_lock = _interprocess_lock
+
+
 def sanitize_remote_for_storage(identity: RepositoryIdentity) -> RepositoryIdentity:
     """Assert an identity carries no credentials before persisting it.
 

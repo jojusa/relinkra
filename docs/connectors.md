@@ -1,0 +1,406 @@
+# Connectors (R4B)
+
+Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
+Code, OpenCode, Codex, Windsurf, or anything else that speaks MCP — to launch
+that server for this workspace.
+
+The user-facing shape is meant to stay this small:
+
+```
+relinkra connect list
+relinkra connect inspect claude
+relinkra connect plan claude
+relinkra connect check claude
+relinkra connect generic
+```
+
+Powerful inside, simple outside. Everything below is the "inside".
+
+> **Status.** This phase builds and proves the connector foundation. No
+> connector writes to a host configuration, and no connector has been proven
+> against a live host launch. See [Capability honesty](#capability-honesty).
+
+---
+
+## Connector lifecycle
+
+Every connector mutation — when writing is eventually enabled — follows one
+fixed sequence. Read-only commands stop partway through it.
+
+```
+discover → inspect → plan → validate plan → dry-run
+         → backup → atomic merge → validate result → rollback on failure
+```
+
+| Stage | Owner | Implemented | Reachable from the CLI |
+| --- | --- | --- | --- |
+| discover | `host_discovery.probe` | yes | `connect list`, `connect inspect` |
+| inspect | `connectors.inspect_connector` | yes | `connect inspect`, `connect check` |
+| plan | `connectors.build_plan` | yes | `connect plan` |
+| validate plan | `config_merge.decide_member` | yes | `connect plan` |
+| dry-run | planning *is* the dry run | yes | `connect plan --dry-run` |
+| backup | `safe_write.create_backup` | yes | not yet |
+| atomic merge | `safe_write.safe_replace` | yes | not yet |
+| validate result | `config_merge.validate_json_text` | yes | not yet |
+| rollback | `safe_write.safe_replace` | yes | not yet |
+
+The last four rows are built and tested. They are deliberately not wired to a
+command — see [Why there is no `apply`](#why-there-is-no-apply).
+
+---
+
+## Module map
+
+| Module | Responsibility |
+| --- | --- |
+| `relinkra/connector.py` | Domain vocabulary: states, launch contract, plan, capability matrix. No I/O. |
+| `relinkra/host_discovery.py` | Bounded, declared candidate locations; pure path resolution; probing. |
+| `relinkra/config_merge.py` | Non-destructive structured merge and deterministic serialization. |
+| `relinkra/safe_write.py` | Backup, atomic write, rollback, size bounds, advisory locking. |
+| `relinkra/connectors.py` | The registry: per-host declarations, launch resolution, plan building. |
+| `relinkra/connect_cli.py` | Command dispatch, exit codes, the portability audit. |
+| `relinkra/connect_render.py` | Human-readable rendering. Pure functions. |
+
+---
+
+## Generic MCP contract
+
+`relinkra connect generic` emits the host-neutral way to start the server over
+stdio. It is derived from the running environment, never hardcoded.
+
+Resolution order:
+
+1. **console script** — `relinkra-mcp` on `PATH`, if Relinkra is installed as a
+   package. Cleanest contract: no interpreter, no `PYTHONPATH`.
+2. **installed module** — the current interpreter plus `-m relinkra.mcp_cli`,
+   when the package resolves from the interpreter's own library directories.
+3. **source checkout** — same, plus a required `PYTHONPATH`. This is what a
+   working copy of the repository gets, and the contract says so out loud.
+4. **unresolved** — no interpreter could be found. Reported, never guessed.
+
+The contract is always **structured**: a `command` string and a separate `args`
+list. It is never assembled into a single shell string, so a workspace path
+containing a space, an `&` or a quote is inert data. No `shell=True`, anywhere.
+
+### Portable vs machine-local output
+
+| | Default | `--reveal-paths` |
+| --- | --- | --- |
+| `command` | `<interpreter>` | the real executable |
+| path-shaped `args` | `<path>` | the real value |
+| environment | key names only | names and values |
+
+Argument **arity and order** survive redaction, so the shape of the invocation
+is still reviewable without disclosing where anything lives. Every payload
+rendered without `--reveal-paths` is audited for absolute paths immediately
+before printing; a leak fails the command rather than reaching the terminal.
+
+---
+
+## Support and proof matrix
+
+Verified formats were read out of a real local configuration on a development
+machine — not from documentation.
+
+| Connector | Support | Format verified | Evidence | Plan | Apply | Host launch proven |
+| --- | --- | --- | --- | --- | --- | --- |
+| `generic` | supported | yes | Relinkra's own stdio entry point | n/a | n/a | **no** |
+| `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | **no** | **no** |
+| `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | **no** | **no** |
+| `codex` | experimental | yes (read) | `[mcp_servers.<name>]` TOML tables | **no** | **no** | **no** |
+| `windsurf` | experimental | yes | `mcpServers` with `{command, args}` | yes | **no** | **no** |
+| `devin` | unsupported | no | — | no | no | no |
+
+Codex is read-only: rewriting TOML without destroying the user's comments and
+formatting needs a round-tripping writer, which is out of scope here. Reading it
+requires `tomllib` (Python 3.11+); on older interpreters the registration state
+is reported `unknown` rather than guessed from a regex.
+
+Devin appears so the roadmap is visible. Nothing about it is implemented.
+
+### Config locations
+
+Each connector declares a finite, ordered list. Declaration order is
+precedence: the first candidate that **exists** becomes the active config.
+Nothing is globbed and no directory is walked.
+
+| Connector | Candidates |
+| --- | --- |
+| `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`), `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` |
+| `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| `windsurf` | `~/.codeium/windsurf/mcp_config.json`, `~/.codeium/windsurf-next/mcp_config.json` |
+
+A host is reported `not_installed` only when **none** of its candidates exist
+**and** its executable is not on `PATH`. One missing conventional file proves
+nothing.
+
+---
+
+## Discovery states
+
+Four failure shapes are kept distinct because each calls for a different user
+action:
+
+| State | Meaning | What the user does |
+| --- | --- | --- |
+| `discovered` | config found and parsed | nothing |
+| `not_installed` | no config, no executable | install the host |
+| `config_missing` | executable present, no config | run the host once |
+| `config_malformed` | config exists, does not parse | repair the file |
+| `config_unsupported` | parses, wrong shape / too large / unreadable | look at what that key holds |
+| `unverified` | Relinkra cannot speak for this host | nothing available |
+
+A candidate whose `stat` is denied counts as the **active** location even
+though it does not report as existing. A denied `stat` cannot tell presence
+from absence, and skipping it would report the host as not installed while its
+config sits right there behind a permissions problem — sending the user to
+reinstall instead of to `chmod`.
+
+---
+
+## Ownership and conflicts
+
+Relinkra registers under the server name `relinkra`. A name alone never confers
+ownership — the name is exactly what a coincidental user entry would share.
+
+Ownership is decided **structurally**: an entry is Relinkra's if its command
+tokens name `relinkra.mcp_cli` or the `relinkra-mcp` console script. Both
+command shapes are understood (`{command: str, args: [...]}` and
+`{command: [prog, ...]}`), and path separators are handled for both platforms so
+a config written on Windows is read correctly on POSIX.
+
+| Situation | Decision | Effect |
+| --- | --- | --- |
+| no entry of that name | `add` | plan creates it |
+| our entry, already correct | `no_op` | plan is idempotent |
+| our entry, stale | `update` | plan refreshes it |
+| someone else's entry of that name | **`conflict`** | plan is `blocked`, nothing is overwritten |
+
+An explicit ownership marker (`x-relinkra`) is supported by the engine but
+enabled for no host: adding an unknown member to a config whose validation
+behaviour is unverified could break the very file Relinkra is extending. It
+stays opt-in per connector.
+
+### What survives a merge
+
+- Every unrelated member, byte-for-byte where the structured representation
+  allows it.
+- Key order — the document is never sorted, so a one-member addition stays a
+  one-member diff.
+- Indentation and line endings, detected from the file itself.
+- **Unknown fields on our own entry.** An update overlays the desired fields
+  onto the existing entry rather than replacing it, so a user's `disabled` flag
+  or a host's bookkeeping is not reset on the next run.
+
+Nothing is guessed. A container that is a list where an object is expected is a
+typed refusal, not an assumption.
+
+---
+
+## Plan model
+
+A plan is deterministic and side-effect free. Two builds from the same inputs
+produce equal dictionaries — that is what makes `connect plan` safe to run
+repeatedly and what the idempotency proof compares.
+
+Operations: `no_op`, `backup_file`, `create_file`, `add_object_member`,
+`replace_managed_member`, `validate_json`, `request_restart`.
+
+Every operation carries preconditions, postconditions and rollback information
+as **data**, because the process that plans is not the process that would
+apply. The executor re-checks them at write time; that re-check is what closes
+the gap between the two.
+
+Targets are named semantically (`claude:claude_user_settings`), never by path,
+so a plan means the same thing on every machine and can be diffed across them.
+
+Plan status is three-valued:
+
+- `ready` — the merge is computable and safe.
+- `blocked` — a conflict. A person must decide.
+- `unavailable` — no plan could be built (unverified format, unparseable
+  config, unresolved launch contract, TOML host).
+
+`apply_available` is a **separate** field. A `ready` plan with
+`apply_available: false` is the normal state in this phase.
+
+`connect check` decides staleness with the **same** `decide_member` engine that
+`build_plan` uses. Answering that question a second way is exactly how a `check`
+ends up calling a registration valid that `plan`, reading the same file, reports
+as needing an update. `check` also distinguishes *unknown* from *absent*: when
+the config could not be parsed — on an interpreter without `tomllib`, say — it
+says so rather than claiming no registration exists.
+
+---
+
+## Backup, atomic write and rollback
+
+The only acceptable failure mode for a connector write is "nothing changed".
+
+- **Backup before mutation**, with collision-safe naming
+  (`config.json.relinkra-backup`, then `-1`, `-2`). A name is never reused, so
+  a second failed write cannot overwrite the only copy of the original.
+- **Same-directory temp file.** `os.replace` is atomic only within a
+  filesystem; a cross-mount move would silently degrade to copy-then-delete.
+- **fsync** on the temp file, on backups, and best-effort on the directory.
+- **Atomic replace**, then **re-read and re-validate what landed on disk** —
+  the in-memory string being valid says nothing about truncation, encoding, or
+  a full disk.
+- **Automatic rollback**, by the most faithful route available: the backup file
+  (copied back through the same temp-and-replace sequence as the forward write,
+  never a chunked `copy2` onto the live file), else the original text — which
+  `safe_replace` already read to compute the precondition digest, and which is
+  what covers `backup=False` — else deletion, when the file did not exist before
+  and the correct original state is *absent*.
+- **Temp cleanup on every path**, success or failure.
+- **Permissions**: new files are `0o600`; an existing file keeps its own mode.
+  Relinkra never widens permissions.
+- **Advisory locking** around the whole read-modify-write, reusing the
+  registry's existing cross-platform lock rather than introducing a second one.
+  Best-effort by design (matching the registry): if the platform primitive is
+  unavailable the critical section proceeds unlocked rather than failing.
+- **The symlink refusal is re-asserted immediately before the replace**, not
+  only on entry. The early check runs several I/O steps before the write —
+  long enough for the target to be swapped for a symlink in between, which is
+  exactly the substitution the check exists to refuse.
+
+Precondition digests close the plan/apply gap: a plan is built from the config
+as it was *read*, and a user may edit it while deciding. A changed digest
+aborts the write instead of silently discarding their edit.
+
+---
+
+## Security boundaries
+
+| Risk | Mitigation |
+| --- | --- |
+| Command injection | Structured `command` + `args`; never joined into a string. |
+| Shell invocation | No `shell=True`, no `eval`/`exec`, no shell string assembled anywhere. |
+| Path traversal | Candidate locations are declared constants joined onto a resolved base. |
+| Environment-supplied directories | `XDG_CONFIG_HOME` / `CODEX_HOME` are honoured only when **absolute**; a relative value would resolve against an arbitrary working directory. |
+| Symlink / reparse point | Writes through a symlink are refused with a typed error — `os.replace` would silently detach the link. |
+| TOCTOU | Size is checked at `stat` **and** at read; content digests gate the write; the read-modify-write runs under one lock. |
+| Oversized config | Hard `MAX_CONFIG_BYTES` ceiling with a typed failure. |
+| Malicious JSON shapes | Non-object roots and non-object containers are typed refusals, never coerced. |
+| Credential leakage | No configuration is echoed. Only key *names* and structural counts are rendered. |
+| Environment-value leakage | `env_keys` in portable output; values only under `--reveal-paths`. |
+| Absolute-path leakage | Every non-revealed payload is audited before printing; a leak fails the command. |
+| Destructive merge | Foreign entries of the same name are a hard conflict. Unrelated members are never touched. |
+| Unbounded scanning | No globbing, no directory walking, no reading outside declared candidates. |
+| Deeply nested JSON | `RecursionError` is caught at the parse boundary and reported as a malformed configuration. ~40 KB of brackets is under the size ceiling, so the byte limit alone does not cover this. |
+
+The host executable is looked up **only as evidence of installation**. Relinkra
+never runs it. Relinkra configures agents; it does not start them.
+
+---
+
+## Capability honesty
+
+`connect list` and `connect inspect` report seven independent facts. Read them
+left to right — a later one is never implied by an earlier one.
+
+| Capability | Means |
+| --- | --- |
+| `implementation_exists` | Relinkra has a connector for this host. |
+| `configuration_format_verified` | The shape was read from a real config, not assumed. |
+| `registration_detected` | A Relinkra entry is present right now. |
+| `registration_planned` | A `ready` mutation plan was produced. `connect list` and `connect inspect` plan as well as inspect, so this is a live fact rather than a field that can only ever be false. |
+| `configuration_validated` | The host's config parsed cleanly. |
+| `mcp_process_contract_validated` | The launch contract resolves and the server module imports. |
+| `real_host_launch_proven` | **A real host actually started this server.** |
+
+The last one is `false` everywhere and cannot be set by planning. Producing a
+plan proves a file could be edited; it says nothing about a host starting the
+server afterwards.
+
+### Why there is no `apply`
+
+Every safety primitive an `apply` needs exists and is tested. It is not wired to
+a command because the honest gate for writing to a developer's live
+configuration is a *real host launch*, not a successful merge. Until R4C
+demonstrates that, `connect plan` shows exactly what would change and the user
+applies it themselves.
+
+This is the preferable state, not a shortfall.
+
+---
+
+## Cross-platform design
+
+Windows, Linux and macOS are all first-class.
+
+- `pathlib` throughout; no separator literals, no hardcoded slashes.
+- Location resolution is a **pure function** of an injected environment and uses
+  `PureWindowsPath` / `PurePosixPath` chosen from that environment's declared
+  system — so Windows semantics are asserted while running on Linux and vice
+  versa.
+- `%APPDATA%` is Windows-only and resolves to nothing elsewhere. `XDG_CONFIG_HOME`
+  is honoured on **every** platform, because real cross-platform agent CLIs use
+  `~/.config` on Windows too.
+- No `python` vs `python3` assumption: `sys.executable` first, then `python3`,
+  then `python`.
+- No dependency on PowerShell, `cmd` or a POSIX shell.
+- POSIX file modes are applied where they mean something and ignored where they
+  do not; directory `fsync` is best-effort because Windows cannot do it.
+
+**Still requiring CI certification on real machines:** POSIX permission
+assertions and symlink refusal are skipped on Windows and vice versa; the
+`%APPDATA%` and `$XDG_CONFIG_HOME` branches are asserted through injected
+environments rather than on real Linux and macOS hosts; and no host has been
+launched on any platform yet.
+
+---
+
+## Adding a future connector
+
+Append one `ConnectorSpec` to `CONNECTORS` in `relinkra/connectors.py`:
+
+```python
+NEWHOST = ConnectorSpec(
+    connector_id="newhost",
+    display_name="New Host",
+    host_type="cli_agent",
+    aliases=("nh",),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("newhost",),
+    locations=_newhost_locations(),   # declared LocationSpec tuple
+    container_path=("mcpServers",),
+    config_format=FORMAT_JSON,
+    entry_builder=_string_command_entry,
+    format_verified=False,            # until read from a real config
+    apply_available=False,            # until a real host launch is proven
+    apply_unavailable_reason="...",
+    restart_instruction="...",
+)
+```
+
+Nothing in the CLI enumerates connector ids, so no dispatch code changes.
+
+Rules for the new spec:
+
+1. `format_verified` stays `False` until the shape is read out of a real
+   configuration file. Documentation is not evidence.
+2. `apply_available` stays `False` until a real host has launched the server.
+3. `marker_allowed` stays `False` until that host is shown to preserve unknown
+   members across a rewrite.
+4. Location `display_hint` is a declared template (`~/.foo/config.json`), never
+   derived from a resolved path.
+5. If the entry shape is neither of the two verified ones, add an entry builder
+   and an ownership matcher rather than bending an existing one.
+
+---
+
+## Next: R4C real-host proof
+
+Required before any connector may claim `real_host_launch_proven`:
+
+1. Apply a `connect plan` by hand to one real host.
+2. Start that host and confirm it launches `relinkra.mcp_cli` over stdio.
+3. Confirm the MCP handshake and at least one tool call succeed.
+4. Confirm unrelated MCP servers in the same config still work.
+5. Only then set `real_host_launch_proven=True` for that connector, and only
+   for that one.
+
+Enabling `apply_available` additionally requires the round trip — plan, write,
+restart, verify, rollback — to be demonstrated end to end.

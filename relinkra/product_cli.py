@@ -992,6 +992,13 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.set_defaults(func=handler)
 
+    # Imported here, not at module scope: connect_cli imports this
+    # module for the exit-code contract and the shared renderers, so a
+    # top-level import in either direction would be circular.
+    from .connect_cli import register as register_connect
+
+    register_connect(sub)
+
     return parser
 
 

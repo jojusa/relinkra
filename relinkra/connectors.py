@@ -1,0 +1,1341 @@
+"""Connector registry, launch contract and plan builder (R4B).
+
+This is where host knowledge lives. Everything below is declarative: a
+:class:`ConnectorSpec` states where a host keeps its configuration, what
+shape an MCP entry takes there, how to recognise an entry as Relinkra's,
+and — separately — how much of that has actually been VERIFIED against a
+real configuration file rather than assumed from documentation.
+
+Adding a future agent means appending one ``ConnectorSpec`` to
+:data:`CONNECTORS`. Nothing in the CLI enumerates connector ids, so no
+dispatch code changes.
+
+Honesty is enforced structurally. ``format_verified`` is set only where
+the shape was read out of a real local config, and it gates whether a
+plan can be produced at all. ``apply_available`` is a second, stricter
+gate: even a verified format does not get a write path in this phase,
+because a plan proves a file could be edited and proves nothing about a
+host successfully launching the server afterwards.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import shutil
+import sys
+import sysconfig
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from .config_merge import (
+    ACTION_ADD,
+    ACTION_CONFLICT,
+    ACTION_NO_OP,
+    ACTION_UPDATE,
+    MalformedConfigError,
+    MergeError,
+    UnsupportedShapeError,
+    decide_member,
+    ownership_test,
+    parse_json_document,
+)
+from .connector import (
+    CONTRACT_VERSION,
+    DISCOVERY_CONFIG_MALFORMED,
+    DISCOVERY_CONFIG_MISSING,
+    DISCOVERY_CONFIG_UNSUPPORTED,
+    DISCOVERY_DISCOVERED,
+    DISCOVERY_NOT_INSTALLED,
+    DISCOVERY_UNVERIFIED,
+    DISTRIBUTION_CONSOLE_SCRIPT,
+    DISTRIBUTION_INSTALLED_MODULE,
+    DISTRIBUTION_SOURCE_CHECKOUT,
+    DISTRIBUTION_UNRESOLVED,
+    FORMAT_JSON,
+    FORMAT_TOML,
+    MANAGED_SERVER_NAME,
+    OP_ADD_OBJECT_MEMBER,
+    OP_BACKUP_FILE,
+    OP_CREATE_FILE,
+    OP_NO_OP,
+    OP_REPLACE_MANAGED_MEMBER,
+    OP_REQUEST_RESTART,
+    OP_VALIDATE_JSON,
+    PLAN_BLOCKED,
+    PLAN_READY,
+    PLAN_UNAVAILABLE,
+    REGISTRATION_ABSENT,
+    REGISTRATION_ALREADY_CONNECTED,
+    REGISTRATION_CONFLICT,
+    REGISTRATION_NEEDS_UPDATE,
+    REGISTRATION_UNKNOWN,
+    SUPPORT_EXPERIMENTAL,
+    SUPPORT_SUPPORTED,
+    SUPPORT_UNSUPPORTED,
+    TRANSPORT_STDIO,
+    CapabilityMatrix,
+    ConfigLocation,
+    ConnectorPlan,
+    ConnectorReport,
+    ConnectorWarning,
+    LaunchContract,
+    PlanOperation,
+    UnknownConnectorError,
+)
+from .host_discovery import (
+    SCOPE_USER,
+    SCOPE_WORKSPACE,
+    DiscoveryEnvironment,
+    LocationSpec,
+    active_location,
+    find_executable,
+    probe,
+)
+from .safe_write import (
+    ConfigTooLargeError,
+    SafeWriteError,
+    read_bounded_text,
+)
+
+#: Console script name, if Relinkra is ever installed as a package. Not
+#: present in a source checkout, which is why it is probed rather than
+#: assumed.
+CONSOLE_SCRIPT = "relinkra-mcp"
+
+#: The module a host is asked to run. Also the structural fingerprint
+#: used to recognise a Relinkra entry in someone else's config.
+SERVER_MODULE = "relinkra.mcp_cli"
+
+
+# ---------------------------------------------------------------------------
+# Launch contract
+# ---------------------------------------------------------------------------
+
+
+def _interpreter(which: Callable[[str], Optional[str]]) -> str:
+    """Resolve a Python to hand the host.
+
+    ``sys.executable`` first, because it is the interpreter that already
+    imported Relinkra successfully — the only one known to work. It is
+    empty in embedded and frozen builds, so PATH is the fallback, and
+    ``python3`` is tried before ``python`` since on many Linux distros
+    ``python`` is either absent or still Python 2.
+    """
+    if sys.executable:
+        return sys.executable
+    for name in ("python3", "python"):
+        found = which(name)
+        if found:
+            return found
+    return ""
+
+
+def _package_root() -> Path:
+    """Directory that must be importable for ``relinkra`` to resolve."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _is_installed_package() -> bool:
+    """Whether ``relinkra`` resolves without help from ``PYTHONPATH``.
+
+    Compares the package's parent against the interpreter's own library
+    directories. A checkout sitting in a user's projects folder is not
+    under either, so the launch contract knows it must carry
+    ``PYTHONPATH`` — the difference between an MCP server that starts and
+    one that dies with ``ModuleNotFoundError`` the first time a host runs
+    it from its own working directory.
+    """
+    root = _package_root()
+    for key in ("purelib", "platlib"):
+        raw = sysconfig.get_paths().get(key)
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).resolve()
+        except OSError:
+            continue
+        if root == candidate or candidate in root.parents:
+            return True
+    return False
+
+
+def server_module_importable() -> bool:
+    """Whether the MCP entry point exists in THIS installation.
+
+    Cheap proof that the contract points at something real, and it stays
+    a pure import-spec lookup: no process is spawned, so nothing is
+    started as a side effect of asking a question.
+    """
+    try:
+        return importlib.util.find_spec(SERVER_MODULE) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def resolve_launch(
+    workspace_root,
+    registry_path,
+    *,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    force_source_checkout: Optional[bool] = None,
+) -> LaunchContract:
+    """Build the stdio launch contract for this machine.
+
+    Command and arguments stay separate values all the way through. They
+    are never joined into a string, so a workspace root containing a
+    space, an ampersand or a quote is inert data rather than something a
+    shell would reinterpret. No shell is involved at any point.
+    """
+    warnings: List[str] = []
+    root = str(Path(workspace_root).resolve()) if workspace_root else ""
+    registry = str(registry_path) if registry_path else ""
+
+    args: List[str] = []
+    env: Dict[str, str] = {}
+
+    script = which(CONSOLE_SCRIPT)
+    if script:
+        command = script
+        distribution = DISTRIBUTION_CONSOLE_SCRIPT
+    else:
+        command = _interpreter(which)
+        if not command:
+            return LaunchContract(
+                transport=TRANSPORT_STDIO,
+                distribution=DISTRIBUTION_UNRESOLVED,
+                module=SERVER_MODULE,
+                resolved=False,
+                warnings=(
+                    "no Python interpreter could be resolved for this "
+                    "environment; the MCP launch command cannot be built",
+                ),
+            )
+        args.extend(["-m", SERVER_MODULE])
+        source_checkout = (
+            (not _is_installed_package())
+            if force_source_checkout is None
+            else force_source_checkout
+        )
+        if source_checkout:
+            distribution = DISTRIBUTION_SOURCE_CHECKOUT
+            env["PYTHONPATH"] = str(_package_root())
+            warnings.append(
+                "Relinkra is running from a source checkout, so the host "
+                "must pass PYTHONPATH for the server to import. Installing "
+                "Relinkra as a package removes this requirement."
+            )
+        else:
+            distribution = DISTRIBUTION_INSTALLED_MODULE
+
+    if root:
+        args.extend(["--workspace-root", root])
+    if registry:
+        args.extend(["--registry", registry])
+
+    if not server_module_importable():
+        warnings.append(
+            f"{SERVER_MODULE} is not importable in this environment; the "
+            "launch contract cannot be trusted until that is fixed."
+        )
+
+    return LaunchContract(
+        transport=TRANSPORT_STDIO,
+        command=command,
+        args=tuple(args),
+        env=env,
+        distribution=distribution,
+        module=SERVER_MODULE,
+        resolved=bool(command) and server_module_importable(),
+        warnings=tuple(warnings),
+    )
+
+
+def launch_contract_document(launch: LaunchContract) -> dict:
+    """The host-neutral contract ``connect generic`` emits (portable)."""
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "server_name": MANAGED_SERVER_NAME,
+        "launch": launch.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ownership: recognising a Relinkra entry in someone else's config
+# ---------------------------------------------------------------------------
+
+
+def _basename(token: str) -> str:
+    """Last path segment, treating BOTH separators as separators.
+
+    A config written on Windows can be read on Linux and vice versa, so
+    ``PurePath`` of the local flavour is the wrong tool here — it would
+    not split ``C:\\...\\relinkra-mcp.exe`` when running on POSIX.
+    """
+    for separator in ("\\", "/"):
+        token = token.rsplit(separator, 1)[-1]
+    return token
+
+
+def entry_tokens(entry: Any) -> Tuple[str, ...]:
+    """Flatten an MCP entry into the tokens it would execute.
+
+    Handles both shapes seen in real configs: ``command`` as a string
+    with a separate ``args`` list (Claude Code, Windsurf), and ``command``
+    as a single list holding the program and its arguments (OpenCode).
+    """
+    if not isinstance(entry, Mapping):
+        return ()
+    tokens: List[str] = []
+    command = entry.get("command")
+    if isinstance(command, str):
+        tokens.append(command)
+    elif isinstance(command, (list, tuple)):
+        tokens.extend(str(item) for item in command)
+    args = entry.get("args")
+    if isinstance(args, (list, tuple)):
+        tokens.extend(str(item) for item in args)
+    return tuple(tokens)
+
+
+def launches_relinkra(entry: Any) -> bool:
+    """Structural ownership test: does this entry start Relinkra?
+
+    Chosen over a name check because the name is exactly what a
+    coincidental user entry would share. An entry that names the
+    Relinkra module or console script IS a Relinkra registration
+    whoever wrote it; an entry that does not is someone else's, and
+    overwriting it would be the destructive behaviour this refuses.
+
+    Deliberately does not require an exact command match, so a user who
+    pinned a different interpreter still owns a valid registration and
+    gets an update rather than a conflict.
+    """
+    tokens = entry_tokens(entry)
+    for token in tokens:
+        if token == SERVER_MODULE:
+            return True
+        base = _basename(token)
+        if base == CONSOLE_SCRIPT or base == CONSOLE_SCRIPT + ".exe":
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Entry builders — one per verified host format
+# ---------------------------------------------------------------------------
+
+
+def _string_command_entry(launch: LaunchContract) -> Dict[str, Any]:
+    """``{command: str, args: [str]}`` — Claude Code and Windsurf.
+
+    Verified against a real local entry in both hosts' configs. ``env``
+    is emitted only when the launch actually needs one, so a packaged
+    install writes the minimal entry those configs already contain.
+    """
+    entry: Dict[str, Any] = {
+        "command": launch.command,
+        "args": list(launch.args),
+    }
+    if launch.env:
+        entry["env"] = dict(launch.env)
+    return entry
+
+
+def _list_command_entry(launch: LaunchContract) -> Dict[str, Any]:
+    """OpenCode's shape: ``type``/``command`` as one list/``environment``.
+
+    Verified against a real local ``mcp`` entry, which stores the program
+    as element 0 of ``command`` rather than in a separate field.
+    """
+    entry: Dict[str, Any] = {
+        "type": "local",
+        "command": [launch.command, *launch.args],
+        "enabled": True,
+    }
+    if launch.env:
+        entry["environment"] = dict(launch.env)
+    return entry
+
+
+def _toml_command_entry(launch: LaunchContract) -> Dict[str, Any]:
+    """Codex's ``[mcp_servers.<name>]`` table: ``command`` plus ``args``."""
+    entry: Dict[str, Any] = {
+        "command": launch.command,
+        "args": list(launch.args),
+    }
+    if launch.env:
+        entry["env"] = dict(launch.env)
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Connector specs
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConnectorSpec:
+    """Everything Relinkra knows about one host, declared in one place."""
+
+    connector_id: str
+    display_name: str
+    host_type: str
+    aliases: Tuple[str, ...] = ()
+    support_status: str = SUPPORT_EXPERIMENTAL
+    executables: Tuple[str, ...] = ()
+    locations: Tuple[LocationSpec, ...] = ()
+    container_path: Tuple[str, ...] = ()
+    config_format: str = FORMAT_JSON
+    entry_builder: Optional[Callable[[LaunchContract], Dict[str, Any]]] = None
+    #: True only when the shape was read out of a real configuration file.
+    format_verified: bool = False
+    format_evidence: str = ""
+    #: Whether unknown members are known-safe to add. Gates the explicit
+    #: ownership marker; false everywhere until a host is shown to keep
+    #: unknown keys across a rewrite.
+    marker_allowed: bool = False
+    #: Whether this phase may WRITE. Separate from format_verified on
+    #: purpose: writing is gated on a real host launch, not on parsing.
+    apply_available: bool = False
+    apply_unavailable_reason: str = ""
+    real_host_launch_proven: bool = False
+    restart_instruction: str = ""
+    security_notes: Tuple[str, ...] = ()
+
+    @property
+    def all_names(self) -> Tuple[str, ...]:
+        return (self.connector_id, *self.aliases)
+
+
+def _claude_locations() -> Tuple[LocationSpec, ...]:
+    return (
+        LocationSpec(
+            location_id="claude_user_settings",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.claude/settings.json",
+            build=lambda env: env.home_path(".claude", "settings.json"),
+        ),
+        LocationSpec(
+            location_id="claude_user_config",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.claude.json",
+            build=lambda env: env.home_path(".claude.json"),
+        ),
+        LocationSpec(
+            location_id="claude_workspace_mcp",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/.mcp.json",
+            build=lambda env: env.workspace_path(".mcp.json"),
+        ),
+        LocationSpec(
+            location_id="claude_workspace_settings_local",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/.claude/settings.local.json",
+            build=lambda env: env.workspace_path(".claude", "settings.local.json"),
+        ),
+    )
+
+
+def _opencode_locations() -> Tuple[LocationSpec, ...]:
+    return (
+        LocationSpec(
+            location_id="opencode_user_config",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.config/opencode/opencode.json",
+            build=lambda env: env.config_home("opencode", "opencode.json"),
+        ),
+        LocationSpec(
+            location_id="opencode_user_appdata",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="%APPDATA%/opencode/opencode.json",
+            build=lambda env: env.app_data("opencode", "opencode.json"),
+        ),
+        LocationSpec(
+            location_id="opencode_workspace",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/opencode.json",
+            build=lambda env: env.workspace_path("opencode.json"),
+        ),
+    )
+
+
+def _codex_locations() -> Tuple[LocationSpec, ...]:
+    return (
+        LocationSpec(
+            location_id="codex_user_config",
+            scope=SCOPE_USER,
+            config_format=FORMAT_TOML,
+            display_hint="~/.codex/config.toml",
+            build=lambda env: (
+                env.env_dir("CODEX_HOME", "config.toml")
+                or env.home_path(".codex", "config.toml")
+            ),
+        ),
+    )
+
+
+def _windsurf_locations() -> Tuple[LocationSpec, ...]:
+    return (
+        LocationSpec(
+            location_id="windsurf_user_mcp",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.codeium/windsurf/mcp_config.json",
+            build=lambda env: env.home_path(
+                ".codeium", "windsurf", "mcp_config.json"
+            ),
+        ),
+        LocationSpec(
+            location_id="windsurf_next_mcp",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.codeium/windsurf-next/mcp_config.json",
+            build=lambda env: env.home_path(
+                ".codeium", "windsurf-next", "mcp_config.json"
+            ),
+        ),
+    )
+
+
+_NO_APPLY = (
+    "host writes stay disabled until a real host has launched the Relinkra "
+    "MCP server (R4C). Use 'relinkra connect plan' and apply the change by "
+    "hand until then."
+)
+
+GENERIC = ConnectorSpec(
+    connector_id="generic",
+    display_name="Generic MCP host",
+    host_type="generic",
+    aliases=("mcp", "stdio"),
+    support_status=SUPPORT_SUPPORTED,
+    format_verified=True,
+    format_evidence="Relinkra's own stdio MCP entry point (relinkra.mcp_cli).",
+    apply_available=False,
+    apply_unavailable_reason=(
+        "the generic connector describes a launch contract; it owns no "
+        "configuration file to mutate."
+    ),
+    restart_instruction=(
+        "Add the emitted server entry to your host's MCP configuration and "
+        "restart the host."
+    ),
+    security_notes=(
+        "Command and arguments are structured values; no shell is invoked.",
+        "Environment values are machine-local and are printed only with "
+        "--reveal-paths.",
+    ),
+)
+
+CLAUDE = ConnectorSpec(
+    connector_id="claude",
+    display_name="Claude Code",
+    host_type="cli_agent",
+    aliases=("claude-code", "claudecode"),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("claude",),
+    locations=_claude_locations(),
+    container_path=("mcpServers",),
+    config_format=FORMAT_JSON,
+    entry_builder=_string_command_entry,
+    format_verified=True,
+    format_evidence=(
+        "'mcpServers' object with {command, args} entries, read from a real "
+        "local Claude Code configuration."
+    ),
+    apply_available=False,
+    apply_unavailable_reason=_NO_APPLY,
+    restart_instruction="Restart Claude Code, then run '/mcp' to confirm.",
+    security_notes=(
+        "Unrelated MCP servers in the same file are preserved untouched.",
+        "An entry of the same name that does not launch Relinkra is treated "
+        "as a conflict and never overwritten.",
+    ),
+)
+
+OPENCODE = ConnectorSpec(
+    connector_id="opencode",
+    display_name="OpenCode",
+    host_type="cli_agent",
+    aliases=("open-code",),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("opencode",),
+    locations=_opencode_locations(),
+    container_path=("mcp",),
+    config_format=FORMAT_JSON,
+    entry_builder=_list_command_entry,
+    format_verified=True,
+    format_evidence=(
+        "'mcp' object with {type: local, command: [...]} entries, read from a "
+        "real local OpenCode configuration."
+    ),
+    apply_available=False,
+    apply_unavailable_reason=_NO_APPLY,
+    restart_instruction="Restart OpenCode so it re-reads its configuration.",
+    security_notes=(
+        "Remote (URL) MCP entries in the same file are left untouched.",
+        "The program is written as element 0 of 'command'; no shell string is "
+        "ever produced.",
+    ),
+)
+
+CODEX = ConnectorSpec(
+    connector_id="codex",
+    display_name="Codex CLI",
+    host_type="cli_agent",
+    aliases=("openai-codex",),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("codex",),
+    locations=_codex_locations(),
+    container_path=("mcp_servers",),
+    config_format=FORMAT_TOML,
+    entry_builder=_toml_command_entry,
+    format_verified=True,
+    format_evidence=(
+        "'[mcp_servers.<name>]' tables with command/args, read from a real "
+        "local Codex configuration."
+    ),
+    apply_available=False,
+    apply_unavailable_reason=(
+        "Codex stores configuration as TOML. Relinkra can read it, but a "
+        "comment-preserving TOML writer is out of scope for R4B, so writes "
+        "stay disabled."
+    ),
+    restart_instruction="Restart the Codex CLI so it re-reads config.toml.",
+    security_notes=(
+        "TOML is read only. Relinkra never rewrites config.toml in this phase.",
+        "Reading requires tomllib (Python 3.11+); older interpreters report "
+        "the registration state as unknown rather than guessing.",
+    ),
+)
+
+WINDSURF = ConnectorSpec(
+    connector_id="windsurf",
+    display_name="Windsurf",
+    host_type="editor",
+    aliases=("codeium",),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("windsurf",),
+    locations=_windsurf_locations(),
+    container_path=("mcpServers",),
+    config_format=FORMAT_JSON,
+    entry_builder=_string_command_entry,
+    format_verified=True,
+    format_evidence=(
+        "'mcpServers' object with {command, args} entries, read from a real "
+        "local Windsurf mcp_config.json."
+    ),
+    apply_available=False,
+    apply_unavailable_reason=_NO_APPLY,
+    restart_instruction=(
+        "Reload the Windsurf MCP configuration from the Cascade MCP panel."
+    ),
+    security_notes=(
+        "Unrelated MCP servers in mcp_config.json are preserved untouched.",
+    ),
+)
+
+DEVIN = ConnectorSpec(
+    connector_id="devin",
+    display_name="Devin",
+    host_type="hosted_agent",
+    aliases=(),
+    support_status=SUPPORT_UNSUPPORTED,
+    format_verified=False,
+    format_evidence="",
+    apply_available=False,
+    apply_unavailable_reason=(
+        "no connector implementation exists. Listed so the roadmap is "
+        "visible, not because anything is supported."
+    ),
+    security_notes=(),
+)
+
+#: Registration order is presentation order. Append to extend; the CLI
+#: never names a connector, so nothing else changes.
+CONNECTORS: Tuple[ConnectorSpec, ...] = (
+    GENERIC,
+    CLAUDE,
+    OPENCODE,
+    CODEX,
+    WINDSURF,
+    DEVIN,
+)
+
+
+def resolve_connector(name: str) -> ConnectorSpec:
+    """Look a connector up by id or alias, case-insensitively.
+
+    The error names every accepted value, because a typo here is the
+    single most likely way a user meets this function.
+    """
+    key = (name or "").strip().lower()
+    for spec in CONNECTORS:
+        if key in tuple(item.lower() for item in spec.all_names):
+            return spec
+    known = ", ".join(sorted(spec.connector_id for spec in CONNECTORS))
+    raise UnknownConnectorError(f"unknown connector {name!r}; known: {known}")
+
+
+def connector_ids() -> List[str]:
+    return [spec.connector_id for spec in CONNECTORS]
+
+
+# ---------------------------------------------------------------------------
+# TOML reading (Codex)
+# ---------------------------------------------------------------------------
+
+
+def _load_toml(text: str) -> Optional[Dict[str, Any]]:
+    """Parse TOML when the interpreter can. ``None`` when it cannot.
+
+    ``tomllib`` landed in 3.11 and Relinkra supports 3.9, so on older
+    interpreters the answer is "unknown", never a hand-rolled parse. A
+    regex over TOML would appear to work and then quietly misread a
+    multi-line array — an incorrect registration state is worse than an
+    absent one.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    try:
+        return tomllib.loads(text)
+    except ValueError as exc:
+        raise MalformedConfigError(f"configuration is not valid TOML: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Inspection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InspectionResult:
+    """Discovery plus the parsed container, shared by inspect/plan/check.
+
+    One read of the config, three commands. Reading it once per command
+    would let ``inspect`` and ``plan`` disagree about the same file.
+    """
+
+    spec: ConnectorSpec
+    locations: Tuple[ConfigLocation, ...] = ()
+    location: Optional[ConfigLocation] = None
+    executable: Optional[str] = None
+    discovery_status: str = DISCOVERY_UNVERIFIED
+    registration_state: str = REGISTRATION_UNKNOWN
+    document: Optional[Dict[str, Any]] = None
+    raw_text: Optional[str] = None
+    existing_entry: Optional[Any] = None
+    warnings: List[ConnectorWarning] = field(default_factory=list)
+
+    def warn(self, code: str, message: str) -> None:
+        self.warnings.append(ConnectorWarning(code, message))
+
+
+def _read_container(document: Mapping[str, Any], path: Sequence[str]) -> Any:
+    node: Any = document
+    for key in path:
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key)
+        if node is None:
+            return None
+    return node
+
+
+def inspect_connector(
+    spec: ConnectorSpec, env: DiscoveryEnvironment
+) -> InspectionResult:
+    """Read-only discovery for one connector. Never writes, never raises.
+
+    Every failure mode below becomes a REPORTED state rather than an
+    exception, because a user with one broken host config still needs
+    ``inspect`` to tell them about the other three.
+    """
+    result = InspectionResult(spec=spec)
+
+    if not spec.locations:
+        # Generic and roadmap connectors own no config file.
+        result.discovery_status = (
+            DISCOVERY_DISCOVERED
+            if spec.support_status == SUPPORT_SUPPORTED
+            else DISCOVERY_UNVERIFIED
+        )
+        result.registration_state = REGISTRATION_UNKNOWN
+        return result
+
+    result.locations = probe(spec.locations, env)
+    result.executable = find_executable(env, spec.executables)
+    result.location = active_location(result.locations)
+
+    if result.location is None:
+        result.discovery_status = (
+            DISCOVERY_CONFIG_MISSING
+            if result.executable
+            else DISCOVERY_NOT_INSTALLED
+        )
+        result.registration_state = REGISTRATION_ABSENT
+        return result
+
+    if not result.location.readable:
+        result.discovery_status = DISCOVERY_CONFIG_UNSUPPORTED
+        result.warn(
+            "config_unreadable",
+            "the host configuration exists but could not be read; check its "
+            "permissions.",
+        )
+        return result
+
+    try:
+        text = read_bounded_text(result.location.path)
+    except ConfigTooLargeError as exc:
+        result.discovery_status = DISCOVERY_CONFIG_UNSUPPORTED
+        result.warn("config_too_large", str(exc))
+        return result
+    except (SafeWriteError, OSError, UnicodeDecodeError) as exc:
+        result.discovery_status = DISCOVERY_CONFIG_UNSUPPORTED
+        result.warn("config_unreadable", f"could not read configuration: {exc}")
+        return result
+
+    result.raw_text = text
+
+    try:
+        if spec.config_format == FORMAT_TOML:
+            document = _load_toml(text)
+            if document is None:
+                result.discovery_status = DISCOVERY_DISCOVERED
+                result.registration_state = REGISTRATION_UNKNOWN
+                result.warn(
+                    "toml_parser_unavailable",
+                    "reading TOML needs Python 3.11 or newer; the "
+                    "registration state cannot be determined on this "
+                    "interpreter.",
+                )
+                return result
+        else:
+            document = parse_json_document(text)
+    except MalformedConfigError as exc:
+        result.discovery_status = DISCOVERY_CONFIG_MALFORMED
+        result.warn("config_malformed", str(exc))
+        return result
+    except UnsupportedShapeError as exc:
+        result.discovery_status = DISCOVERY_CONFIG_UNSUPPORTED
+        result.warn("config_unsupported", str(exc))
+        return result
+
+    result.document = document
+    result.discovery_status = DISCOVERY_DISCOVERED
+
+    container = _read_container(document, spec.container_path)
+    if container is None:
+        result.registration_state = REGISTRATION_ABSENT
+        return result
+    if not isinstance(container, Mapping):
+        result.discovery_status = DISCOVERY_CONFIG_UNSUPPORTED
+        result.registration_state = REGISTRATION_UNKNOWN
+        result.warn(
+            "config_unsupported",
+            f"'{'.'.join(spec.container_path)}' is not an object in this "
+            "configuration.",
+        )
+        return result
+
+    entry = container.get(MANAGED_SERVER_NAME)
+    if entry is None:
+        result.registration_state = REGISTRATION_ABSENT
+        return result
+
+    result.existing_entry = entry
+    is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+    if not is_managed(entry):
+        result.registration_state = REGISTRATION_CONFLICT
+        result.warn(
+            "registration_conflict",
+            f"an entry named '{MANAGED_SERVER_NAME}' exists but does not "
+            "launch Relinkra; it will never be overwritten.",
+        )
+        return result
+
+    result.registration_state = REGISTRATION_ALREADY_CONNECTED
+    return result
+
+
+def build_report(
+    spec: ConnectorSpec,
+    inspection: InspectionResult,
+    launch: Optional[LaunchContract] = None,
+    plan: Optional[ConnectorPlan] = None,
+) -> ConnectorReport:
+    """Render an inspection as the portable report both commands print.
+
+    ``plan`` is optional but callers should supply it: without it,
+    ``registration_planned`` can only ever be false, and a capability
+    that is structurally incapable of being true tells the reader
+    nothing.
+    """
+    registration_detected = inspection.registration_state in (
+        REGISTRATION_ALREADY_CONNECTED,
+        REGISTRATION_NEEDS_UPDATE,
+    )
+    capabilities = CapabilityMatrix(
+        # Structural, not a name check. Keying off the literal "generic"
+        # would silently flip this capability to false the day that
+        # connector is renamed, with nothing failing to say so.
+        implementation_exists=(
+            bool(spec.locations)
+            or spec.entry_builder is not None
+            or spec.format_verified
+        ),
+        configuration_format_verified=spec.format_verified,
+        registration_detected=registration_detected,
+        registration_planned=bool(plan is not None and plan.status == PLAN_READY),
+        configuration_validated=inspection.document is not None,
+        mcp_process_contract_validated=bool(launch and launch.resolved),
+        real_host_launch_proven=spec.real_host_launch_proven,
+    )
+    return ConnectorReport(
+        connector_id=spec.connector_id,
+        display_name=spec.display_name,
+        host_type=spec.host_type,
+        aliases=spec.aliases,
+        support_status=spec.support_status,
+        discovery_status=inspection.discovery_status,
+        registration_state=inspection.registration_state,
+        transport=TRANSPORT_STDIO,
+        executable_found=bool(inspection.executable),
+        locations=list(inspection.locations),
+        active_location_id=(
+            inspection.location.location_id if inspection.location else ""
+        ),
+        env_keys=list(launch.env_keys) if launch else [],
+        warnings=list(inspection.warnings),
+        capabilities=capabilities,
+        restart_instruction=spec.restart_instruction,
+        security_notes=list(spec.security_notes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planning
+# ---------------------------------------------------------------------------
+
+
+def _target_ref(spec: ConnectorSpec, location: Optional[ConfigLocation]) -> str:
+    """Semantic target id. Stable across machines, never a path."""
+    suffix = location.location_id if location else "unresolved"
+    return f"{spec.connector_id}:{suffix}"
+
+
+def _preferred_target(
+    spec: ConnectorSpec, inspection: InspectionResult
+) -> Optional[ConfigLocation]:
+    """Where a write WOULD go: the active config, else the first
+    declared writable candidate. Declaration order is the preference."""
+    if inspection.location is not None:
+        return inspection.location
+    return inspection.locations[0] if inspection.locations else None
+
+
+def _describe_entry(entry: Mapping[str, Any]) -> str:
+    """Summarise a planned entry without printing any of its values.
+
+    Arity and key names only. That is enough for a reviewer to see that
+    the plan is the shape they expect, and it carries no interpreter
+    path, no workspace root and no environment value.
+    """
+    tokens = entry_tokens(entry)
+    env_keys = sorted(entry.get("env") or entry.get("environment") or {})
+    parts = [f"{len(tokens)} command token(s)"]
+    if env_keys:
+        parts.append("env keys: " + ", ".join(env_keys))
+    else:
+        parts.append("no environment")
+    return "; ".join(parts)
+
+
+def build_plan(
+    spec: ConnectorSpec,
+    inspection: InspectionResult,
+    launch: LaunchContract,
+) -> ConnectorPlan:
+    """Produce a deterministic mutation plan. Touches no file.
+
+    The plan is built from the config as it was READ; a precondition on
+    every mutating step names the digest the executor must still see, so
+    an edit made between planning and applying aborts the write instead
+    of silently discarding the user's change.
+    """
+    plan = ConnectorPlan(
+        connector_id=spec.connector_id,
+        apply_available=spec.apply_available,
+        restart_instruction=spec.restart_instruction,
+        registration_state=inspection.registration_state,
+    )
+    plan.warnings.extend(inspection.warnings)
+    for message in launch.warnings:
+        plan.warnings.append(ConnectorWarning("launch_contract", message))
+
+    if not spec.locations or spec.entry_builder is None:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            spec.apply_unavailable_reason
+            or "this connector owns no host configuration."
+        )
+        return plan
+
+    if not spec.format_verified:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            "this host's configuration format has not been verified; "
+            "Relinkra will not invent a schema."
+        )
+        return plan
+
+    if not launch.resolved:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            "the MCP launch contract could not be resolved on this machine."
+        )
+        return plan
+
+    location = _preferred_target(spec, inspection)
+    plan.target_ref = _target_ref(spec, location)
+    if location is None:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            "no configuration location applies to this platform."
+        )
+        return plan
+
+    if inspection.discovery_status in (
+        DISCOVERY_CONFIG_MALFORMED,
+        DISCOVERY_CONFIG_UNSUPPORTED,
+    ):
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            "the existing configuration could not be parsed, so no safe "
+            "merge can be planned."
+        )
+        return plan
+
+    if spec.config_format == FORMAT_TOML:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = spec.apply_unavailable_reason
+        return plan
+
+    desired = spec.entry_builder(launch)
+    document = inspection.document if inspection.document is not None else {}
+    is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+
+    try:
+        decision = decide_member(
+            document,
+            spec.container_path,
+            MANAGED_SERVER_NAME,
+            desired,
+            is_managed=is_managed,
+        )
+    except MergeError as exc:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = str(exc)
+        return plan
+
+    container = ".".join(spec.container_path)
+    file_exists = bool(location.exists)
+    digest_precondition = (
+        "target file content is unchanged since inspection"
+        if file_exists
+        else "target file does not exist"
+    )
+
+    if decision.action == ACTION_CONFLICT:
+        plan.status = PLAN_BLOCKED
+        plan.registration_state = REGISTRATION_CONFLICT
+        plan.conflicts.append(
+            f"{container}.{MANAGED_SERVER_NAME} is owned by another server"
+        )
+        plan.warnings.append(
+            ConnectorWarning("registration_conflict", decision.reason)
+        )
+        return plan
+
+    if decision.action == ACTION_NO_OP:
+        plan.status = PLAN_READY
+        plan.registration_state = REGISTRATION_ALREADY_CONNECTED
+        plan.operations.append(
+            PlanOperation(
+                op=OP_NO_OP,
+                target_ref=plan.target_ref,
+                detail=(
+                    f"{container}.{MANAGED_SERVER_NAME} is already correct; "
+                    "nothing to change."
+                ),
+                preconditions=(digest_precondition,),
+                postconditions=("configuration is byte-identical",),
+                rollback="not applicable; no write occurs",
+            )
+        )
+        return plan
+
+    operations: List[PlanOperation] = []
+    if file_exists:
+        operations.append(
+            PlanOperation(
+                op=OP_BACKUP_FILE,
+                target_ref=plan.target_ref,
+                detail="copy the existing configuration aside before writing",
+                preconditions=(digest_precondition, "target is a regular file"),
+                postconditions=("a collision-safe backup copy exists",),
+                rollback="restore the target from the backup copy",
+            )
+        )
+    else:
+        operations.append(
+            PlanOperation(
+                op=OP_CREATE_FILE,
+                target_ref=plan.target_ref,
+                detail="create the configuration file with owner-only permissions",
+                preconditions=("target file does not exist",),
+                postconditions=("a new configuration file exists",),
+                rollback="delete the created file",
+            )
+        )
+
+    if decision.action == ACTION_ADD:
+        plan.registration_state = REGISTRATION_ABSENT
+        operations.append(
+            PlanOperation(
+                op=OP_ADD_OBJECT_MEMBER,
+                target_ref=plan.target_ref,
+                detail=(
+                    f"add {container}.{MANAGED_SERVER_NAME} "
+                    f"({_describe_entry(desired)})"
+                ),
+                preconditions=(
+                    f"{container}.{MANAGED_SERVER_NAME} does not exist",
+                    "all unrelated members are preserved",
+                ),
+                postconditions=(
+                    f"{container}.{MANAGED_SERVER_NAME} launches Relinkra",
+                    "every pre-existing member is unchanged",
+                ),
+                rollback="restore the target from the backup copy",
+            )
+        )
+    elif decision.action == ACTION_UPDATE:
+        plan.registration_state = REGISTRATION_NEEDS_UPDATE
+        operations.append(
+            PlanOperation(
+                op=OP_REPLACE_MANAGED_MEMBER,
+                target_ref=plan.target_ref,
+                detail=(
+                    f"refresh the stale Relinkra entry at "
+                    f"{container}.{MANAGED_SERVER_NAME} "
+                    f"({_describe_entry(decision.member or desired)})"
+                ),
+                preconditions=(
+                    f"{container}.{MANAGED_SERVER_NAME} is Relinkra-managed",
+                    digest_precondition,
+                ),
+                postconditions=(
+                    "fields Relinkra does not manage are preserved",
+                    "every unrelated member is unchanged",
+                ),
+                rollback="restore the target from the backup copy",
+            )
+        )
+    else:
+        # Unreachable with today's four actions. Kept so that adding a
+        # fifth cannot silently produce a plan that backs the file up and
+        # then never mutates it.
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = f"unsupported merge action: {decision.action}"
+        return plan
+
+    operations.append(
+        PlanOperation(
+            op=OP_VALIDATE_JSON,
+            target_ref=plan.target_ref,
+            detail="re-parse the written file before accepting the change",
+            preconditions=("the write completed",),
+            postconditions=("the written configuration parses as JSON",),
+            rollback="restore the target from the backup copy",
+        )
+    )
+    operations.append(
+        PlanOperation(
+            op=OP_REQUEST_RESTART,
+            target_ref=plan.target_ref,
+            detail=spec.restart_instruction,
+            preconditions=("the configuration was written and validated",),
+            postconditions=("the host has re-read its configuration",),
+            rollback="not applicable; no file is touched",
+        )
+    )
+
+    plan.operations = operations
+    plan.status = PLAN_READY
+    if not spec.apply_available:
+        plan.unavailable_reason = spec.apply_unavailable_reason
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Checking an existing registration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CheckResult:
+    """Validation of an EXISTING registration. Read-only by construction."""
+
+    connector_id: str
+    registration_state: str = REGISTRATION_UNKNOWN
+    valid: bool = False
+    findings: List[str] = field(default_factory=list)
+    warnings: List[ConnectorWarning] = field(default_factory=list)
+    matches_workspace: Optional[bool] = None
+    target_ref: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "connector_id": self.connector_id,
+            "registration_state": self.registration_state,
+            "valid": self.valid,
+            "findings": list(self.findings),
+            "warnings": [w.to_dict() for w in self.warnings],
+            "matches_workspace": self.matches_workspace,
+            "target_ref": self.target_ref,
+        }
+
+
+def check_registration(
+    spec: ConnectorSpec,
+    inspection: InspectionResult,
+    launch: LaunchContract,
+) -> CheckResult:
+    """Validate the registration that is already there, changing nothing.
+
+    ``matches_workspace`` compares the recorded ``--workspace-root``
+    against this workspace. A registration pointing at a DIFFERENT repo
+    is valid MCP configuration and still wrong for the user standing
+    here, so it is reported as its own fact rather than folded into
+    ``valid``.
+    """
+    result = CheckResult(
+        connector_id=spec.connector_id,
+        registration_state=inspection.registration_state,
+        target_ref=_target_ref(spec, inspection.location),
+    )
+    result.warnings.extend(inspection.warnings)
+
+    if inspection.registration_state == REGISTRATION_CONFLICT:
+        result.findings.append(
+            f"an entry named '{MANAGED_SERVER_NAME}' exists but does not "
+            "launch Relinkra."
+        )
+        return result
+    if inspection.registration_state == REGISTRATION_UNKNOWN:
+        # Distinct from "absent". The config could not be read or parsed
+        # — on an interpreter without tomllib, for instance — so nothing
+        # is known either way. Claiming absence here would contradict the
+        # state field printed directly above it.
+        result.findings.append(
+            "the registration state could not be determined; see the "
+            "warnings below."
+        )
+        return result
+    if inspection.existing_entry is None:
+        result.findings.append("no Relinkra registration found for this host.")
+        return result
+
+    entry = inspection.existing_entry
+    tokens = entry_tokens(entry)
+    if not tokens:
+        result.findings.append("the registration has no command to run.")
+        return result
+
+    desired_root: Optional[str] = None
+    for index, token in enumerate(launch.args):
+        if token == "--workspace-root" and index + 1 < len(launch.args):
+            desired_root = launch.args[index + 1]
+            break
+    recorded_root: Optional[str] = None
+    for index, token in enumerate(tokens):
+        if token == "--workspace-root" and index + 1 < len(tokens):
+            recorded_root = tokens[index + 1]
+            break
+
+    if desired_root and recorded_root:
+        result.matches_workspace = _same_path(recorded_root, desired_root)
+        if not result.matches_workspace:
+            result.findings.append(
+                "the registration points at a different workspace than this one."
+            )
+    elif desired_root and not recorded_root:
+        result.matches_workspace = False
+        result.findings.append(
+            "the registration does not pin a workspace root, so the server "
+            "will bind to whichever directory the host starts it in."
+        )
+
+    if launch.env and not (entry.get("env") or entry.get("environment")):
+        result.findings.append(
+            "this workspace runs Relinkra from a source checkout, but the "
+            "registration passes no environment; the server may fail to "
+            "import."
+        )
+
+    # Staleness is decided by the SAME engine ``build_plan`` uses.
+    # Answering this question a second way here is exactly how ``check``
+    # ends up calling a registration valid that ``plan``, looking at the
+    # same file, reports as needing an update.
+    if (
+        spec.entry_builder is not None
+        and inspection.document is not None
+        and launch.resolved
+    ):
+        try:
+            decision = decide_member(
+                inspection.document,
+                spec.container_path,
+                MANAGED_SERVER_NAME,
+                spec.entry_builder(launch),
+                is_managed=ownership_test(
+                    launches_relinkra, marker_allowed=spec.marker_allowed
+                ),
+            )
+        except MergeError:
+            decision = None
+        if decision is not None and decision.action == ACTION_UPDATE:
+            result.registration_state = REGISTRATION_NEEDS_UPDATE
+            result.findings.append(
+                "the registration is out of date; run "
+                "'relinkra connect plan' to see what would change."
+            )
+
+    result.valid = not result.findings
+    return result
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Compare two recorded workspace roots.
+
+    ``Path`` comparison rather than string equality so a trailing
+    separator or a different separator style is not read as a different
+    workspace. Case folding follows the platform, which is what
+    ``PurePath`` equality already does.
+    """
+    try:
+        return PurePath(left) == PurePath(right) or Path(left) == Path(right)
+    except (TypeError, ValueError):
+        return left == right
