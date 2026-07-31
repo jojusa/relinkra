@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from relinkra.config_merge import (
     apply_member,
@@ -388,6 +389,22 @@ class DiscoveryStateTests(HostFixtureCase):
         inspection = self.inspect(CLAUDE)
         self.assertEqual(inspection.discovery_status, DISCOVERY_CONFIG_MALFORMED)
         self.assertTrue(any(w.code == "config_malformed" for w in inspection.warnings))
+
+    def test_opencode_permission_denied_stays_unverified(self):
+        real_stat = Path.stat
+
+        def deny_opencode_config(path, *args, **kwargs):
+            if str(path).replace("\\", "/").endswith(
+                "/.config/opencode/opencode.json"
+            ):
+                raise PermissionError("permission denied")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch("relinkra.host_discovery.Path.stat", deny_opencode_config):
+            inspection = self.inspect(OPENCODE)
+        self.assertEqual(inspection.discovery_status, DISCOVERY_CONFIG_UNSUPPORTED)
+        self.assertIsNone(inspection.document)
+        self.assertTrue(any(w.code == "config_unreadable" for w in inspection.warnings))
 
     def test_unsupported_root_shape_is_its_own_state(self):
         self.claude_config("[1, 2, 3]")

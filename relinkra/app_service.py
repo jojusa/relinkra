@@ -21,10 +21,11 @@ unrelated tool.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import __version__
+from . import __version__, cbm_support
 from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
 from .code_reference import CodeRefError
 from .context_budget import (
@@ -155,6 +156,13 @@ class _Probe:
         }
 
 
+#: Minimum seconds between two real CBM liveness probes per services
+#: instance. ``health(deep=True)`` spawns a bounded subprocess, and the
+#: MCP surface lets any connected agent request it — the TTL caps that
+#: trigger rate without weakening the default cheap probe.
+DEEP_CBM_PROBE_TTL_SECONDS = 60.0
+
+
 @dataclass
 class RelinkraServices:
     """Facade over the R1/R2 domain modules."""
@@ -175,20 +183,31 @@ class RelinkraServices:
         clock = self.clock or _utcnow
         self.memories = MemoryService(self.store, clock=clock)
         self.handoffs = HandoffService(self.memories, clock=clock)
+        self._cbm_config_error = ""
         if self.git_service is None:
             self.git_service = GitIntelligenceService()
         if self.cbm_adapter is None and self.config.cbm_bin:
+            # Production wiring receives exactly the doctor trust policy;
+            # injected adapters above stay available as deliberate test seams.
+            record = {
+                "project_name": self.config.cbm_project_name,
+                "cache_dir": self.config.cbm_cache_dir,
+            }
             try:
-                self.cbm_adapter = CBMCLIAdapter(
-                    cbm_bin=self.config.cbm_bin,
-                    cache_dir=self.config.cbm_cache_dir,
-                    cbm_project_name=self.config.cbm_project_name,
-                    workspace_root=self.config.workspace_root,
+                self.cbm_adapter = cbm_support.certify_configured_adapter(
+                    self.config.workspace_root or "",
+                    record,
+                    self.config.cbm_bin,
+                    adapter_factory=CBMCLIAdapter,
                 )
-            except CBMAdapterError:
-                # CBM is optional. A bad binary degrades code resolution
+            except Exception as exc:
+                # CBM is optional. A failed trust gate degrades code resolution
                 # rather than preventing the server from starting.
                 self.cbm_adapter = None
+                self._cbm_config_error = (
+                    sanitize_wire_text(str(exc))
+                    or "CBM trust verification failed"
+                )
         self._registry_error: Optional[str] = None
         if self.registry is None:
             self.registry = self._load_registry()
@@ -849,14 +868,18 @@ class RelinkraServices:
             "handoffs": [h.to_portable_dict() for h in handoffs],
         }
 
-    def health(self) -> dict:
+    def health(self, deep: bool = False) -> dict:
         """Report contract, engine availability, and degraded components.
 
         Never emits secrets or absolute machine paths: the workspace root
         is reported as a boolean, not a value.
+
+        With ``deep=True`` the CBM probe issues a REAL bounded query
+        instead of only checking configuration, so the report
+        distinguishes "configured" from "callable" (checked=True).
         """
         engram = self._probe_engram()
-        cbm = self._probe_cbm()
+        cbm = self._probe_cbm(deep=deep)
         git = self._probe_git()
         degraded = [
             name
@@ -963,23 +986,109 @@ class RelinkraServices:
         except Exception as exc:
             return _Probe(available=False, detail=sanitize_wire_text(str(exc)))
 
-    def _probe_cbm(self) -> _Probe:
-        """Configuration check only — deliberately NOT a liveness probe.
+    @staticmethod
+    def _cbm_stat_identity(path: str) -> tuple:
+        """Return opaque filesystem metadata for a CBM trust-cache input."""
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return ("missing",)
+        return (
+            "present",
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
 
-        Its siblings issue a real call, but a live CBM probe would shell
-        out to the code indexer on every health request, which is too
-        expensive for a status endpoint. ``checked=False`` reports that
-        honestly rather than implying a verification that did not happen.
+    def _deep_cbm_probe_identity(self) -> Optional[tuple]:
+        """Fingerprint the local inputs that make a deep CBM PASS trustworthy.
+
+        Production adapters expose the binary/cache/project attributes below.
+        Injected test adapters need not expose them, in which case their
+        existing per-instance TTL behavior remains unchanged.
+        """
+        adapter = self.cbm_adapter
+        identities = []
+        cbm_bin = getattr(adapter, "cbm_bin", None)
+        if cbm_bin:
+            identities.append(("binary", self._cbm_stat_identity(str(cbm_bin))))
+            verifier = getattr(adapter, "_verify_binary", None)
+            if callable(verifier):
+                verifier()
+
+        cache_dir = getattr(adapter, "cache_dir", None)
+        project_name = getattr(adapter, "cbm_project_name", None)
+        if cache_dir and project_name:
+            database = os.path.join(str(cache_dir), f"{project_name}.db")
+            identities.extend(
+                (
+                    ("database", self._cbm_stat_identity(database)),
+                    ("database-wal", self._cbm_stat_identity(database + "-wal")),
+                    ("database-shm", self._cbm_stat_identity(database + "-shm")),
+                )
+            )
+        return tuple(identities) if identities else None
+
+    def _probe_cbm(self, deep: bool = False) -> _Probe:
+        """Configuration check by default — deliberately NOT liveness.
+
+        A live CBM probe on every health request would shell out to the
+        code indexer, which is too expensive for a status endpoint, so
+        the default reports ``checked=False`` honestly rather than
+        implying a verification that did not happen. ``deep=True``
+        (doctor, explicit operator checks) pays for one bounded real
+        query and reports ``checked=True`` with the actual outcome.
         """
         if self.cbm_adapter is None:
             return _Probe(
-                available=False, detail="no CBM adapter configured", checked=True
+                available=False,
+                detail=self._cbm_config_error or "no CBM adapter configured",
+                checked=True,
             )
-        return _Probe(
-            available=True,
-            checked=False,
-            detail="configured; not liveness-checked",
-        )
+        if not deep:
+            return _Probe(
+                available=False,
+                checked=False,
+                detail="configured; not liveness-checked",
+            )
+        cached = getattr(self, "_deep_cbm_probe", None)
+        now = time.monotonic()
+        if (
+            cached is not None
+            and now - cached[0] < DEEP_CBM_PROBE_TTL_SECONDS
+        ):
+            try:
+                if self._deep_cbm_probe_identity() == cached[2]:
+                    return cached[1]
+            except Exception:
+                # A certified binary must be re-verified before a prior
+                # PASS can be reused. Fall through to the bounded query.
+                pass
+            self._deep_cbm_probe = None
+        try:
+            # A real, bounded graph query: an empty result set still
+            # proves the binary, the cache, and the index are callable.
+            self.cbm_adapter.search_symbols(query="relinkra_health_probe", limit=1)
+            probe = _Probe(available=True, checked=True, detail="query probe succeeded")
+        except Exception as exc:
+            probe = _Probe(
+                available=False,
+                checked=True,
+                detail=sanitize_wire_text(str(exc)),
+            )
+        try:
+            identity = self._deep_cbm_probe_identity()
+        except Exception:
+            probe = _Probe(
+                available=False,
+                checked=True,
+                detail="CBM executable identity verification failed",
+            )
+            identity = None
+        self._deep_cbm_probe = (now, probe, identity)
+        return probe
 
     def _probe_git(self) -> _Probe:
         root = self.config.workspace_root

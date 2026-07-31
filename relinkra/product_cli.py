@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, backend_policy
+from . import __version__, backend_policy, cbm_support
 from .app_service import (
     CONTRACT_VERSION,
     RelinkraServices,
@@ -228,18 +228,61 @@ def _repo_root(start: Optional[str] = None) -> Optional[Path]:
     return None
 
 
+def _workspace_cbm_record(
+    root: Path, config: Optional[WorkspaceConfig]
+) -> Optional[dict]:
+    """The CBM identity record the registry holds for this workspace.
+
+    Read through the existing registry contract; anything unusable is
+    treated as absent (doctor must run on broken workspaces).
+    """
+    if config is None or not config.workspace_id:
+        return None
+    try:
+        registry = Registry(str(registry_path(root)))
+    except RegistryError:
+        return None
+    workspace = registry.get_workspace(config.workspace_id)
+    if workspace is None or not workspace.cbm:
+        return None
+    record = workspace.cbm
+    return record if isinstance(record, dict) else None
+
+
 def _services(root: Path, config: Optional[WorkspaceConfig]) -> RelinkraServices:
     """Build the R3 service facade for this workspace.
 
     The CLI never probes engines itself; it constructs the same services
-    the MCP server uses and reads their health.
+    the MCP server uses and reads their health. CBM wiring is resolved
+    from the registry's workspace record plus the binary locations
+    Relinkra manages (env, the isolated workspace location, PATH) —
+    never from agent configuration.
     """
+    cbm_record = _workspace_cbm_record(root, config)
+    cbm_bin = cbm_support.resolve_cbm_binary(str(root))
+    cbm_cache_dir = None
+    cbm_project_name = None
+    if cbm_record:
+        cbm_project_name = (cbm_record.get("project_name") or "").strip() or None
+        raw_cache = (cbm_record.get("cache_dir") or "").strip()
+        if raw_cache:
+            try:
+                cbm_cache_dir = cbm_support.absolutize_against_root(
+                    str(root), raw_cache
+                )
+            except ValueError:
+                # Trust evaluation reports the invalid record explicitly;
+                # services must never pass the escaping value to CBM.
+                cbm_bin = None
     return RelinkraServices(
         config=ServiceConfig(
             workspace_root=str(root),
             registry_path=str(registry_path(root)),
             default_project_id=(config.project_id if config else None) or None,
             default_workspace_id=(config.workspace_id if config else None) or None,
+            cbm_bin=cbm_bin,
+            cbm_cache_dir=cbm_cache_dir,
+            cbm_project_name=cbm_project_name,
         )
     )
 
@@ -372,6 +415,59 @@ def component_checks(health: dict) -> List[Check]:
             "commit.",
         ),
     ]
+
+
+def _platform_tag() -> str:  # kept as a thin alias for backward compatibility
+    return cbm_support.platform_tag()
+
+
+def cbm_trust_checks(
+    root: Path,
+    config: Optional[WorkspaceConfig],
+) -> List[Check]:
+    """Render the CBM trust ladder as doctor checks.
+
+    All probing and policy live in ``cbm_support.evaluate_cbm_trust``
+    (provenance-before-execution, per-stage isolation); this layer only
+    maps verdicts to presentation.
+    """
+    record = _workspace_cbm_record(root, config)
+    binary = cbm_support.resolve_cbm_binary(str(root))
+    status_of = {cbm_support.STAGE_PASS: PASS, cbm_support.STAGE_WARN: WARN}
+    return [
+        Check(stage.name, status_of.get(stage.status, WARN), stage.detail, stage.action)
+        for stage in cbm_support.evaluate_cbm_trust(str(root), record, binary)
+    ]
+
+
+_REQUIRED_CBM_TRUST_STAGES = frozenset(
+    {"CBM provenance", "CBM version", "CBM index", "CBM graph", "CBM query"}
+)
+
+
+def _cbm_trust_is_complete(checks: List[Check]) -> bool:
+    by_name = {check.name: check for check in checks}
+    return _REQUIRED_CBM_TRUST_STAGES.issubset(by_name) and all(
+        by_name[name].status == PASS for name in _REQUIRED_CBM_TRUST_STAGES
+    )
+
+
+def _enable_trusted_cbm_service(services: RelinkraServices) -> None:
+    """Replace a configured production adapter with a hash-pinned one."""
+    adapter = getattr(services, "cbm_adapter", None)
+    if not isinstance(adapter, cbm_support.CBMCLIAdapter):
+        return
+    expected = cbm_support.CERTIFIED_CBM_BINARIES.get(cbm_support.platform_tag())
+    if not expected:
+        raise cbm_support.CBMAdapterError("no certified CBM provenance for this platform")
+    services.cbm_adapter = cbm_support.CBMCLIAdapter(
+        cbm_bin=adapter.cbm_bin,
+        cache_dir=adapter.cache_dir,
+        cbm_project_name=adapter.cbm_project_name,
+        workspace_root=services.config.workspace_root,
+        timeout=adapter.timeout,
+        expected_sha256=expected["sha256"],
+    )
 
 
 def check_mcp(services: Optional[RelinkraServices], health: Optional[dict]) -> Check:
@@ -1133,7 +1229,37 @@ def cmd_doctor(args) -> int:
                 )
             )
         else:
-            checks.extend(component_checks(resolved.health or {}))
+            # Trust MUST be established before any deep health/query call.
+            # A shallow health result is safe for incomplete or distrusted
+            # CBM because it performs no subprocess execution.
+            trust_checks: List[Check] = []
+            try:
+                trust_checks = cbm_trust_checks(resolved.root, resolved.config)
+            except Exception as exc:  # the ladder must never crash doctor
+                trust_checks.append(
+                    Check(
+                        "CBM trust",
+                        WARN,
+                        f"trust ladder could not run: {sanitize_wire_text(str(exc))}",
+                    )
+                )
+            checks.extend(trust_checks)
+
+            health = resolved.health or {}
+            cbm_adapter = getattr(resolved.services, "cbm_adapter", None)
+            if (
+                _cbm_trust_is_complete(trust_checks)
+                and resolved.services is not None
+                and cbm_adapter is not None
+            ):
+                try:
+                    _enable_trusted_cbm_service(resolved.services)
+                    health = resolved.services.health(deep=True)
+                except Exception:
+                    # Keep the shallow/current report when the trusted
+                    # production adapter cannot be rebuilt or probed.
+                    health = resolved.health or {}
+            checks.extend(component_checks(health))
             checks.append(check_mcp(resolved.services, resolved.health))
             checks.append(
                 Check("Project identity", PASS, "resolved")

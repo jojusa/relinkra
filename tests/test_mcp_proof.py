@@ -17,11 +17,15 @@ import json
 import os
 import queue
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 
 from relinkra.handoff import contains_absolute_path
 
@@ -30,7 +34,8 @@ STARTUP_TIMEOUT = 60.0
 CALL_TIMEOUT = 120.0
 
 _HAS_GIT = shutil.which("git") is not None
-_HAS_ENGRAM = shutil.which("engram") is not None
+_ENGRAM_BIN = shutil.which("engram")
+_HAS_ENGRAM = _ENGRAM_BIN is not None
 
 
 class StdioClient:
@@ -212,6 +217,31 @@ class LiveMCPProofTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        cls._saved_engram_data_dir = os.environ.get("ENGRAM_DATA_DIR")
+        cls._saved_engram_url = os.environ.get("ENGRAM_URL")
+        cls.engram_data_dir = os.path.join(cls.tmp.name, "engram")
+        os.makedirs(cls.engram_data_dir, exist_ok=True)
+        cls.engram_port = cls._free_port()
+        cls.engram_url = f"http://127.0.0.1:{cls.engram_port}"
+        engram_env = dict(os.environ)
+        engram_env["ENGRAM_DATA_DIR"] = cls.engram_data_dir
+        cls.engram_process = subprocess.Popen(
+            [_ENGRAM_BIN, "serve", str(cls.engram_port)],
+            cwd=REPO_ROOT,
+            env=engram_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["ENGRAM_DATA_DIR"] = cls.engram_data_dir
+        os.environ["ENGRAM_URL"] = cls.engram_url
+        try:
+            cls._wait_for_engram()
+        except Exception:
+            cls._stop_engram()
+            cls.tmp.cleanup()
+            raise
+
         cls.root = os.path.join(cls.tmp.name, "repo")
         os.makedirs(cls.root, exist_ok=True)
 
@@ -250,7 +280,49 @@ class LiveMCPProofTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls._stop_engram()
+        if cls._saved_engram_data_dir is None:
+            os.environ.pop("ENGRAM_DATA_DIR", None)
+        else:
+            os.environ["ENGRAM_DATA_DIR"] = cls._saved_engram_data_dir
+        if cls._saved_engram_url is None:
+            os.environ.pop("ENGRAM_URL", None)
+        else:
+            os.environ["ENGRAM_URL"] = cls._saved_engram_url
         cls.tmp.cleanup()
+
+    @staticmethod
+    def _free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    @classmethod
+    def _wait_for_engram(cls):
+        deadline = time.monotonic() + 15.0
+        url = f"{cls.engram_url}/search?q=rlkmem1&limit=1"
+        while time.monotonic() < deadline:
+            if cls.engram_process.poll() is not None:
+                raise unittest.SkipTest("isolated Engram server exited")
+            try:
+                with urllib.request.urlopen(url, timeout=1.0) as response:
+                    if response.status == 200:
+                        return
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.1)
+        raise unittest.SkipTest("isolated Engram server did not become ready")
+
+    @classmethod
+    def _stop_engram(cls):
+        process = getattr(cls, "engram_process", None)
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def _client(self):
         client = StdioClient(
@@ -276,6 +348,14 @@ class LiveMCPProofTests(unittest.TestCase):
         self.assertEqual(init["result"]["serverInfo"]["name"], "relinkra")
         client.notify("notifications/initialized")
         return client
+
+    def test_live_proof_uses_isolated_engram_environment(self):
+        self.assertEqual(os.environ.get("ENGRAM_DATA_DIR"), self.engram_data_dir)
+        self.assertEqual(os.environ.get("ENGRAM_URL"), self.engram_url)
+        self.assertNotEqual(
+            os.path.abspath(self.engram_data_dir),
+            os.path.abspath(os.path.expanduser("~/.engram")),
+        )
 
     def test_live_cross_agent_handoff_over_stdio(self):
         # --- agent A: a real server process -------------------------------

@@ -543,15 +543,16 @@ class CapabilityHonestyTests(HardeningTestCase):
         self.assertNotIn("code_resolution", health["capabilities_unchecked"])
 
     def test_configured_but_unprobed_component_is_named_unchecked(self):
-        """A configured CBM is advertised, but honestly labelled.
+        """A configured CBM is not advertised as callable.
 
         Liveness-probing the code indexer on every health call would be
-        too expensive, so the capability is reported as available AND
-        listed as unchecked rather than silently implying verification.
+        too expensive, so the capability is reported as unavailable,
+        checked=False, and listed as unchecked rather than implying
+        verification.
         """
         self.services.cbm_adapter = object()
         health = self.ok("relinkra_health")
-        self.assertTrue(health["capabilities"]["code_resolution"])
+        self.assertFalse(health["capabilities"]["code_resolution"])
         self.assertFalse(health["components"]["cbm"]["checked"])
         self.assertIn("code_resolution", health["capabilities_unchecked"])
         # Liveness-probed components are never listed as unchecked.

@@ -360,7 +360,16 @@ TOOLS: List[dict] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "deep": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, the code-index component is verified "
+                        "with a real bounded query instead of only "
+                        "checking configuration (checked=true)."
+                    ),
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -491,7 +500,7 @@ class MCPServer:
             "relinkra_git_context": self.services.git_context,
             "relinkra_handoff_create": self.services.handoff_create,
             "relinkra_handoff_get": self.services.handoff_get,
-            "relinkra_health": lambda: self.services.health(),
+            "relinkra_health": lambda deep=False: self.services.health(deep=bool(deep)),
         }
 
     # -- protocol ---------------------------------------------------------

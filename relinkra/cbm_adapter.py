@@ -24,6 +24,8 @@ Hard boundaries:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,6 +37,11 @@ from .memory import sanitize_error
 
 DEFAULT_CBM_TIMEOUT = 30.0
 CBM_CACHE_DIR_ENV = "CBM_CACHE_DIR"
+# Keep the parser from accepting arbitrarily large child output.  The
+# subprocess API still buffers the completed process before this guard can
+# run; this is intentionally the smallest safe boundary without introducing
+# a platform-specific streaming reader.
+MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 
 # CBM placeholder paths that are not repo files (project root node,
 # external/stdlib symbols like <python-builtins>).
@@ -69,8 +76,10 @@ def parse_cli_json(stdout: str) -> object:
         if not stripped.startswith(("{", "[")):
             continue
         try:
-            payload, _ = decoder.raw_decode(stripped)
-        except ValueError:
+            payload, end = decoder.raw_decode(stripped)
+        except (ValueError, RecursionError):
+            continue
+        if stripped[end:].strip():
             continue
         return payload
     raise CBMAdapterError("cbm returned no JSON payload on stdout")
@@ -118,6 +127,7 @@ class CBMCLIAdapter:
         cbm_project_name: Optional[str] = None,
         workspace_root: Optional[str] = None,
         timeout: float = DEFAULT_CBM_TIMEOUT,
+        expected_sha256: Optional[str] = None,
     ):
         if not cbm_bin or not str(cbm_bin).strip():
             raise CBMAdapterError("an explicit cbm binary path is required")
@@ -132,17 +142,80 @@ class CBMCLIAdapter:
             else None
         )
         self.timeout = float(timeout)
+        self.expected_sha256 = (
+            str(expected_sha256).strip().lower() if expected_sha256 else None
+        )
 
     # -- subprocess ---------------------------------------------------
 
+    def _child_environment(self) -> dict:
+        """Return only the environment CBM needs for a local executable."""
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "SystemRoot": os.environ.get("SystemRoot", ""),
+            "WINDIR": os.environ.get("WINDIR", ""),
+            "LC_ALL": "C.UTF-8",
+            "LANG": "C.UTF-8",
+        }
+        # The audit/test runner may inject Git's safe.directory exception via
+        # GIT_CONFIG_* environment variables. Preserve the security boundary
+        # without inheriting the whole host environment: CBM must be able to
+        # ask Git about the server-owned workspace even when its owner differs
+        # from the sandbox identity.
+        if self.workspace_root:
+            env.update(
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "safe.directory",
+                    "GIT_CONFIG_VALUE_0": self.workspace_root,
+                }
+            )
+        return env
+
+    def _verify_binary(self) -> None:
+        """Re-check a trust-gated production binary immediately before exec."""
+        if not self.expected_sha256:
+            return
+        digest = hashlib.sha256()
+        try:
+            with open(self.cbm_bin, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise CBMAdapterError(
+                "cbm executable changed or disappeared since trust verification"
+            ) from exc
+        if not hmac.compare_digest(digest.hexdigest(), self.expected_sha256):
+            raise CBMAdapterError(
+                "cbm executable hash changed since trust verification; refusing to execute"
+            )
+
+    @staticmethod
+    def _output_size(value) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, bytes):
+            return len(value)
+        return len(str(value).encode("utf-8", errors="replace"))
+
+    def _check_child_output(self, tool: str, result) -> None:
+        for stream_name in ("stdout", "stderr"):
+            size = self._output_size(getattr(result, stream_name, None))
+            if size > MAX_CHILD_OUTPUT_BYTES:
+                raise CBMAdapterError(
+                    f"cbm {tool} {stream_name} exceeded the {MAX_CHILD_OUTPUT_BYTES}-byte output limit"
+                )
+
     def _run(self, tool: str, flags: List[str]) -> object:
+        self._verify_binary()
         argv = [self.cbm_bin, "cli", tool, *flags]
-        env = dict(os.environ)
+        env = self._child_environment()
         if self.cache_dir:
             env[CBM_CACHE_DIR_ENV] = self.cache_dir
         try:
             result = subprocess.run(
                 argv,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -158,6 +231,9 @@ class CBMCLIAdapter:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise CBMAdapterError(f"cbm {tool} timed out") from exc
+        except OSError as exc:
+            raise CBMAdapterError(f"cbm {tool} could not be executed") from exc
+        self._check_child_output(tool, result)
         if result.returncode != 0:
             detail = sanitize_error((result.stderr or result.stdout or "").strip())
             raise CBMAdapterError(f"cbm {tool} failed: {detail}")
@@ -203,17 +279,20 @@ class CBMCLIAdapter:
             # the repository-relative path verbatim.
             flags += ["--file-pattern", file_path]
         payload = self._run("search_graph", flags)
-        if not isinstance(payload, dict) or payload.get("error"):
-            return []
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm search_graph returned a non-object payload")
+        if "error" in payload:
+            raise CBMAdapterError("cbm search_graph returned an error payload")
         results = payload.get("results")
         if not isinstance(results, list):
-            return []
+            raise CBMAdapterError("cbm search_graph returned malformed results")
         candidates = []
         for node in results:
-            if isinstance(node, dict):
-                candidate = self._normalize_node(node, cbm_project_name=slug)
-                if candidate is not None:
-                    candidates.append(candidate)
+            if not isinstance(node, dict):
+                raise CBMAdapterError("cbm search_graph returned a malformed result")
+            candidate = self._normalize_node(node, cbm_project_name=slug)
+            if candidate is not None:
+                candidates.append(candidate)
         return candidates
 
     def get_snippet(
@@ -225,15 +304,103 @@ class CBMCLIAdapter:
         an error / no such symbol. Source contents are discarded. The
         resolved project slug (adapter default or per-call) drives the
         qn normalization.
+
+        Contract note (certified CBM 0.9.0): a MISSING symbol is not a
+        JSON error payload — the CLI exits 1 with ``symbol not found``
+        at the START of stderr. That is a lookup miss, not a backend
+        outage, so it maps to None here. The match is anchored to the
+        start of the failure detail: an outage whose stderr merely
+        CONTAINS the phrase (e.g. "fatal: symbol not found table …
+        index corrupted") still raises CBMAdapterError and degrades as
+        an outage upstream.
         """
         slug = self._project(project)
-        payload = self._run(
-            "get_code_snippet",
-            ["--project", slug, "--qualified-name", qualified_name],
-        )
-        if not isinstance(payload, dict) or payload.get("error"):
-            return None
-        return self._normalize_node(payload, cbm_project_name=slug)
+        try:
+            payload = self._run(
+                "get_code_snippet",
+                ["--project", slug, "--qualified-name", qualified_name],
+            )
+        except CBMAdapterError as exc:
+            # _run shapes failures as "cbm <tool> failed: <sanitized
+            # stderr>", so "failed: symbol not found" can only be the
+            # not-found class emitted at the start of stderr — never a
+            # wrapped outage that happens to embed the phrase later.
+            if re.search(r"failed:\s*symbol not found", str(exc), re.IGNORECASE):
+                return None
+            raise
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm get_code_snippet returned a non-object payload")
+        if "error" in payload:
+            # Historical CBM fixtures encode a missing exact symbol as a
+            # structured error, while certified 0.9.0 uses stderr. Preserve
+            # that explicit miss contract, but never swallow arbitrary
+            # backend errors as a lookup miss.
+            error = str(payload.get("error") or "").strip()
+            if re.match(r"^symbol not found(?:\\b|$)", error, re.IGNORECASE):
+                return None
+            raise CBMAdapterError("cbm get_code_snippet returned an error payload")
+        candidate = self._normalize_node(payload, cbm_project_name=slug)
+        if candidate is None:
+            raise CBMAdapterError("cbm get_code_snippet returned a malformed node")
+        return candidate
+
+    # -- introspection -------------------------------------------------
+
+    def probe_version(self) -> str:
+        """Run ``--version`` and return the raw version line.
+
+        Capability negotiation starts here: doctor/pin-policy classify
+        the parsed version instead of assuming one. Raises
+        CBMAdapterError when the binary cannot run.
+        """
+        self._verify_binary()
+        try:
+            result = subprocess.run(
+                [self.cbm_bin, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=self.timeout,
+                env=self._child_environment(),
+                shell=False,
+            )
+        except FileNotFoundError as exc:
+            raise CBMAdapterError(
+                f"cbm executable not found: {self.cbm_bin}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CBMAdapterError("cbm --version timed out") from exc
+        self._check_child_output("--version", result)
+        if result.returncode != 0:
+            detail = sanitize_error((result.stderr or result.stdout or "").strip())
+            raise CBMAdapterError(f"cbm --version failed: {detail}")
+        return (result.stdout or "").strip()
+
+    def list_projects(self) -> List[dict]:
+        """Indexed projects known to this cache (``cli list_projects``)."""
+        payload = self._run("list_projects", [])
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm list_projects returned a non-object payload")
+        if "error" in payload:
+            raise CBMAdapterError("cbm list_projects returned an error payload")
+        projects = payload.get("projects")
+        if not isinstance(projects, list):
+            raise CBMAdapterError("cbm list_projects returned malformed projects")
+        if any(not isinstance(project, dict) for project in projects):
+            raise CBMAdapterError("cbm list_projects returned a malformed project")
+        return projects
+
+    def index_status(self, project: Optional[str] = None) -> dict:
+        """Index freshness/root facts for one project (``cli index_status``)."""
+        slug = self._project(project)
+        payload = self._run("index_status", ["--project", slug])
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm index_status returned a non-object payload")
+        if "error" in payload:
+            raise CBMAdapterError("cbm index_status returned an error payload")
+        return payload
 
     # -- normalization --------------------------------------------------
 

@@ -30,7 +30,8 @@ import os
 import sys
 from typing import Optional
 
-from .cbm_adapter import CBMCLIAdapter, CBMAdapterError
+from . import cbm_support
+from .cbm_adapter import CBMAdapterError
 from .context_budget import (
     BudgetValidationError,
     apply_budget,
@@ -155,6 +156,21 @@ def _cbm_project_name(args, registry) -> Optional[str]:
     return None
 
 
+def _cbm_record(args, registry) -> dict:
+    """Build the configured CBM identity consumed by the shared trust gate."""
+    recorded = None
+    if registry is not None and args.workspace_id:
+        workspace = registry.get_workspace(args.workspace_id)
+        if workspace is not None and isinstance(workspace.cbm, dict):
+            recorded = workspace.cbm
+    return {
+        "project_name": args.cbm_project_name
+        or ((recorded or {}).get("project_name")),
+        "cache_dir": args.cbm_cache_dir
+        or ((recorded or {}).get("cache_dir")),
+    }
+
+
 def main(
     argv: Optional[list] = None,
     *,
@@ -177,11 +193,10 @@ def main(
 
     if cbm_adapter is None and args.cbm_bin:
         try:
-            cbm_adapter = CBMCLIAdapter(
-                cbm_bin=args.cbm_bin,
-                cache_dir=args.cbm_cache_dir,
-                cbm_project_name=_cbm_project_name(args, registry),
-                workspace_root=args.workspace_root,
+            cbm_adapter = cbm_support.certify_configured_adapter(
+                args.workspace_root or "",
+                _cbm_record(args, registry),
+                args.cbm_bin,
             )
         except CBMAdapterError as exc:
             return _fail(str(exc))
