@@ -60,11 +60,11 @@ from relinkra.connectors import (
     CODEX,
     CONNECTORS,
     CONSOLE_SCRIPT,
-    DEVIN,
+    DEVIN_CLOUD,
     GENERIC,
     OPENCODE,
     SERVER_MODULE,
-    WINDSURF,
+    DEVIN_DESKTOP,
     build_plan,
     build_report,
     check_registration,
@@ -105,7 +105,7 @@ class RegistryTests(unittest.TestCase):
     def test_every_expected_connector_is_registered(self):
         self.assertEqual(
             connector_ids(),
-            ["generic", "claude", "opencode", "codex", "windsurf", "devin"],
+            ["generic", "claude", "opencode", "codex", "devin-desktop", "devin-cloud"],
         )
 
     def test_ids_and_aliases_are_globally_unique(self):
@@ -121,8 +121,11 @@ class RegistryTests(unittest.TestCase):
             ("open-code", "opencode"),
             ("codex", "codex"),
             ("openai-codex", "codex"),
-            ("windsurf", "windsurf"),
-            ("codeium", "windsurf"),
+            ("windsurf", "devin-desktop"),
+            ("codeium", "devin-desktop"),
+            ("windsurf-next", "devin-desktop"),
+            ("devin-desktop", "devin-desktop"),
+            ("devin-cloud", "devin-cloud"),
             ("generic", "generic"),
             ("mcp", "generic"),
             ("stdio", "generic"),
@@ -150,9 +153,9 @@ class RegistryTests(unittest.TestCase):
                 self.assertIn(spec.support_status, SUPPORT_STATUSES)
 
     def test_devin_is_not_advertised_as_supported(self):
-        self.assertEqual(DEVIN.support_status, SUPPORT_UNSUPPORTED)
-        self.assertFalse(DEVIN.format_verified)
-        self.assertEqual(DEVIN.locations, ())
+        self.assertEqual(DEVIN_CLOUD.support_status, SUPPORT_UNSUPPORTED)
+        self.assertFalse(DEVIN_CLOUD.format_verified)
+        self.assertEqual(DEVIN_CLOUD.locations, ())
 
     def test_no_connector_may_write_in_this_phase(self):
         # The structural guarantee behind "live host configs unmodified".
@@ -526,9 +529,9 @@ class PlanTests(HostFixtureCase):
         self.assertIn("no configuration file", plan.unavailable_reason)
 
     def test_unimplemented_connector_is_honest(self):
-        plan = self.plan(DEVIN)
+        plan = self.plan(DEVIN_CLOUD)
         self.assertEqual(plan.status, PLAN_UNAVAILABLE)
-        self.assertIn("no connector implementation", plan.unavailable_reason)
+        self.assertIn("no local configuration file", plan.unavailable_reason)
 
     def test_codex_stays_read_only(self):
         self.write_config(".codex", "config.toml", content='[mcp_servers.other]\ncommand = "x"\n')
@@ -547,13 +550,13 @@ class PlanTests(HostFixtureCase):
         )
         self.assertIn("mcp.relinkra", detail)
 
-    def test_windsurf_plans_against_its_own_file(self):
+    def test_devin_desktop_plans_against_the_legacy_file(self):
         self.write_config(
             ".codeium", "windsurf", "mcp_config.json", content={"mcpServers": {}}
         )
-        plan = self.plan(WINDSURF)
+        plan = self.plan(DEVIN_DESKTOP)
         self.assertEqual(plan.status, PLAN_READY)
-        self.assertEqual(plan.target_ref, "windsurf:windsurf_user_mcp")
+        self.assertEqual(plan.target_ref, "devin-desktop:windsurf_user_mcp")
 
     def test_every_operation_declares_conditions_and_rollback(self):
         self.claude_config({"mcpServers": {}})
@@ -851,9 +854,9 @@ class CapabilityHonestyTests(HostFixtureCase):
         self.assertTrue(with_plan.capabilities.registration_planned)
 
     def test_registration_planned_is_false_for_an_unavailable_plan(self):
-        inspection = self.inspect(DEVIN)
-        plan = build_plan(DEVIN, inspection, LAUNCH)
-        report = build_report(DEVIN, inspection, LAUNCH, plan)
+        inspection = self.inspect(DEVIN_CLOUD)
+        plan = build_plan(DEVIN_CLOUD, inspection, LAUNCH)
+        report = build_report(DEVIN_CLOUD, inspection, LAUNCH, plan)
         self.assertFalse(report.capabilities.registration_planned)
 
     def test_implementation_exists_is_structural_not_a_name_check(self):
@@ -861,7 +864,7 @@ class CapabilityHonestyTests(HostFixtureCase):
         # comparing connector_id against a hardcoded "generic".
         generic = build_report(GENERIC, self.inspect(GENERIC), LAUNCH)
         self.assertTrue(generic.capabilities.implementation_exists)
-        devin = build_report(DEVIN, self.inspect(DEVIN), LAUNCH)
+        devin = build_report(DEVIN_CLOUD, self.inspect(DEVIN_CLOUD), LAUNCH)
         self.assertFalse(devin.capabilities.implementation_exists)
 
     def test_machine_rendering_is_available_but_opt_in(self):

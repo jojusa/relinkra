@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__
+from . import __version__, backend_policy
 from .app_service import (
     CONTRACT_VERSION,
     RelinkraServices,
@@ -46,7 +46,10 @@ from .app_service import (
     ServiceError,
     sanitize_wire_text,
 )
+from .backend_detection import assess_workspace
+from .connectors import resolve_launch
 from .handoff import contains_absolute_path
+from .host_discovery import DiscoveryEnvironment
 from .identity import (
     AmbiguousIdentityError,
     GitError,
@@ -114,15 +117,28 @@ class WorkspaceConfig:
     initialized_at: str = ""
     relinkra_version: str = __version__
     config_version: int = CONFIG_VERSION
+    #: Explicit opt-in to the advanced topology where a direct CBM server
+    #: is exposed alongside Relinkra. NOTHING writes this today — no
+    #: command sets it and ``init`` never emits it — so it can only become
+    #: true by a deliberate hand edit. Read here so the diagnostics can
+    #: report a chosen mixture as ``explicitly_allowed_advanced`` instead
+    #: of accusing the user of an accident.
+    advanced_direct_cbm: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "config_version": self.config_version,
             "project_id": self.project_id,
             "workspace_id": self.workspace_id,
             "initialized_at": self.initialized_at,
             "relinkra_version": self.relinkra_version,
         }
+        # Emitted only when set. A re-init must not erase a hand-made
+        # opt-in, and a workspace that never made one must not grow a key
+        # implying the choice was ever offered.
+        if self.advanced_direct_cbm:
+            data["advanced_direct_cbm"] = True
+        return data
 
     @staticmethod
     def load(root: Path) -> Optional["WorkspaceConfig"]:
@@ -148,6 +164,7 @@ class WorkspaceConfig:
                 initialized_at=str(data.get("initialized_at") or ""),
                 relinkra_version=str(data.get("relinkra_version") or ""),
                 config_version=int(data.get("config_version") or 0),
+                advanced_direct_cbm=bool(data.get("advanced_direct_cbm")),
             )
         except (OSError, ValueError, TypeError):
             return None
@@ -387,6 +404,290 @@ def check_mcp(services: Optional[RelinkraServices], health: Optional[dict]) -> C
             "Run 'relinkra doctor' to see which component is missing.",
         )
     return Check("MCP", PASS, "ready")
+
+
+# ---------------------------------------------------------------------------
+# Routing and trust diagnostics (R4C.0)
+# ---------------------------------------------------------------------------
+
+#: Which ownership states are a good outcome. Everything absent from
+#: these sets is a WARN — including every ``unknown`` and ``unverified``
+#: state, which is the rule that keeps "we did not look" from rendering
+#: as "we checked and it is fine".
+_HEALTHY_CBM_OWNERSHIP = frozenset(
+    {backend_policy.CBM_RELINKRA_PRIVATE, backend_policy.CBM_UNAVAILABLE}
+)
+_HEALTHY_ENGRAM_OWNERSHIP = frozenset(
+    {
+        backend_policy.ENGRAM_RELINKRA_MANAGED,
+        backend_policy.ENGRAM_GENTLEMAN_MANAGED,
+        backend_policy.ENGRAM_SHARED_SEPARATED,
+        backend_policy.ENGRAM_UNAVAILABLE,
+    }
+)
+
+_CBM_OWNERSHIP_DETAIL = {
+    backend_policy.CBM_RELINKRA_PRIVATE: "private Relinkra backend",
+    backend_policy.CBM_UNAVAILABLE: (
+        "no CBM backend configured and none exposed directly"
+    ),
+    backend_policy.CBM_DIRECTLY_EXPOSED: (
+        "a direct CBM server is registered; direct calls bypass Relinkra "
+        "relevance, budgeting, memory integration, Git intelligence, handoffs "
+        "and metrics"
+    ),
+    backend_policy.CBM_EXPLICITLY_ALLOWED_ADVANCED: (
+        "direct CBM exposure is allowed explicitly for this workspace"
+    ),
+    backend_policy.CBM_UNKNOWN: "ownership could not be determined",
+}
+
+_ENGRAM_OWNERSHIP_DETAIL = {
+    backend_policy.ENGRAM_RELINKRA_MANAGED: "reached through Relinkra only",
+    backend_policy.ENGRAM_GENTLEMAN_MANAGED: (
+        "a Gentleman-attributed registration; SDD workflow state is its own"
+    ),
+    backend_policy.ENGRAM_SHARED_SEPARATED: (
+        "shared with Gentleman under separated contracts"
+    ),
+    backend_policy.ENGRAM_DIRECT_UNCLASSIFIED: (
+        "a direct Engram registration was found that could not be attributed "
+        "to Gentleman or to Relinkra"
+    ),
+    backend_policy.ENGRAM_UNAVAILABLE: "no memory backend detected",
+    backend_policy.ENGRAM_UNKNOWN: "ownership could not be determined",
+}
+
+_ROUTE_DETAIL = {
+    backend_policy.ROUTE_MANAGED: "managed through Relinkra",
+    backend_policy.ROUTE_MIXED: (
+        "direct backend exposure detected alongside Relinkra"
+    ),
+    backend_policy.ROUTE_BYPASSED: (
+        "a private backend is exposed directly and Relinkra is not registered"
+    ),
+    backend_policy.ROUTE_DEGRADED: (
+        "Relinkra owns the route but cannot fully serve it"
+    ),
+    backend_policy.ROUTE_UNVERIFIED: (
+        "no observed evidence that project context flows through Relinkra"
+    ),
+}
+
+_TRUST_DETAIL = {
+    backend_policy.TRUST_HIGH: "high",
+    backend_policy.TRUST_DEGRADED: (
+        "degraded — some context reaches the agent outside Relinkra's "
+        "budgeting and attribution"
+    ),
+    backend_policy.TRUST_UNRELIABLE: (
+        "unreliable — direct backend calls bypass Relinkra budgeting and "
+        "attribution"
+    ),
+    backend_policy.TRUST_UNVERIFIED: (
+        "unverified — no route has been observed to attribute against"
+    ),
+}
+
+#: Every non-high trust state names something the user can actually do.
+#: A warning with no action is a warning people learn to scroll past.
+_TRUST_ACTION = {
+    backend_policy.TRUST_DEGRADED: (
+        "Some context reaches the agent outside Relinkra. Route project "
+        "context and memory through Relinkra before treating token or "
+        "duration numbers as attributable."
+    ),
+    backend_policy.TRUST_UNRELIABLE: (
+        "Direct backend calls bypass Relinkra budgeting and attribution. "
+        "Disable the direct entry for this host, or treat every metric as "
+        "a lower bound."
+    ),
+    backend_policy.TRUST_UNVERIFIED: (
+        "Register Relinkra with a host and start it. Until a route has been "
+        "observed, no metric can be attributed to any component."
+    ),
+}
+
+
+def routing_checks(assessment) -> List[Check]:
+    """Render one routing assessment as the compatibility section.
+
+    Every check here is PASS or WARN, never FAIL. A user who deliberately
+    exposes CBM has a working machine and a topology Relinkra disagrees
+    with; failing their ``doctor`` over it would turn a policy opinion
+    into a broken exit code. What Relinkra will not do is call it healthy.
+    """
+    checks = [
+        Check(
+            "Context routing",
+            PASS if assessment.context_route == backend_policy.ROUTE_MANAGED else WARN,
+            _ROUTE_DETAIL.get(assessment.context_route, assessment.context_route),
+            assessment.route_remediation,
+        ),
+        Check(
+            "CBM ownership",
+            PASS if assessment.cbm_ownership in _HEALTHY_CBM_OWNERSHIP else WARN,
+            _CBM_OWNERSHIP_DETAIL.get(
+                assessment.cbm_ownership, assessment.cbm_ownership
+            ),
+            _ownership_action(assessment, assessment.cbm_ownership),
+        ),
+        Check(
+            "Engram ownership",
+            PASS if assessment.engram_ownership in _HEALTHY_ENGRAM_OWNERSHIP else WARN,
+            _ENGRAM_OWNERSHIP_DETAIL.get(
+                assessment.engram_ownership, assessment.engram_ownership
+            ),
+            (
+                backend_policy.REMEDIATION_UNCLASSIFIED_ENGRAM
+                if assessment.engram_ownership
+                == backend_policy.ENGRAM_DIRECT_UNCLASSIFIED
+                else _ownership_action(assessment, assessment.engram_ownership)
+            ),
+        ),
+        Check(
+            "Duplicate read/write risk",
+            PASS if assessment.duplicate_risk == backend_policy.DUPLICATE_NONE else WARN,
+            _duplicate_detail(assessment),
+            _duplicate_action(assessment),
+        ),
+        Check(
+            "Metrics trust",
+            PASS if assessment.metrics_trust == backend_policy.TRUST_HIGH else WARN,
+            _TRUST_DETAIL.get(assessment.metrics_trust, assessment.metrics_trust),
+            _TRUST_ACTION.get(assessment.metrics_trust, ""),
+        ),
+        _ladder_check(assessment.ladder),
+    ]
+    return checks
+
+
+#: The two ways an ownership axis lands on ``unknown``, and what to do
+#: about each. Without this, a conflicting registration produced a WARN
+#: reading "ownership could not be determined" with no action at all —
+#: the assessment knew why, and the operator was never told.
+_UNKNOWN_OWNERSHIP_ACTION_CONFLICT = (
+    "At least one MCP registration's name disagrees with what it launches, "
+    "so ownership was not inferred from the name. Check that entry's command "
+    "against its name; nothing was changed."
+)
+_UNKNOWN_OWNERSHIP_ACTION_UNROUTED = (
+    "The backend is reachable but Relinkra is not registered with any host, "
+    "so nothing observable owns it. Register Relinkra to bring it under the "
+    "managed route."
+)
+
+
+def _ownership_action(assessment, state: str) -> str:
+    """What to do about an ownership state that is not a clean PASS.
+
+    Only ``unknown`` needs disambiguating: it is reached either from a
+    conflicting detection or from Relinkra being absent, and those call
+    for opposite actions. ``directly_exposed`` already has the route's
+    own remediation.
+    """
+    if assessment.bypass_detected:
+        return backend_policy.REMEDIATION_MIXED
+    if state not in (backend_policy.CBM_UNKNOWN, backend_policy.ENGRAM_UNKNOWN):
+        return ""
+    conflicting = any("disagrees" in note for note in assessment.notes)
+    return (
+        _UNKNOWN_OWNERSHIP_ACTION_CONFLICT
+        if conflicting
+        else _UNKNOWN_OWNERSHIP_ACTION_UNROUTED
+    )
+
+
+def _duplicate_detail(assessment) -> str:
+    """Name the risk level and the kinds that reached it."""
+    worst = assessment.duplicate_risk
+    kinds = sorted(
+        {
+            finding.kind
+            for finding in assessment.duplicate_findings
+            if finding.risk == worst
+        }
+    )
+    if worst == backend_policy.DUPLICATE_NONE:
+        return "no duplicate retrieval or duplicate write path detected"
+    return f"{worst}: " + ", ".join(kinds)
+
+
+def _duplicate_action(assessment) -> str:
+    """What to do about the worst duplication risk found.
+
+    ``unverified`` gets its own wording rather than the route's, because
+    the honest answer there is not "fix something" — it is "Relinkra
+    cannot see this from here", and pretending otherwise would send
+    someone looking for a problem that may not exist.
+    """
+    worst = assessment.duplicate_risk
+    if worst == backend_policy.DUPLICATE_NONE:
+        return ""
+    if worst == backend_policy.DUPLICATE_UNVERIFIED:
+        return (
+            "Some duplication happens entirely outside Relinkra's process and "
+            "cannot be observed from here. Route project memory and handoffs "
+            "through Relinkra so its own side stays single-sourced."
+        )
+    return assessment.route_remediation or backend_policy.REMEDIATION_MIXED
+
+
+def _ladder_check(ladder) -> Check:
+    """One check for the whole integration-trust ladder.
+
+    Reported as a single row with the unproven rungs named, rather than
+    twelve rows: the useful question is "how far does the evidence
+    actually go", and a wall of WARNs answers it worse than one line that
+    says where the evidence stops.
+    """
+    # Keyed off all_proven rather than "no unproven stages", because an
+    # EMPTY ladder has no unproven stages and has also proven nothing.
+    # The two readings differ on exactly one input, and that input is the
+    # one a failed assessment produces.
+    if ladder.all_proven:
+        return Check(
+            "Integration trust",
+            PASS,
+            "every stage from configuration to real host launch is proven",
+        )
+    unproven = ladder.unproven()
+    if not ladder.stages:
+        return Check(
+            "Integration trust",
+            WARN,
+            "no integration evidence was gathered",
+            "Run 'relinkra connect routing' for detail.",
+        )
+    names = ", ".join(stage.stage for stage in unproven)
+    return Check(
+        "Integration trust",
+        WARN,
+        f"{len(ladder.stages) - len(unproven)}/{len(ladder.stages)} stages "
+        f"proven; not proven: {names}",
+        "Configuration presence is never treated as readiness. Register "
+        "Relinkra with a host, start it, and re-run 'relinkra doctor'.",
+    )
+
+
+def assess_routing_for(root: Optional[Path], resolved: "Resolved"):
+    """Build the routing assessment for a workspace. Read-only.
+
+    Returns ``None`` when there is no repository to assess, so the caller
+    can omit the section rather than render a verdict about nothing.
+    """
+    if root is None:
+        return None
+    env = DiscoveryEnvironment.current(workspace_root=root)
+    launch = resolve_launch(root, registry_path(root))
+    return assess_workspace(
+        env,
+        health=resolved.health,
+        launch_resolved=bool(launch.resolved),
+        advanced_cbm_allowed=bool(
+            resolved.config is not None and resolved.config.advanced_direct_cbm
+        ),
+    )
 
 
 def check_portable_output(payload: Any) -> Check:
@@ -641,6 +942,14 @@ def cmd_init(args) -> int:
             existing.initialized_at if reuse_timestamp else workspace.registered_at
         ),
         relinkra_version=__version__,
+        # Carried across a refresh. An identity change means a different
+        # repository, and a topology choice made for the previous one says
+        # nothing about this one.
+        advanced_direct_cbm=bool(
+            existing is not None
+            and not identity_changed
+            and existing.advanced_direct_cbm
+        ),
     )
     try:
         config.save(root)
@@ -842,6 +1151,44 @@ def cmd_doctor(args) -> int:
         "contract_version": CONTRACT_VERSION,
         "checks": [check.to_dict() for check in checks],
     }
+
+    # The compatibility and routing section. Built from the same
+    # assessment 'connect routing' renders, so the two commands cannot
+    # describe one machine two ways. A discovery failure degrades the
+    # section to a warning rather than taking down the whole diagnostic —
+    # doctor's job is to run when things are broken.
+    assessment = None
+    if resolved.root is not None:
+        try:
+            assessment = assess_routing_for(resolved.root, resolved)
+        except Exception as exc:  # discovery must never crash diagnostics
+            assessment = None
+            checks.append(
+                Check(
+                    "Context routing",
+                    WARN,
+                    f"routing could not be assessed: {sanitize_wire_text(str(exc))}",
+                    "Run 'relinkra connect routing' for detail.",
+                )
+            )
+        if assessment is not None:
+            try:
+                checks.extend(routing_checks(assessment))
+                payload["routing"] = assessment.to_dict()
+            except Exception as exc:
+                # Rendering the section is as much a place to fail as
+                # building it, and a doctor that dies while formatting
+                # its own diagnosis is worse than one that omits a row.
+                assessment = None
+                checks.append(
+                    Check(
+                        "Context routing",
+                        WARN,
+                        f"routing could not be rendered: {sanitize_wire_text(str(exc))}",
+                        "Run 'relinkra connect routing' for detail.",
+                    )
+                )
+        payload["agent_instructions"] = backend_policy.agent_instruction_document()
     # Audit the payload we are about to print, then report the result
     # alongside it.
     portable = check_portable_output(payload)
@@ -863,6 +1210,16 @@ def cmd_doctor(args) -> int:
             lines.append(f"      {sanitize_wire_text(check.detail)}")
         if check.action and check.status != PASS:
             lines.append(f"      Suggested action: {sanitize_wire_text(check.action)}")
+    # Assessment notes explain WHY a routing state landed where it did —
+    # a conflicting registration, an unrecognised server left alone, a
+    # legacy config location. The JSON payload has carried them all
+    # along; without this block the text reader, who is most of the
+    # readers, saw the verdict and none of the reasoning.
+    if assessment is not None and assessment.notes:
+        lines.append("")
+        lines.append("Routing notes")
+        for note in assessment.notes:
+            lines.append(f"      {sanitize_wire_text(note)}")
     lines.append("")
     lines.append(
         f"{counts[PASS]} passed, {counts[WARN]} warning(s), {counts[FAIL]} failed"

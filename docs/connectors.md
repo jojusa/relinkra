@@ -1,7 +1,7 @@
 # Connectors (R4B)
 
 Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
-Code, OpenCode, Codex, Windsurf, or anything else that speaks MCP — to launch
+Code, OpenCode, Codex, Devin Desktop (formerly Windsurf), or anything else that speaks MCP — to launch
 that server for this workspace.
 
 The user-facing shape is meant to stay this small:
@@ -11,6 +11,7 @@ relinkra connect list
 relinkra connect inspect claude
 relinkra connect plan claude
 relinkra connect check claude
+relinkra connect routing
 relinkra connect generic
 ```
 
@@ -60,6 +61,14 @@ command — see [Why there is no `apply`](#why-there-is-no-apply).
 | `relinkra/connectors.py` | The registry: per-host declarations, launch resolution, plan building. |
 | `relinkra/connect_cli.py` | Command dispatch, exit codes, the portability audit. |
 | `relinkra/connect_render.py` | Human-readable rendering. Pure functions. |
+| `relinkra/backend_policy.py` | R4C.0 ownership, routing and trust vocabulary. Pure domain, no I/O. |
+| `relinkra/backend_detection.py` | R4C.0 structural classification of MCP registrations; routing assessment. |
+
+`connect routing` reports which backends each host actually reaches and
+whether project context flows through Relinkra. It is configuration-only
+— no backend is probed and no process is spawned. See
+[context-control-plane.md](context-control-plane.md) for the policy it
+applies.
 
 ---
 
@@ -108,8 +117,8 @@ machine — not from documentation.
 | `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | **no** | **no** |
 | `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | **no** | **no** |
 | `codex` | experimental | yes (read) | `[mcp_servers.<name>]` TOML tables | **no** | **no** | **no** |
-| `windsurf` | experimental | yes | `mcpServers` with `{command, args}` | yes | **no** | **no** |
-| `devin` | unsupported | no | — | no | no | no |
+| `devin-desktop` | experimental | yes (legacy file) | `mcpServers` with `{command, args}` | yes | **no** | **no** |
+| `devin-cloud` | unsupported | no | — | no | no | no |
 
 Codex is read-only: rewriting TOML without destroying the user's comments and
 formatting needs a round-tripping writer, which is out of scope here. Reading it
@@ -129,7 +138,7 @@ Nothing is globbed and no directory is walked.
 | `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
 | `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`), `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` |
 | `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
-| `windsurf` | `~/.codeium/windsurf/mcp_config.json`, `~/.codeium/windsurf-next/mcp_config.json` |
+| `devin-desktop` | `~/.codeium/windsurf/mcp_config.json`, `~/.codeium/windsurf-next/mcp_config.json` (legacy; still discovered) |
 
 A host is reported `not_installed` only when **none** of its candidates exist
 **and** its executable is not on `PATH`. One missing conventional file proves

@@ -15,6 +15,12 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
+from .backend_policy import (
+    AGENT_INSTRUCTIONS,
+    STAGE_NOT_PROVEN,
+    STAGE_PROVEN,
+    STAGE_UNVERIFIED,
+)
 from .connector import (
     MANAGED_SERVER_NAME,
     PLAN_READY,
@@ -223,6 +229,80 @@ def render_check(result) -> str:
         _bullets("Warnings", [f"{w.code}: {w.message}" for w in result.warnings])
     )
     lines.append("This command wrote nothing.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+_STAGE_GLYPH = {
+    STAGE_PROVEN: "proven",
+    STAGE_NOT_PROVEN: "not proven",
+    STAGE_UNVERIFIED: "unverified",
+}
+
+
+def render_routing(assessment) -> str:
+    """The routing verdict, its evidence, and what to do about it.
+
+    Ordered verdict-first. Someone running this command has one question
+    — "is my agent actually going through Relinkra?" — and the answer is
+    the first thing on the screen; the per-host detail below it exists to
+    justify that answer, not to bury it.
+    """
+    lines = ["", "Relinkra context routing", ""]
+    lines.extend(
+        _aligned(
+            [
+                ("Context route", assessment.context_route),
+                ("CBM ownership", assessment.cbm_ownership),
+                ("Engram ownership", assessment.engram_ownership),
+                ("Metrics trust", assessment.metrics_trust),
+                ("Duplicate risk", assessment.duplicate_risk),
+                ("Bypass detected", _yes_no(assessment.bypass_detected)),
+            ]
+        )
+    )
+    lines.append("")
+
+    lines.append("Hosts")
+    for host in assessment.hosts:
+        detections = host.get("detections") or []
+        summary = (
+            ", ".join(
+                f"{item['ref']} ({item['confidence']})" for item in detections
+            )
+            or "no MCP registrations found"
+        )
+        lines.append(f"  {host['connector_id']}  [{host['discovery_status']}]")
+        lines.append(f"     {summary}")
+        if host.get("naming") in ("legacy", "unverified"):
+            lines.append(f"     naming: {host['naming']}")
+    lines.append("")
+
+    lines.append("Duplicate read/write risk")
+    for finding in assessment.duplicate_findings:
+        lines.append(
+            f"  {finding.kind}: {finding.risk} ({finding.observability})"
+        )
+        if finding.detail:
+            lines.append(f"     {finding.detail}")
+    lines.append("")
+
+    lines.append("Integration trust")
+    for stage in assessment.ladder.stages:
+        lines.append(f"  {stage.stage:<34}{_STAGE_GLYPH[stage.state]}")
+        if stage.evidence:
+            lines.append(f"     {stage.evidence}")
+    lines.append("")
+
+    lines.extend(_bullets("Notes", list(assessment.notes)))
+    lines.extend(_bullets("Suggested action", list(assessment.remediation)))
+    lines.append("Agent instruction contract (not written to any host)")
+    lines.extend(f"  {item.text}" for item in AGENT_INSTRUCTIONS)
+    lines.append("")
+    lines.append(
+        "This command wrote nothing. No host configuration, MCP registration "
+        "or backend was modified."
+    )
     lines.append("")
     return "\n".join(lines)
 

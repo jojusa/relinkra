@@ -187,7 +187,8 @@ class ListTests(ConnectCLICase):
         self.assertEqual(code, EXIT_OK)
         ids = [entry["connector_id"] for entry in payload["connectors"]]
         self.assertEqual(
-            ids, ["generic", "claude", "opencode", "codex", "windsurf", "devin"]
+            ids,
+            ["generic", "claude", "opencode", "codex", "devin-desktop", "devin-cloud"],
         )
 
     def test_reports_that_nothing_is_host_proven(self):
@@ -403,13 +404,14 @@ class LeakageTests(ConnectCLICase):
         ("inspect", "claude"),
         ("inspect", "opencode"),
         ("inspect", "codex"),
-        ("inspect", "windsurf"),
+        ("inspect", "devin-desktop"),
         ("inspect", "generic"),
         ("plan", "claude"),
         ("plan", "opencode"),
         ("plan", "codex"),
-        ("plan", "windsurf"),
+        ("plan", "devin-desktop"),
         ("check", "claude"),
+        ("routing",),
         ("generic",),
     )
 
@@ -517,7 +519,7 @@ class MaliciousConfigTests(ConnectCLICase):
             for entry in payload["connectors"]
         }
         self.assertEqual(states["claude"], "config_malformed")
-        self.assertEqual(states["windsurf"], "discovered")
+        self.assertEqual(states["devin-desktop"], "discovered")
 
 
 class ReadOnlyTests(ConnectCLICase):

@@ -34,12 +34,15 @@ import json
 import sys
 from typing import Any, List, Optional, Tuple
 
+from .backend_detection import assess_workspace
+from .backend_policy import agent_instruction_document
 from .connect_render import (
     render_check,
     render_generic,
     render_inspect,
     render_list,
     render_plan,
+    render_routing,
 )
 from .connector import (
     PLAN_READY,
@@ -59,10 +62,12 @@ from .connectors import (
 )
 from .handoff import contains_absolute_path
 from .host_discovery import DiscoveryEnvironment
+from .backend_policy import ROUTE_MANAGED
 from .product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    WorkspaceConfig,
     _fail,
     _repo_root,
     registry_path,
@@ -245,6 +250,66 @@ def cmd_check(args) -> int:
     return EXIT_OK if result.valid else EXIT_ACTION_REQUIRED
 
 
+def cmd_routing(args) -> int:
+    """Report how project context actually reaches an agent. Read-only.
+
+    Surveys every host configuration on this machine, classifies each MCP
+    registration by what it LAUNCHES, and renders the routing verdict. It
+    inspects; it never registers, disables, migrates or deletes anything,
+    including the servers it recognises as competing with Relinkra.
+
+    Deliberately CONFIGURATION-ONLY: no backend is probed and no process
+    is spawned, so the command stays fast and provably read-only. That
+    costs one distinction — a Gentleman-marked Engram registration cannot
+    be reported as ``shared_separated`` without knowing the backend is
+    reachable — and ``relinkra doctor``, which does probe, is where the
+    fuller picture belongs.
+
+    Exit 2 when the route is anything other than managed — the command
+    ran fine, and the outcome needs a person.
+    """
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect routing' from inside a git repository.",
+        )
+        return EXIT_ERROR
+
+    launch = _launch_for(root)
+    config = WorkspaceConfig.load(root)
+
+    try:
+        assessment = assess_workspace(
+            env,
+            health=None,
+            launch_resolved=bool(launch.resolved),
+            advanced_cbm_allowed=bool(
+                config is not None and config.advanced_direct_cbm
+            ),
+        )
+    except Exception as exc:
+        # Same guard ``doctor`` has, for the same reason. This command
+        # exists to describe a machine whose wiring may be broken, so
+        # failing to survey it is a result to report — with the honest
+        # unverified defaults — not a traceback.
+        _fail(
+            f"Could not assess context routing: {exc}",
+            "Run 'relinkra connect inspect <agent>' to narrow it down.",
+        )
+        return EXIT_ERROR
+
+    payload = assessment.to_dict()
+    payload["agent_instructions"] = agent_instruction_document()
+
+    code = _emit(
+        payload, render_routing(assessment), as_json=args.json, allow_paths=False
+    )
+    if code != EXIT_OK:
+        return code
+    return EXIT_OK if assessment.context_route == ROUTE_MANAGED else EXIT_ACTION_REQUIRED
+
+
 def cmd_generic(args) -> int:
     """Emit the host-neutral stdio launch contract."""
     root, _ = _environment(args)
@@ -283,6 +348,13 @@ _COMMANDS = (
     ("inspect", cmd_inspect, "read-only discovery for one host", True, ("reveal",)),
     ("plan", cmd_plan, "show a deterministic mutation plan", True, ("dry-run",)),
     ("check", cmd_check, "validate an existing registration", True, ()),
+    (
+        "routing",
+        cmd_routing,
+        "report backend ownership, context routing and metrics trust",
+        False,
+        (),
+    ),
     ("generic", cmd_generic, "emit the generic MCP launch contract", False, ("reveal",)),
 )
 

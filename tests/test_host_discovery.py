@@ -19,7 +19,7 @@ from relinkra.connector import (
     SCOPE_WORKSPACE,
     FORMAT_JSON,
 )
-from relinkra.connectors import CLAUDE, CODEX, OPENCODE, WINDSURF
+from relinkra.connectors import CLAUDE, CODEX, DEVIN_DESKTOP, OPENCODE
 from relinkra.host_discovery import (
     SYSTEM_DARWIN,
     SYSTEM_LINUX,
@@ -175,7 +175,7 @@ class ConnectorLocationTests(unittest.TestCase):
         self.assertEqual(str(paths["codex_user_config"]), "/home/dev/.codex/config.toml")
 
     def test_windsurf_locations(self):
-        paths = resolved(WINDSURF.locations, posix_env())
+        paths = resolved(DEVIN_DESKTOP.locations, posix_env())
         self.assertEqual(
             str(paths["windsurf_user_mcp"]),
             "/home/dev/.codeium/windsurf/mcp_config.json",
@@ -187,18 +187,18 @@ class ConnectorLocationTests(unittest.TestCase):
 
     def test_every_location_id_is_unique_across_connectors(self):
         seen = []
-        for spec in (CLAUDE, OPENCODE, CODEX, WINDSURF):
+        for spec in (CLAUDE, OPENCODE, CODEX, DEVIN_DESKTOP):
             seen.extend(location.location_id for location in spec.locations)
         self.assertEqual(len(seen), len(set(seen)))
 
     def test_location_sets_are_bounded(self):
         # Discovery must never turn into a scan of the user's profile.
-        for spec in (CLAUDE, OPENCODE, CODEX, WINDSURF):
+        for spec in (CLAUDE, OPENCODE, CODEX, DEVIN_DESKTOP):
             with self.subTest(connector=spec.connector_id):
                 self.assertLessEqual(len(spec.locations), 6)
 
     def test_scope_drives_classification(self):
-        for spec in (CLAUDE, OPENCODE, CODEX, WINDSURF):
+        for spec in (CLAUDE, OPENCODE, CODEX, DEVIN_DESKTOP):
             for location in spec.locations:
                 with self.subTest(location=location.location_id):
                     expected = (

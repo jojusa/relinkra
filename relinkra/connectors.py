@@ -402,6 +402,13 @@ class ConnectorSpec:
     real_host_launch_proven: bool = False
     restart_instruction: str = ""
     security_notes: Tuple[str, ...] = ()
+    #: Location ids that belong to a PREVIOUS name for this product. Kept
+    #: discoverable rather than dropped: a rename does not move anyone's
+    #: existing config file, and a connector that stops looking at the old
+    #: location reports a configured host as not installed.
+    legacy_location_ids: Tuple[str, ...] = ()
+    #: How this connector's naming changed, in one sentence, when it did.
+    naming_migration: str = ""
 
     @property
     def all_names(self) -> Tuple[str, ...]:
@@ -482,7 +489,17 @@ def _codex_locations() -> Tuple[LocationSpec, ...]:
     )
 
 
-def _windsurf_locations() -> Tuple[LocationSpec, ...]:
+def _devin_desktop_locations() -> Tuple[LocationSpec, ...]:
+    """Where the local desktop agent keeps its MCP configuration.
+
+    Every entry here is a LEGACY Windsurf/Codeium location, and every one
+    of them is real: they are the files the product actually writes today
+    on this machine. The current Devin Desktop location is deliberately
+    absent — inventing a path so the table looks complete would make
+    ``inspect`` report a missing file at a location that may not exist,
+    which is worse than admitting the gap. See
+    :data:`DEVIN_DESKTOP_NAMING`.
+    """
     return (
         LocationSpec(
             location_id="windsurf_user_mcp",
@@ -503,6 +520,23 @@ def _windsurf_locations() -> Tuple[LocationSpec, ...]:
             ),
         ),
     )
+
+
+#: The legacy location ids for the desktop connector. Named once so
+#: discovery, the naming report and the tests all mean the same set.
+DEVIN_DESKTOP_LEGACY_LOCATIONS: Tuple[str, ...] = (
+    "windsurf_user_mcp",
+    "windsurf_next_mcp",
+)
+
+DEVIN_DESKTOP_NAMING = (
+    "Windsurf (Codeium) is now Devin Desktop. The connector id is "
+    "'devin-desktop'; 'windsurf' and 'codeium' remain aliases, and the "
+    "~/.codeium locations stay discoverable because a rename does not move "
+    "anyone's existing configuration. A current Devin Desktop configuration "
+    "location will be declared once one has been observed locally — it is "
+    "not guessed here."
+)
 
 
 _NO_APPLY = (
@@ -617,35 +651,45 @@ CODEX = ConnectorSpec(
     ),
 )
 
-WINDSURF = ConnectorSpec(
-    connector_id="windsurf",
-    display_name="Windsurf",
+DEVIN_DESKTOP = ConnectorSpec(
+    connector_id="devin-desktop",
+    display_name="Devin Desktop",
     host_type="editor",
-    aliases=("codeium",),
+    # The old names stay first-class. Someone with Windsurf installed and
+    # a year of muscle memory types 'windsurf', and being told that is not
+    # a connector would be a rename breaking a working command.
+    aliases=("windsurf", "codeium", "windsurf-next"),
     support_status=SUPPORT_EXPERIMENTAL,
-    executables=("windsurf",),
-    locations=_windsurf_locations(),
+    executables=("devin", "windsurf"),
+    locations=_devin_desktop_locations(),
+    legacy_location_ids=DEVIN_DESKTOP_LEGACY_LOCATIONS,
+    naming_migration=DEVIN_DESKTOP_NAMING,
     container_path=("mcpServers",),
     config_format=FORMAT_JSON,
     entry_builder=_string_command_entry,
+    # Verified against the LEGACY file only. The evidence string says so
+    # explicitly, because "format verified" for a renamed product is the
+    # easiest place to quietly inherit a claim that was never re-checked.
     format_verified=True,
     format_evidence=(
         "'mcpServers' object with {command, args} entries, read from a real "
-        "local Windsurf mcp_config.json."
+        "local ~/.codeium/windsurf/mcp_config.json. The current Devin Desktop "
+        "configuration format has NOT been verified locally."
     ),
     apply_available=False,
     apply_unavailable_reason=_NO_APPLY,
     restart_instruction=(
-        "Reload the Windsurf MCP configuration from the Cascade MCP panel."
+        "Reload the MCP configuration from the Cascade/MCP panel."
     ),
     security_notes=(
         "Unrelated MCP servers in mcp_config.json are preserved untouched.",
+        "Legacy ~/.codeium locations are read, never migrated or deleted.",
     ),
 )
 
-DEVIN = ConnectorSpec(
-    connector_id="devin",
-    display_name="Devin",
+DEVIN_CLOUD = ConnectorSpec(
+    connector_id="devin-cloud",
+    display_name="Devin (hosted)",
     host_type="hosted_agent",
     aliases=(),
     support_status=SUPPORT_UNSUPPORTED,
@@ -653,8 +697,14 @@ DEVIN = ConnectorSpec(
     format_evidence="",
     apply_available=False,
     apply_unavailable_reason=(
-        "no connector implementation exists. Listed so the roadmap is "
-        "visible, not because anything is supported."
+        "hosted Devin is a remote agent with no local configuration file. It "
+        "is listed so the roadmap is visible, and it is deliberately a "
+        "SEPARATE connector from devin-desktop: the two share a brand and "
+        "nothing else."
+    ),
+    naming_migration=(
+        "Hosted Devin is 'devin-cloud' and is unsupported. It is not an alias "
+        "of devin-desktop, and configuring one says nothing about the other."
     ),
     security_notes=(),
 )
@@ -666,9 +716,22 @@ CONNECTORS: Tuple[ConnectorSpec, ...] = (
     CLAUDE,
     OPENCODE,
     CODEX,
-    WINDSURF,
-    DEVIN,
+    DEVIN_DESKTOP,
+    DEVIN_CLOUD,
 )
+
+#: Names that used to identify one product and now identify two. Resolved
+#: to NOTHING on purpose: guessing which Devin someone meant would either
+#: point a desktop user at an unsupported hosted connector or silently
+#: reinterpret an existing script. The error names both and lets the human
+#: decide, which costs one retry and prevents a wrong answer.
+AMBIGUOUS_NAMES: Dict[str, Tuple[str, ...]] = {
+    "devin": ("devin-desktop", "devin-cloud"),
+}
+
+
+class AmbiguousConnectorError(UnknownConnectorError):
+    """Raised when a name maps to more than one connector."""
 
 
 def resolve_connector(name: str) -> ConnectorSpec:
@@ -678,6 +741,12 @@ def resolve_connector(name: str) -> ConnectorSpec:
     single most likely way a user meets this function.
     """
     key = (name or "").strip().lower()
+    candidates = AMBIGUOUS_NAMES.get(key)
+    if candidates:
+        raise AmbiguousConnectorError(
+            f"{name!r} is ambiguous since Windsurf became Devin Desktop; "
+            "name one of: " + ", ".join(candidates)
+        )
     for spec in CONNECTORS:
         if key in tuple(item.lower() for item in spec.all_names):
             return spec
