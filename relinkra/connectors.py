@@ -13,9 +13,10 @@ dispatch code changes.
 Honesty is enforced structurally. ``format_verified`` is set only where
 the shape was read out of a real local config, and it gates whether a
 plan can be produced at all. ``apply_available`` is a second, stricter
-gate: even a verified format does not get a write path in this phase,
-because a plan proves a file could be edited and proves nothing about a
-host successfully launching the server afterwards.
+gate, opened per connector only when the write path exists: R4C.1B opens
+it for Claude Code alone. Even then, a successful apply proves a file
+was edited and says nothing about the host launching the server
+afterwards — that evidence lives in ``connect_verification``.
 """
 
 from __future__ import annotations
@@ -298,6 +299,33 @@ def entry_tokens(entry: Any) -> Tuple[str, ...]:
     return tuple(tokens)
 
 
+def _launch_command_and_args(entry: Any) -> Tuple[Optional[str], Tuple[str, ...]]:
+    """Return the executable token and argument tokens, without coercion."""
+    if not isinstance(entry, Mapping):
+        return None, ()
+    command = entry.get("command")
+    if isinstance(command, str):
+        executable = command
+        command_args: Tuple[Any, ...] = ()
+    elif isinstance(command, (list, tuple)) and command and all(
+        isinstance(item, str) for item in command
+    ):
+        executable = command[0]
+        command_args = tuple(command[1:])
+    else:
+        return None, ()
+    args = entry.get("args")
+    if args is None:
+        extra_args: Tuple[Any, ...] = ()
+    elif isinstance(args, (list, tuple)) and all(
+        isinstance(item, str) for item in args
+    ):
+        extra_args = tuple(args)
+    else:
+        return None, ()
+    return executable, tuple(command_args) + extra_args
+
+
 def launches_relinkra(entry: Any) -> bool:
     """Structural ownership test: does this entry start Relinkra?
 
@@ -311,14 +339,24 @@ def launches_relinkra(entry: Any) -> bool:
     pinned a different interpreter still owns a valid registration and
     gets an update rather than a conflict.
     """
-    tokens = entry_tokens(entry)
-    for token in tokens:
-        if token == SERVER_MODULE:
+    command, args = _launch_command_and_args(entry)
+    if command is None:
+        return False
+
+    # A module name is meaningful only in the interpreter's module-launch
+    # slot.  Looking for the bare token anywhere in the flattened command
+    # let foreign wrappers such as ``node wrapper.js relinkra.mcp_cli``
+    # masquerade as Relinkra and be overwritten.
+    module_positions = [index for index, token in enumerate(args) if token == "-m"]
+    if len(module_positions) == 1:
+        index = module_positions[0]
+        if index + 1 < len(args) and args[index + 1] == SERVER_MODULE:
             return True
-        base = _basename(token)
-        if base == CONSOLE_SCRIPT or base == CONSOLE_SCRIPT + ".exe":
-            return True
-    return False
+
+    # Console-script ownership belongs to the executable token only.  A
+    # script name appearing in an arbitrary argument is not a launch target.
+    base = _basename(command)
+    return base in (CONSOLE_SCRIPT, CONSOLE_SCRIPT + ".exe")
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +408,66 @@ def _toml_command_entry(launch: LaunchContract) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Claude Code project keys and dynamic containers
+# ---------------------------------------------------------------------------
+
+
+def claude_project_key(workspace_root) -> str:
+    """The ``projects[]`` key Claude Code uses for a workspace.
+
+    Empirically verified against Claude Code 2.1.220: the absolute path
+    with forward slashes, an UPPERCASE drive letter on Windows, and no
+    trailing slash (``C:\\Desarrollos\\relinkra`` becomes
+    ``C:/Desarrollos/relinkra``; POSIX paths keep their form). Pure —
+    no filesystem access, so the key can be computed for any root.
+    """
+    text = str(workspace_root).replace("\\", "/")
+    text = text.rstrip("/")
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def _claude_container(workspace_root) -> Optional[Tuple[str, ...]]:
+    """LOCAL scope: ``projects[<project-key>].mcpServers`` in ~/.claude.json.
+
+    ``None`` when no workspace root is known, which falls the connector
+    back to its static container — the same file's top-level
+    ``mcpServers`` (USER scope). Apply/check/plan always run inside a
+    repository, so the fallback is reachable only from read-only
+    commands run outside one.
+    """
+    if workspace_root is None:
+        return None
+    return ("projects", claude_project_key(workspace_root), "mcpServers")
+
+
+def container_path_for(spec: "ConnectorSpec", workspace_root) -> Tuple[str, ...]:
+    """The container a connector targets, static or workspace-resolved."""
+    if spec.container_resolver is not None:
+        resolved = spec.container_resolver(workspace_root)
+        if resolved:
+            return tuple(resolved)
+    return spec.container_path
+
+
+def container_label(container_path: Sequence[str]) -> str:
+    """A portable label for a container path.
+
+    A workspace-resolved container carries the project key, which is
+    derived from an absolute path and therefore machine-local. It is
+    redacted here — once, at the single place labels are made — so plan
+    and warning text can never leak it into portable output.
+    """
+    from .handoff import contains_absolute_path
+
+    return ".".join(
+        "<project>" if contains_absolute_path(segment) else segment
+        for segment in container_path
+    )
+
+
+# ---------------------------------------------------------------------------
 # Connector specs
 # ---------------------------------------------------------------------------
 
@@ -386,6 +484,10 @@ class ConnectorSpec:
     executables: Tuple[str, ...] = ()
     locations: Tuple[LocationSpec, ...] = ()
     container_path: Tuple[str, ...] = ()
+    #: Optional hook resolving the container from the workspace root.
+    #: Called with the root (or None outside a repository); a None
+    #: result falls back to the static ``container_path``.
+    container_resolver: Optional[Callable[[Optional[Any]], Optional[Tuple[str, ...]]]] = None
     config_format: str = FORMAT_JSON
     entry_builder: Optional[Callable[[LaunchContract], Dict[str, Any]]] = None
     #: True only when the shape was read out of a real configuration file.
@@ -396,7 +498,8 @@ class ConnectorSpec:
     #: unknown keys across a rewrite.
     marker_allowed: bool = False
     #: Whether this phase may WRITE. Separate from format_verified on
-    #: purpose: writing is gated on a real host launch, not on parsing.
+    #: purpose: parsing a format and being trusted to mutate someone's
+    #: live configuration are different claims, opened per connector.
     apply_available: bool = False
     apply_unavailable_reason: str = ""
     real_host_launch_proven: bool = False
@@ -416,14 +519,17 @@ class ConnectorSpec:
 
 
 def _claude_locations() -> Tuple[LocationSpec, ...]:
+    """Claude Code's MCP configuration locations, in preference order.
+
+    Empirically verified against Claude Code 2.1.220 and the official
+    docs: LOCAL scope lives in ``~/.claude.json`` under
+    ``projects[<project-key>].mcpServers`` — that is the active and only
+    apply target. ``~/.claude/settings.json`` is NOT honored for
+    mcpServers by Claude Code 2.1+ (verified: an entry there is
+    invisible to ``claude mcp list``), and ``.mcp.json`` project scope
+    is approval-gated; both stay discoverable and nothing more.
+    """
     return (
-        LocationSpec(
-            location_id="claude_user_settings",
-            scope=SCOPE_USER,
-            config_format=FORMAT_JSON,
-            display_hint="~/.claude/settings.json",
-            build=lambda env: env.home_path(".claude", "settings.json"),
-        ),
         LocationSpec(
             location_id="claude_user_config",
             scope=SCOPE_USER,
@@ -437,6 +543,15 @@ def _claude_locations() -> Tuple[LocationSpec, ...]:
             config_format=FORMAT_JSON,
             display_hint="<workspace>/.mcp.json",
             build=lambda env: env.workspace_path(".mcp.json"),
+            discovery_only=True,
+        ),
+        LocationSpec(
+            location_id="claude_user_settings",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.claude/settings.json",
+            build=lambda env: env.home_path(".claude", "settings.json"),
+            discovery_only=True,
         ),
         LocationSpec(
             location_id="claude_workspace_settings_local",
@@ -444,6 +559,7 @@ def _claude_locations() -> Tuple[LocationSpec, ...]:
             config_format=FORMAT_JSON,
             display_hint="<workspace>/.claude/settings.local.json",
             build=lambda env: env.workspace_path(".claude", "settings.local.json"),
+            discovery_only=True,
         ),
     )
 
@@ -540,9 +656,9 @@ DEVIN_DESKTOP_NAMING = (
 
 
 _NO_APPLY = (
-    "host writes stay disabled until a real host has launched the Relinkra "
-    "MCP server (R4C). Use 'relinkra connect plan' and apply the change by "
-    "hand until then."
+    "host writes stay disabled for this connector (R4C). Use "
+    "'relinkra connect plan' and apply the change by hand until a write "
+    "path is opened for it."
 )
 
 GENERIC = ConnectorSpec(
@@ -577,21 +693,38 @@ CLAUDE = ConnectorSpec(
     support_status=SUPPORT_EXPERIMENTAL,
     executables=("claude",),
     locations=_claude_locations(),
+    # USER scope in the same file; the resolver retargets to LOCAL scope
+    # (projects[<project-key>].mcpServers) whenever a workspace is known.
     container_path=("mcpServers",),
+    container_resolver=_claude_container,
     config_format=FORMAT_JSON,
     entry_builder=_string_command_entry,
     format_verified=True,
     format_evidence=(
-        "'mcpServers' object with {command, args} entries, read from a real "
-        "local Claude Code configuration."
+        "LOCAL scope 'projects[<project-key>].mcpServers' in ~/.claude.json "
+        "with {command, args} entries, read from a real local Claude Code "
+        "2.1.220 state file. Empirically verified: Claude Code 2.1+ does "
+        "NOT honor mcpServers from ~/.claude/settings.json."
     ),
-    apply_available=False,
-    apply_unavailable_reason=_NO_APPLY,
+    # R4C.1B opens the write path for Claude Code ONLY. The apply engine
+    # still refuses unsafe targets, conflicts and direct CBM exposure,
+    # and a written config is reported as host-unverified.
+    apply_available=True,
+    apply_unavailable_reason="",
     restart_instruction="Restart Claude Code, then run '/mcp' to confirm.",
     security_notes=(
-        "Unrelated MCP servers in the same file are preserved untouched.",
+        "Unrelated MCP servers, sibling projects and unknown state-file "
+        "members are preserved untouched.",
         "An entry of the same name that does not launch Relinkra is treated "
         "as a conflict and never overwritten.",
+        "Claude Code 2.1+ ignores mcpServers in ~/.claude/settings.json "
+        "(verified against 2.1.220); the file stays discoverable as a "
+        "legacy location and is never the apply target.",
+        "USER scope (top-level ~/.claude.json mcpServers) is deliberately "
+        "not the target: the launch contract pins --workspace-root to one "
+        "workspace, and a user-scope entry would load into every project.",
+        "PROJECT scope (<workspace>/.mcp.json) remains available but is "
+        "approval-gated; it is not the apply target in this phase.",
     ),
 )
 
@@ -804,6 +937,11 @@ class InspectionResult:
     document: Optional[Dict[str, Any]] = None
     raw_text: Optional[str] = None
     existing_entry: Optional[Any] = None
+    #: The container that was actually read: the spec's static path, or
+    #: the workspace-resolved one when the connector declares a resolver.
+    #: Carried here so plan/check/apply read the SAME container inspect
+    #: did and can never disagree about where the registration lives.
+    container_path: Tuple[str, ...] = ()
     warnings: List[ConnectorWarning] = field(default_factory=list)
 
     def warn(self, code: str, message: str) -> None:
@@ -845,6 +983,10 @@ def inspect_connector(
     result.locations = probe(spec.locations, env)
     result.executable = find_executable(env, spec.executables)
     result.location = active_location(result.locations)
+    # Resolved up front: plan, check and apply all read this same value,
+    # so a workspace-scoped container is targeted identically whether
+    # the config parses, is missing, or has yet to be created.
+    result.container_path = container_path_for(spec, env.workspace_root)
 
     if result.location is None:
         result.discovery_status = (
@@ -904,7 +1046,7 @@ def inspect_connector(
     result.document = document
     result.discovery_status = DISCOVERY_DISCOVERED
 
-    container = _read_container(document, spec.container_path)
+    container = _read_container(document, result.container_path)
     if container is None:
         result.registration_state = REGISTRATION_ABSENT
         return result
@@ -913,8 +1055,8 @@ def inspect_connector(
         result.registration_state = REGISTRATION_UNKNOWN
         result.warn(
             "config_unsupported",
-            f"'{'.'.join(spec.container_path)}' is not an object in this "
-            "configuration.",
+            f"'{container_label(result.container_path)}' is not an object in "
+            "this configuration.",
         )
         return result
 
@@ -1104,11 +1246,12 @@ def build_plan(
     desired = spec.entry_builder(launch)
     document = inspection.document if inspection.document is not None else {}
     is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+    container_path = inspection.container_path or spec.container_path
 
     try:
         decision = decide_member(
             document,
-            spec.container_path,
+            container_path,
             MANAGED_SERVER_NAME,
             desired,
             is_managed=is_managed,
@@ -1118,7 +1261,7 @@ def build_plan(
         plan.unavailable_reason = str(exc)
         return plan
 
-    container = ".".join(spec.container_path)
+    container = container_label(container_path)
     file_exists = bool(location.exists)
     digest_precondition = (
         "target file content is unchanged since inspection"
@@ -1376,7 +1519,7 @@ def check_registration(
         try:
             decision = decide_member(
                 inspection.document,
-                spec.container_path,
+                inspection.container_path or spec.container_path,
                 MANAGED_SERVER_NAME,
                 spec.entry_builder(launch),
                 is_managed=ownership_test(

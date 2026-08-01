@@ -22,3 +22,5 @@ __pycache__/
 *.py[cod]
 
 .upstream/
+
+*.relinkra-backup*

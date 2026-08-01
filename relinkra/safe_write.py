@@ -314,6 +314,19 @@ def _current_mode(path) -> Optional[int]:
         return None
 
 
+def _target_identity(path) -> Optional[tuple]:
+    """Stable-enough identity for the final in-lock replacement gate."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return None
+    return (
+        getattr(info, "st_dev", None),
+        getattr(info, "st_ino", None),
+        getattr(info, "st_file_attributes", None),
+    )
+
+
 def safe_replace(
     path,
     text: str,
@@ -321,6 +334,7 @@ def safe_replace(
     validator: Optional[Callable[[str], None]] = None,
     expected_digest: Optional[str] = None,
     backup: bool = True,
+    before_replace_hook: Optional[Callable[[Path], None]] = None,
 ) -> WriteReceipt:
     """Replace a config file's contents, or leave it exactly as it was.
 
@@ -345,6 +359,7 @@ def safe_replace(
         if existed:
             original = read_bounded_text(target)
             digest_before = digest_text(original)
+        original_identity = _target_identity(target) if existed else None
         if expected_digest is not None and digest_before != expected_digest:
             raise PreconditionError(
                 "configuration changed since it was inspected; re-run the plan"
@@ -369,6 +384,22 @@ def safe_replace(
             # the substitution the check exists to refuse. Inside the
             # try so a refusal here also discards the backup.
             assert_writable_target(target)
+            # Deterministic test hook: callers can model an external edit
+            # between backup creation and the last gate without relying on
+            # timing. It runs before the final identity/digest check.
+            if before_replace_hook is not None:
+                before_replace_hook(target)
+            assert_writable_target(target)
+            if expected_digest is not None:
+                current_before_replace = read_bounded_text(target)
+                if digest_text(current_before_replace) != expected_digest:
+                    raise PreconditionError(
+                        "configuration changed immediately before replacement; re-run the plan"
+                    )
+            if original_identity is not None and _target_identity(target) != original_identity:
+                raise PreconditionError(
+                    "configuration target identity changed immediately before replacement; re-run the plan"
+                )
             atomic_write_text(target, text, mode=mode)
         except BaseException:
             # Nothing was replaced (atomic_write_text either replaced or
@@ -459,17 +490,30 @@ def _restore(
     3. deletion, when the file did not exist before — then the correct
        original state is ABSENT, not a half-valid file.
     """
+    expected_digest = digest_text(original) if original is not None else None
+
+    def _matches_original() -> bool:
+        if not existed:
+            return not target.exists()
+        if expected_digest is None:
+            return False
+        try:
+            return digest_text(read_bounded_text(target)) == expected_digest
+        except (OSError, SafeWriteError):
+            return False
+
     try:
         if backup_path is not None and backup_path.exists():
             _atomic_copy(backup_path, target)
-            return True
+            if _matches_original():
+                return True
         if original is not None:
             atomic_write_text(target, original, mode=mode)
-            return True
+            return _matches_original()
         if not existed:
             with contextlib.suppress(OSError):
                 os.unlink(str(target))
-            return True
+            return _matches_original()
     except OSError:
         return False
     return False

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest import mock
 
 from relinkra.config_merge import (
@@ -69,7 +69,9 @@ from relinkra.connectors import (
     build_plan,
     build_report,
     check_registration,
+    claude_project_key,
     connector_ids,
+    container_label,
     entry_tokens,
     inspect_connector,
     launch_contract_document,
@@ -158,12 +160,18 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(DEVIN_CLOUD.format_verified)
         self.assertEqual(DEVIN_CLOUD.locations, ())
 
-    def test_no_connector_may_write_in_this_phase(self):
-        # The structural guarantee behind "live host configs unmodified".
+    def test_only_claude_may_write_in_this_phase(self):
+        # R4C.1B opened the write path for Claude Code alone. Every other
+        # connector keeps the structural guarantee behind "live host
+        # configs unmodified".
         for spec in CONNECTORS:
             with self.subTest(connector=spec.connector_id):
-                self.assertFalse(spec.apply_available)
-                self.assertTrue(spec.apply_unavailable_reason)
+                if spec.connector_id == "claude":
+                    self.assertTrue(spec.apply_available)
+                    self.assertFalse(spec.apply_unavailable_reason)
+                else:
+                    self.assertFalse(spec.apply_available)
+                    self.assertTrue(spec.apply_unavailable_reason)
 
     def test_no_connector_claims_a_proven_host_launch(self):
         for spec in CONNECTORS:
@@ -357,7 +365,40 @@ class HostFixtureCase(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def claude_container_path(self):
+        """The LOCAL-scope container for this fixture's workspace."""
+        return ("projects", claude_project_key(self.workspace), "mcpServers")
+
     def claude_config(self, content):
+        """Write the Claude state file (~/.claude.json).
+
+        A dict of exactly ``{"mcpServers": ...}`` is wrapped into the
+        LOCAL-scope shape Claude Code 2.1+ actually reads —
+        ``projects[<project-key>].mcpServers`` — alongside an unknown
+        top-level member and a sibling project, so every consumer is
+        exercised against the real file shape. Anything else (raw JSON
+        text, other shapes) is written verbatim.
+        """
+        if isinstance(content, dict) and set(content) == {"mcpServers"}:
+            content = {
+                "numStartups": 7,
+                "projects": {
+                    claude_project_key(self.workspace): {
+                        "mcpServers": content["mcpServers"],
+                        "allowedTools": ["mcp__other__list"],
+                    },
+                    "/other/project": {
+                        "mcpServers": {
+                            "sibling": {"command": "npx", "args": ["-y", "sib"]}
+                        }
+                    },
+                },
+                "theme": "dark",
+            }
+        return self.write_config(".claude.json", content=content)
+
+    def legacy_settings_config(self, content):
+        """The legacy ~/.claude/settings.json — discovery-only in 2.1+."""
         return self.write_config(".claude", "settings.json", content=content)
 
     def inspect(self, spec, **kwargs):
@@ -588,7 +629,7 @@ class PlanTests(HostFixtureCase):
     def test_target_ref_is_semantic_never_a_path(self):
         self.claude_config({"mcpServers": {}})
         plan = self.plan(CLAUDE)
-        self.assertEqual(plan.target_ref, "claude:claude_user_settings")
+        self.assertEqual(plan.target_ref, "claude:claude_user_config")
         self.assertFalse(contains_absolute_path(plan.target_ref))
 
     def test_plan_output_carries_no_machine_local_value(self):
@@ -626,7 +667,9 @@ class IdempotencyTests(HostFixtureCase):
         )
         entry = CLAUDE.entry_builder(LAUNCH)
         document = parse_json_document(path.read_text(encoding="utf-8"))
-        applied = apply_member(document, CLAUDE.container_path, MANAGED_SERVER_NAME, entry)
+        applied = apply_member(
+            document, self.claude_container_path(), MANAGED_SERVER_NAME, entry
+        )
         path.write_text(serialize_json_document(applied), encoding="utf-8")
 
         plan = self.plan(CLAUDE)
@@ -634,7 +677,8 @@ class IdempotencyTests(HostFixtureCase):
         self.assertTrue(plan.idempotent)
         # The user's own server survived the simulated apply untouched.
         after = parse_json_document(path.read_text(encoding="utf-8"))
-        self.assertEqual(after["mcpServers"]["context7"], {"command": "npx", "args": ["-y", "c7"]})
+        servers = after["projects"][claude_project_key(self.workspace)]["mcpServers"]
+        self.assertEqual(servers["context7"], {"command": "npx", "args": ["-y", "c7"]})
 
     def test_two_independent_planners_agree(self):
         self.claude_config({"mcpServers": {}})
@@ -890,6 +934,106 @@ class CapabilityHonestyTests(HostFixtureCase):
         active = [loc for loc in report.locations if loc.exists][0]
         self.assertNotIn("path", active.to_dict())
         self.assertIn("path", active.to_machine_dict())
+
+
+class ClaudeProjectKeyTests(unittest.TestCase):
+    """The projects[] key normalization, verified against Claude 2.1.220."""
+
+    def test_windows_paths_get_forward_slashes_and_an_uppercase_drive(self):
+        self.assertEqual(
+            claude_project_key(r"C:\Desarrollos\relinkra"), "C:/Desarrollos/relinkra"
+        )
+        self.assertEqual(claude_project_key(r"c:\x\y"), "C:/x/y")
+
+    def test_posix_paths_pass_through_unchanged(self):
+        self.assertEqual(claude_project_key("/home/user/proj"), "/home/user/proj")
+
+    def test_trailing_separators_are_stripped(self):
+        self.assertEqual(claude_project_key("/home/user/proj/"), "/home/user/proj")
+        self.assertEqual(claude_project_key("C:/X/y/"), "C:/X/y")
+
+    def test_path_objects_and_strings_agree(self):
+        self.assertEqual(claude_project_key(PurePosixPath("/a/b")), "/a/b")
+        self.assertEqual(
+            claude_project_key(PureWindowsPath(r"D:\code\repo")), "D:/code/repo"
+        )
+
+
+class ClaudeContainerResolutionTests(HostFixtureCase):
+    def test_the_container_resolves_to_local_scope_with_a_workspace(self):
+        inspection = self.inspect(CLAUDE)
+        self.assertEqual(inspection.container_path, self.claude_container_path())
+
+    def test_the_container_falls_back_to_user_scope_without_a_workspace(self):
+        inspection = self.inspect(CLAUDE, workspace_root=None)
+        self.assertEqual(inspection.container_path, ("mcpServers",))
+
+    def test_container_labels_redact_the_project_key(self):
+        label = container_label(self.claude_container_path())
+        self.assertEqual(label, "projects.<project>.mcpServers")
+        self.assertFalse(contains_absolute_path(label))
+        self.assertEqual(container_label(("mcpServers",)), "mcpServers")
+
+    def test_plan_targets_the_state_file_local_scope(self):
+        self.claude_config({"mcpServers": {}})
+        plan = self.plan(CLAUDE)
+        self.assertEqual(plan.target_ref, "claude:claude_user_config")
+        detail = next(
+            op.detail for op in plan.operations if op.op == OP_ADD_OBJECT_MEMBER
+        )
+        self.assertIn("projects.<project>.mcpServers.relinkra", detail)
+
+    def test_plan_output_never_carries_the_project_key(self):
+        self.claude_config({"mcpServers": {}})
+        plan = self.plan(CLAUDE)
+        key = claude_project_key(self.workspace)
+        for value in iter_strings(plan.to_dict()):
+            self.assertNotIn(key, value)
+            self.assertFalse(contains_absolute_path(value), value)
+
+
+class ClaudeLegacyLocationTests(HostFixtureCase):
+    """~/.claude/settings.json is discovery-only for Claude Code 2.1+."""
+
+    RELINKRA_ENTRY = {"command": "py", "args": ["-m", SERVER_MODULE]}
+
+    def test_legacy_locations_are_marked_discovery_only(self):
+        flags = {loc.location_id: loc.discovery_only for loc in CLAUDE.locations}
+        self.assertFalse(flags["claude_user_config"])
+        self.assertTrue(flags["claude_user_settings"])
+        self.assertTrue(flags["claude_workspace_mcp"])
+        self.assertTrue(flags["claude_workspace_settings_local"])
+
+    def test_a_legacy_only_registration_never_becomes_the_active_target(self):
+        self.legacy_settings_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.RELINKRA_ENTRY}}
+        )
+        inspection = self.inspect(CLAUDE)
+        self.assertIsNone(inspection.location)
+        self.assertEqual(inspection.registration_state, REGISTRATION_ABSENT)
+        self.assertEqual(inspection.discovery_status, DISCOVERY_NOT_INSTALLED)
+
+    def test_a_legacy_entry_does_not_make_check_report_connected(self):
+        self.legacy_settings_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.RELINKRA_ENTRY}}
+        )
+        self.claude_config({"mcpServers": {}})
+        inspection = self.inspect(CLAUDE)
+        self.assertEqual(inspection.location.location_id, "claude_user_config")
+        result = check_registration(CLAUDE, inspection, LAUNCH)
+        self.assertEqual(result.registration_state, REGISTRATION_ABSENT)
+        self.assertFalse(result.valid)
+
+    def test_the_state_file_wins_over_the_legacy_file(self):
+        self.legacy_settings_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.RELINKRA_ENTRY}}
+        )
+        self.claude_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.RELINKRA_ENTRY}}
+        )
+        inspection = self.inspect(CLAUDE)
+        self.assertEqual(inspection.location.location_id, "claude_user_config")
+        self.assertEqual(inspection.registration_state, REGISTRATION_ALREADY_CONNECTED)
 
 
 if __name__ == "__main__":

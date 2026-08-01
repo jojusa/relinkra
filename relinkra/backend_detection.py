@@ -34,7 +34,9 @@ reader of someone's pasted diagnostics.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .backend_policy import (
@@ -79,6 +81,20 @@ from .backend_policy import (
     classify_metrics_trust,
     duplicate_risk_findings,
 )
+from .connect_verification import (
+    HANDOFF_ROUNDTRIP,
+    HANDSHAKE_SUCCEEDED,
+    HOST_LAUNCHED,
+    PROTOCOL_COMPATIBLE,
+    STATUS_ABSENT,
+    STATUS_EXPIRED,
+    STATUS_INVALID,
+    STATUS_STALE_FINGERPRINT,
+    STATUS_VALID,
+    TOOLS_CALLABLE,
+    TOOLS_VISIBLE,
+    assess_verification,
+)
 from .connectors import (
     CONNECTORS,
     ConnectorSpec,
@@ -87,6 +103,7 @@ from .connectors import (
     inspect_connector,
 )
 from .host_discovery import DiscoveryEnvironment
+from .safe_write import SafeWriteError, read_bounded_text
 
 #: How much of a configuration key is read AS EVIDENCE. Nothing echoes a
 #: server name (see :class:`BackendDetection`), but the name is still
@@ -455,10 +472,11 @@ def detect_registrations(inspection: InspectionResult) -> Tuple[BackendDetection
     """
     document = inspection.document
     spec = inspection.spec
-    if document is None or not spec.container_path:
+    container_path = inspection.container_path or spec.container_path
+    if document is None or not container_path:
         return ()
     node: Any = document
-    for key in spec.container_path:
+    for key in container_path:
         if not isinstance(node, Mapping):
             return ()
         node = node.get(key)
@@ -466,8 +484,18 @@ def detect_registrations(inspection: InspectionResult) -> Tuple[BackendDetection
             return ()
     if not isinstance(node, Mapping):
         return ()
+    containers = [node]
+    # Claude's top-level user-scope entries can affect the active project
+    # even when the project-local container is selected.  Inspect both
+    # effective scopes and never let the friendly key hide direct CBM.
+    if getattr(spec, "connector_id", "") == "claude":
+        top_level = document.get("mcpServers") if isinstance(document, Mapping) else None
+        if isinstance(top_level, Mapping) and top_level is not node:
+            containers.append(top_level)
     detections = [
-        classify_entry(name, entry) for name, entry in sorted(node.items(), key=str)
+        classify_entry(name, entry)
+        for container in containers
+        for name, entry in sorted(container.items(), key=str)
     ]
     # Refs are assigned here rather than in ``classify_entry`` because
     # they are positional: an entry's label only means anything relative
@@ -503,6 +531,7 @@ class HostRouting:
     detections: Tuple[BackendDetection, ...] = ()
     naming: str = NAMING_NOT_APPLICABLE
     active_location_id: str = ""
+    authoritative_scope_unreadable: bool = False
 
     def backends(self, backend: str) -> Tuple[BackendDetection, ...]:
         return tuple(
@@ -518,6 +547,7 @@ class HostRouting:
             "config_readable": self.config_readable,
             "naming": self.naming,
             "active_location_id": self.active_location_id,
+            "authoritative_scope_unreadable": self.authoritative_scope_unreadable,
             "detections": [item.to_dict() for item in self.detections],
         }
 
@@ -559,11 +589,47 @@ def survey_hosts(
     specs: Sequence[ConnectorSpec] = CONNECTORS,
 ) -> Tuple[HostRouting, ...]:
     """Read-only survey of every registered connector. Writes nothing."""
-    return tuple(
-        host_routing(spec, inspect_connector(spec, env))
-        for spec in specs
-        if spec.container_path
-    )
+    surveyed = []
+    for spec in specs:
+        if not spec.container_path:
+            continue
+        inspection = inspect_connector(spec, env)
+        host = host_routing(spec, inspection)
+        if spec.connector_id == "claude" and env.workspace_root is not None:
+            scope_path = Path(str(env.workspace_root)) / ".mcp.json"
+            if scope_path.exists():
+                unreadable = False
+                scope_detections = []
+                try:
+                    if scope_path.is_symlink() or not scope_path.is_file():
+                        raise OSError("project MCP scope is not a regular file")
+                    text = read_bounded_text(scope_path)
+                    scope_document = json.loads(text)
+                    scope_servers = (
+                        scope_document.get("mcpServers")
+                        if isinstance(scope_document, Mapping)
+                        else None
+                    )
+                    if not isinstance(scope_servers, Mapping):
+                        unreadable = True
+                    else:
+                        scope_detections = [
+                            classify_entry(name, entry)
+                            for name, entry in sorted(scope_servers.items(), key=str)
+                        ]
+                except (OSError, SafeWriteError, ValueError, TypeError, RecursionError):
+                    unreadable = True
+                host = HostRouting(
+                    connector_id=host.connector_id,
+                    discovery_status=host.discovery_status,
+                    config_readable=host.config_readable and not unreadable,
+                    detections=host.detections + tuple(scope_detections),
+                    naming=host.naming,
+                    active_location_id=host.active_location_id,
+                    authoritative_scope_unreadable=unreadable,
+                )
+        surveyed.append(host)
+    return tuple(surveyed)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +648,8 @@ def build_trust_ladder(
     handoffs_available: Optional[bool],
     tools_declared: int,
     real_host_launch_proven: bool,
+    workspace_root=None,
+    verification_fingerprint: str = "",
 ) -> TrustLadder:
     """Assemble the twelve-rung ladder from what is actually known.
 
@@ -589,11 +657,89 @@ def build_trust_ladder(
     handshake, a tool call arriving from an agent, a completed handoff
     round trip. Those cannot be established from a configuration file,
     and this phase does not launch hosts to find out — so they stay
-    unverified and render as WARN. Turning any of them into a PASS on the
-    strength of the config would be exactly the false confidence the
+    unverified and render as WARN. Turning any of them into a PASS on
+    the strength of the config would be exactly the false confidence the
     ladder exists to prevent.
+
+    When ``workspace_root`` is supplied, the six host-side rungs are
+    populated from persisted local operational evidence instead:
+    a VALID record records a rung (``valid local host evidence <timestamp>``),
+    and absent, stale or expired evidence leaves the rung UNVERIFIED
+    with the reason named. Config-side rungs keep their structural
+    behaviour either way.
     """
     configured = any(host.config_readable for host in hosts)
+
+    verification_status = ""
+    verification_record = None
+    if workspace_root is not None:
+        try:
+            verification_status, verification_record, _reasons = assess_verification(
+                workspace_root, "claude", verification_fingerprint
+            )
+        except Exception:
+            # Evidence that cannot be read is evidence that does not
+            # exist; the ladder reports unverified, never a traceback.
+            verification_status, verification_record = STATUS_ABSENT, None
+
+    def _host_stage(stage_key: str, default_value, default_evidence: str):
+        if workspace_root is None:
+            return default_value, default_evidence
+        if verification_status == STATUS_VALID and verification_record is not None:
+            stamp = verification_record.timestamp
+            if bool(verification_record.stages.get(stage_key, False)):
+                return True, f"valid local host evidence {stamp}; not independently attested"
+            return (
+                False,
+                f"local host evidence {stamp} reports this stage as not achieved",
+            )
+        note = {
+            STATUS_ABSENT: "no local host evidence has been recorded",
+            STATUS_STALE_FINGERPRINT: (
+                "the recorded local host evidence is stale: the launch contract changed"
+            ),
+            STATUS_EXPIRED: "the recorded local host evidence expired",
+            STATUS_INVALID: "the recorded local host evidence is structurally invalid",
+        }.get(verification_status, "local host evidence is unavailable")
+        return None, f"{default_evidence}; {note}"
+
+    handshake_value, handshake_evidence = _host_stage(
+        HANDSHAKE_SUCCEEDED,
+        None,
+        "no host has completed an initialize handshake with this server",
+    )
+    tools_value, tools_evidence = _host_stage(
+        TOOLS_VISIBLE,
+        bool(tools_declared),
+        f"{tools_declared} tool(s) declared and importable in this process; "
+        "visibility to an agent is a separate, unverified question",
+    )
+    callable_value, callable_evidence = _host_stage(
+        TOOLS_CALLABLE,
+        None,
+        "no tool call has arrived from a host",
+    )
+    handoff_value, handoff_evidence = _host_stage(
+        HANDOFF_ROUNDTRIP,
+        False if handoffs_available is False else None,
+        "the memory backend is unavailable, so no handoff can round-trip"
+        if handoffs_available is False
+        else "no handoff has been written and read back through a host",
+    )
+    launch_value, launch_evidence = _host_stage(
+        HOST_LAUNCHED,
+        real_host_launch_proven,
+        "a real host has launched this server"
+        if real_host_launch_proven
+        else "no real host has been observed launching this server",
+    )
+    protocol_value, protocol_evidence = _host_stage(
+        PROTOCOL_COMPATIBLE,
+        None,
+        "the host's protocol version is only observable during a "
+        "handshake, which this phase does not perform",
+    )
+
     stages = (
         TrustStage(
             STAGE_CONFIGURATION_PRESENT,
@@ -618,39 +764,33 @@ def build_trust_ladder(
         ),
         TrustStage(
             STAGE_PROTOCOL_COMPATIBLE,
-            None,
-            "the host's protocol version is only observable during a "
-            "handshake, which this phase does not perform",
+            protocol_value,
+            protocol_evidence,
         ),
         TrustStage(
             STAGE_HANDSHAKE_VERIFIED,
-            None,
-            "no host has completed an initialize handshake with this server",
+            handshake_value,
+            handshake_evidence,
         ),
         TrustStage(
             STAGE_TOOLS_VISIBLE,
-            bool(tools_declared),
-            f"{tools_declared} tool(s) declared and importable in this process; "
-            "visibility to an agent is a separate, unverified question",
+            tools_value,
+            tools_evidence,
         ),
         TrustStage(
             STAGE_REQUIRED_TOOLS_CALLABLE,
-            None,
-            "no tool call has arrived from a host",
+            callable_value,
+            callable_evidence,
         ),
         TrustStage(
             STAGE_HANDOFF_ROUND_TRIP,
-            False if handoffs_available is False else None,
-            "the memory backend is unavailable, so no handoff can round-trip"
-            if handoffs_available is False
-            else "no handoff has been written and read back through a host",
+            handoff_value,
+            handoff_evidence,
         ),
         TrustStage(
             STAGE_REAL_HOST_LAUNCH,
-            real_host_launch_proven,
-            "a real host has launched this server"
-            if real_host_launch_proven
-            else "no real host has been observed launching this server",
+            launch_value,
+            launch_evidence,
         ),
         TrustStage(
             STAGE_CONTEXT_ROUTE_MANAGED,
@@ -699,15 +839,22 @@ def assess_routing(
     handoffs_available: Optional[bool] = None,
     real_host_launch_proven: bool = False,
     tools_declared: Optional[int] = None,
+    workspace_root=None,
+    verification_fingerprint: str = "",
 ) -> RoutingAssessment:
     """Turn a host survey plus backend health into one verdict.
 
     ``relinkra_verified`` is the caller's assertion that something beyond
-    a config file was observed. Nothing in R4C.0 can supply it, which is
-    why it defaults to false and why the honest local answer today is
-    ``unverified`` rather than ``managed``.
+    a config file was independently revalidated. A persisted operator proof
+    is only local operational evidence: it may explain the ladder, but a
+    writable file must never promote route trust by itself.
     """
     relinkra_registered = any(host.backends(BACKEND_RELINKRA) for host in hosts)
+
+    # Do not derive this flag from the writable verification file.  Callers
+    # must supply independently revalidated host evidence when the route is
+    # to be trusted beyond configuration/locally-recorded evidence.
+
     cbm_hosts = [host for host in hosts if host.backends(BACKEND_CBM)]
     engram_detections = [
         item for host in hosts for item in host.backends(BACKEND_ENGRAM)
@@ -716,7 +863,7 @@ def assess_routing(
         item.confidence == DETECTION_CONFLICTING
         for host in hosts
         for item in host.detections
-    )
+    ) or any(getattr(host, "authoritative_scope_unreadable", False) for host in hosts)
 
     inputs = RouteInputs(
         hosts_inspected=sum(1 for host in hosts if host.config_readable),
@@ -804,6 +951,8 @@ def assess_routing(
                 _declared_tool_count() if tools_declared is None else tools_declared
             ),
             real_host_launch_proven=real_host_launch_proven,
+            workspace_root=workspace_root,
+            verification_fingerprint=verification_fingerprint,
         ),
         hosts=tuple(host.to_dict() for host in hosts),
         remediation=tuple(remediation),
@@ -819,6 +968,7 @@ def assess_workspace(
     launch_resolved: bool = False,
     advanced_cbm_allowed: bool = False,
     specs: Sequence[ConnectorSpec] = CONNECTORS,
+    verification_fingerprint: str = "",
 ) -> RoutingAssessment:
     """Survey the machine and assess it, reading only. The one entry point
     both ``doctor`` and ``connect routing`` call, so they cannot disagree.
@@ -841,6 +991,10 @@ def assess_workspace(
         real_host_launch_proven=any(
             getattr(spec, "real_host_launch_proven", False) for spec in specs
         ),
+        workspace_root=(
+            Path(str(env.workspace_root)) if env.workspace_root is not None else None
+        ),
+        verification_fingerprint=verification_fingerprint,
     )
 
 

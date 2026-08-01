@@ -21,7 +21,12 @@ from pathlib import Path
 
 from relinkra import connect_cli
 from relinkra.connector import MANAGED_SERVER_NAME, iter_strings
-from relinkra.connectors import CLAUDE, SERVER_MODULE, resolve_launch
+from relinkra.connectors import (
+    CLAUDE,
+    SERVER_MODULE,
+    claude_project_key,
+    resolve_launch,
+)
 from relinkra.handoff import contains_absolute_path
 from relinkra.host_discovery import (
     SYSTEM_LINUX,
@@ -147,7 +152,22 @@ class ConnectCLICase(unittest.TestCase):
         return path
 
     def claude_config(self, content):
-        return self.write_config(".claude", "settings.json", content=content)
+        """Write the Claude state file (~/.claude.json) in its real shape.
+
+        A dict of exactly ``{"mcpServers": ...}`` is wrapped into the
+        2.1+ state-file shape — ``projects[<project-key>].mcpServers``.
+        Anything else (raw strings, full documents) is written verbatim.
+        """
+        if isinstance(content, dict) and set(content) == {"mcpServers"}:
+            content = {
+                "projects": {
+                    claude_project_key(self.repo.resolve()): {
+                        "mcpServers": content["mcpServers"],
+                        "hasTrustDialogAccepted": True,
+                    }
+                }
+            }
+        return self.write_config(".claude.json", content=content)
 
     def registered_claude_entry(self):
         """The entry a correct registration for THIS machine would hold.
@@ -271,7 +291,8 @@ class PlanTests(ConnectCLICase):
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(payload["status"], "ready")
         self.assertTrue(payload["dry_run"])
-        self.assertFalse(payload["apply_available"])
+        # R4C.1B opened the write path for Claude Code.
+        self.assertTrue(payload["apply_available"])
 
     def test_conflict_needs_a_human(self):
         self.claude_config(

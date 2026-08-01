@@ -49,15 +49,78 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_cbm_wiring(
+    workspace_root: Optional[str],
+    cbm_bin: Optional[str],
+    cbm_cache_dir: Optional[str],
+    cbm_project_name: Optional[str],
+) -> tuple:
+    """Resolve CBM wiring the same way the product CLI does.
+
+    Explicit flags/environment always win. Otherwise the wiring comes
+    from the registry's workspace record plus the binary locations
+    Relinkra manages (env, the isolated workspace location, PATH) —
+    never from agent configuration. A cache record that escapes the
+    workspace root disables CBM rather than forwarding a hostile path.
+
+    Identity defaults (``--project-id``/``--workspace-id``) are NOT
+    resolved here: the production project-id requirement is unchanged.
+    """
+    from pathlib import Path
+
+    from . import cbm_support
+
+    if not workspace_root:
+        return cbm_bin, cbm_cache_dir, cbm_project_name
+    root = Path(workspace_root)
+    explicit_bin = bool(cbm_bin)
+    if not cbm_bin:
+        cbm_bin = cbm_support.resolve_cbm_binary(str(root))
+    # The registry record is keyed by the pinned workspace id; loading
+    # the workspace config only supplies that key, never tool defaults.
+    from .product_cli import WorkspaceConfig, _workspace_cbm_record
+
+    record = _workspace_cbm_record(root, WorkspaceConfig.load(root))
+    if record:
+        if not cbm_project_name:
+            raw_project_name = record.get("project_name")
+            cbm_project_name = (
+                raw_project_name.strip()
+                if isinstance(raw_project_name, str) and raw_project_name.strip()
+                else None
+            )
+        raw_cache_value = record.get("cache_dir")
+        raw_cache = raw_cache_value.strip() if isinstance(raw_cache_value, str) else ""
+        if raw_cache and not cbm_cache_dir:
+            try:
+                cbm_cache_dir = cbm_support.absolutize_against_root(
+                    str(root), raw_cache
+                )
+            except ValueError:
+                # Trust evaluation reports the invalid record explicitly;
+                # services must never pass the escaping value to CBM. The
+                # guard disables a RESOLVED binary, but an explicit flag
+                # still wins — it never came from the hostile record.
+                if not explicit_bin:
+                    cbm_bin = None
+    return cbm_bin, cbm_cache_dir, cbm_project_name
+
+
 def build_services(args) -> RelinkraServices:
+    cbm_bin, cbm_cache_dir, cbm_project_name = _resolve_cbm_wiring(
+        args.workspace_root,
+        args.cbm_bin,
+        args.cbm_cache_dir,
+        args.cbm_project_name,
+    )
     config = ServiceConfig(
         workspace_root=args.workspace_root,
         registry_path=args.registry,
         engram_bin=args.engram_bin,
         engram_project_alias=args.engram_project_alias,
-        cbm_bin=args.cbm_bin,
-        cbm_cache_dir=args.cbm_cache_dir,
-        cbm_project_name=args.cbm_project_name,
+        cbm_bin=cbm_bin,
+        cbm_cache_dir=cbm_cache_dir,
+        cbm_project_name=cbm_project_name,
         default_project_id=args.project_id,
         default_workspace_id=args.workspace_id,
     )

@@ -181,6 +181,11 @@ class ConfigLocation:
     exists: bool = False
     readable: bool = True
     size_bytes: Optional[int] = None
+    #: Legacy or approval-gated locations stay DISCOVERABLE but are never
+    #: selected as the active (and therefore apply) target. Claude Code
+    #: 2.1+ ignoring ``~/.claude/settings.json`` mcpServers is the case
+    #: that forced this flag into existence.
+    discovery_only: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -192,6 +197,7 @@ class ConfigLocation:
             "exists": self.exists,
             "readable": self.readable,
             "size_bytes": self.size_bytes,
+            "discovery_only": self.discovery_only,
         }
 
     def to_machine_dict(self) -> dict:
@@ -451,12 +457,33 @@ def iter_strings(value: Any):
     payload looking for machine-local values. Defined once here so the
     thing being audited and the thing asserting the audit cannot drift
     into two subtly different traversals.
+
+    Iterative, not recursive: an adversarially nested payload must never
+    turn the audit itself into a RecursionError.
     """
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            yield from iter_strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from iter_strings(item)
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, Mapping):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+
+
+def pinned_project_id(root) -> str:
+    """The pinned project id, best effort; empty when uninitialized.
+
+    Shared by the apply receipt and the verification record so both pin
+    the same identity for the same workspace.
+    """
+    try:
+        from pathlib import Path
+
+        from .product_cli import WorkspaceConfig
+
+        config = WorkspaceConfig.load(Path(root))
+        return config.project_id if config else ""
+    except Exception:
+        return ""

@@ -44,6 +44,25 @@ def _strip_local_diagnostics(value: Any) -> Any:
         return [_strip_local_diagnostics(v) for v in value]
     return value
 
+
+def strip_portable_cbm_labels(value: Any) -> Any:
+    """Remove internal CBM project labels from agent-facing payloads.
+
+    The label is required by the private adapter for exact CBM lookups, but
+    the Windows path-derived slug is not useful to an agent and can reveal
+    host layout even after ordinary absolute-path checks.  Internal
+    ``to_dict`` serialization keeps it; only portable output removes it.
+    """
+    if isinstance(value, dict):
+        return {
+            key: strip_portable_cbm_labels(item)
+            for key, item in value.items()
+            if key != "cbm_project_name"
+        }
+    if isinstance(value, list):
+        return [strip_portable_cbm_labels(item) for item in value]
+    return value
+
 PACKET_VERSION = "rlkctx2"
 PACKET_VERSION_V1 = "rlkctx1"
 ACCEPTED_PACKET_VERSIONS = (PACKET_VERSION_V1, PACKET_VERSION)
@@ -371,8 +390,6 @@ class ContextPacket:
                 bits.append(f"branch={ws['branch']}")
             if ws.get("head_sha"):
                 bits.append(f"head={ws['head_sha']}")
-            if ws.get("cbm_project_name"):
-                bits.append(f"cbm={ws['cbm_project_name']}")
             lines.append("- " + " ".join(bits))
         other = [
             item

@@ -539,6 +539,7 @@ class ToolBehaviourTests(MCPTestCase):
         payload = self.ok("relinkra_code_resolve", file="src/auth.py")
         self.assertEqual(payload["project_id"], self.env.project_id)
         self.assertIn("code_references", payload)
+        self.assertNotIn("cbm_project_name", json.dumps(payload))
 
     def test_handoff_create_and_get(self):
         created = self.ok(
@@ -663,7 +664,9 @@ class PortableOutputTests(MCPTestCase):
             )
 
     def test_context_packet_is_portable(self):
-        self._assert_portable(self.ok("relinkra_context_get", task="auth"))
+        payload = self.ok("relinkra_context_get", task="auth")
+        self._assert_portable(payload)
+        self.assertNotIn("cbm_project_name", json.dumps(payload))
 
     def test_health_is_portable(self):
         payload = self.ok("relinkra_health")
@@ -677,6 +680,7 @@ class PortableOutputTests(MCPTestCase):
         self._assert_portable(payload)
         self.assertNotIn("absolute_path", json.dumps(payload))
         self.assertNotIn("canonical_path", json.dumps(payload))
+        self.assertNotIn("cbm_project_name", json.dumps(payload))
 
     def test_handoff_is_portable(self):
         payload = self.ok(

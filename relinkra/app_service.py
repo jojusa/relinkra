@@ -39,7 +39,11 @@ from .context_builder import (
     ContextRequest,
     _utcnow,
 )
-from .context_packet import PACKET_VERSION, PACKET_VERSION_V1
+from .context_packet import (
+    PACKET_VERSION,
+    PACKET_VERSION_V1,
+    strip_portable_cbm_labels,
+)
 from .engram_adapter import EngramCLIAdapter
 from .git_intelligence import (
     GIT_DEFAULT_COMMITS,
@@ -348,7 +352,6 @@ class RelinkraServices:
                 "os_family": workspace.os,
                 "branch": git_info.get("branch"),
                 "head_sha": git_info.get("head_sha"),
-                "cbm_project_name": (workspace.cbm or {}).get("project_name"),
             }
         return payload
 
@@ -483,7 +486,7 @@ class RelinkraServices:
         if format == "markdown":
             payload["markdown"] = packet.to_markdown()
         else:
-            payload["packet"] = packet.to_portable_dict()
+            payload["packet"] = strip_portable_cbm_labels(packet.to_portable_dict())
         if budget_report is not None:
             payload["budget_report"] = budget_report
         return payload
@@ -635,13 +638,19 @@ class RelinkraServices:
         except (MemoryError, CodeRefError, ValueError) as exc:
             raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
 
-        references = [item.to_dict() for item in packet.code_references]
-        facts = [item.to_dict() for item in packet.code_facts]
+        references = [
+            strip_portable_cbm_labels(item.to_dict())
+            for item in packet.code_references
+        ]
+        facts = [
+            strip_portable_cbm_labels(item.to_dict())
+            for item in packet.code_facts
+        ]
         state = None
         if packet.code_references:
             state = packet.code_references[0].data.get("resolution_state")
 
-        return {
+        return strip_portable_cbm_labels({
             "project_id": project_id,
             "focus": packet.focus,
             "resolution_state": state,
@@ -651,7 +660,7 @@ class RelinkraServices:
                 item.to_dict() for item in packet.memories
             ],
             "warnings": [w.to_dict() for w in packet.warnings],
-        }
+        })
 
     def git_context(
         self,

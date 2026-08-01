@@ -154,6 +154,11 @@ class LocationSpec:
     config_format: str
     display_hint: str
     build: Callable[[DiscoveryEnvironment], Optional[PurePath]]
+    #: True for locations that may be READ as evidence but never chosen
+    #: as the active target: legacy files a renamed or re-versioned host
+    #: no longer honors, and approval-gated scopes this phase must not
+    #: write to.
+    discovery_only: bool = False
 
     @property
     def classification(self) -> str:
@@ -210,6 +215,7 @@ def probe(
                 exists=exists,
                 readable=readable,
                 size_bytes=size if exists else None,
+                discovery_only=spec.discovery_only,
             )
         )
     return tuple(results)
@@ -241,6 +247,10 @@ def active_location(locations: Sequence[ConfigLocation]) -> Optional[ConfigLocat
     the locations decides which config wins — not the order the
     filesystem happens to return.
 
+    ``discovery_only`` locations are skipped entirely: a legacy file the
+    host no longer honors must never become the active target, or the
+    apply path would write a config the host does not read.
+
     An UNREADABLE candidate counts as active even though ``exists`` is
     false for it. A denied ``stat`` cannot tell presence from absence, so
     skipping it would report the host as not installed while its config
@@ -248,6 +258,8 @@ def active_location(locations: Sequence[ConfigLocation]) -> Optional[ConfigLocat
     to reinstall instead of to ``chmod``.
     """
     for location in locations:
+        if location.discovery_only:
+            continue
         if location.exists or not location.readable:
             return location
     return None

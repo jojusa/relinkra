@@ -263,8 +263,14 @@ def _services(root: Path, config: Optional[WorkspaceConfig]) -> RelinkraServices
     cbm_cache_dir = None
     cbm_project_name = None
     if cbm_record:
-        cbm_project_name = (cbm_record.get("project_name") or "").strip() or None
-        raw_cache = (cbm_record.get("cache_dir") or "").strip()
+        raw_project_name = cbm_record.get("project_name")
+        cbm_project_name = (
+            raw_project_name.strip()
+            if isinstance(raw_project_name, str) and raw_project_name.strip()
+            else None
+        )
+        raw_cache_value = cbm_record.get("cache_dir")
+        raw_cache = raw_cache_value.strip() if isinstance(raw_cache_value, str) else ""
         if raw_cache:
             try:
                 cbm_cache_dir = cbm_support.absolutize_against_root(
@@ -766,23 +772,33 @@ def _ladder_check(ladder) -> Check:
     )
 
 
-def assess_routing_for(root: Optional[Path], resolved: "Resolved"):
+def assess_routing_for(
+    root: Optional[Path], resolved: "Resolved", *, health: Optional[dict] = None
+):
     """Build the routing assessment for a workspace. Read-only.
 
     Returns ``None`` when there is no repository to assess, so the caller
     can omit the section rather than render a verdict about nothing.
+
+    ``health`` lets the caller supply a TRUSTED deep health report (one
+    computed only after the CBM trust ladder completed); without it the
+    shallow report on ``resolved`` is used, which honestly marks an
+    unprobed CBM as degraded.
     """
     if root is None:
         return None
+    from .connector_apply import launch_fingerprint
+
     env = DiscoveryEnvironment.current(workspace_root=root)
     launch = resolve_launch(root, registry_path(root))
     return assess_workspace(
         env,
-        health=resolved.health,
+        health=health if health is not None else resolved.health,
         launch_resolved=bool(launch.resolved),
         advanced_cbm_allowed=bool(
             resolved.config is not None and resolved.config.advanced_direct_cbm
         ),
+        verification_fingerprint=launch_fingerprint(launch),
     )
 
 
@@ -1214,6 +1230,9 @@ def cmd_doctor(args) -> int:
         check_git_executable(),
         check_repository(resolved.root),
     ]
+    # Set only when services came up: the trusted deep health doctor
+    # earned through the CBM trust ladder, else the shallow report.
+    health: Optional[dict] = None
 
     if resolved.root is not None:
         checks.append(check_config(resolved.root, resolved.config))
@@ -1286,7 +1305,10 @@ def cmd_doctor(args) -> int:
     assessment = None
     if resolved.root is not None:
         try:
-            assessment = assess_routing_for(resolved.root, resolved)
+            # The trusted deep health (when the CBM trust ladder earned
+            # it) is the honest input here: routing must not call a
+            # backend "degraded" that doctor itself just proved callable.
+            assessment = assess_routing_for(resolved.root, resolved, health=health)
         except Exception as exc:  # discovery must never crash diagnostics
             assessment = None
             checks.append(

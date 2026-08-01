@@ -1,26 +1,38 @@
-"""``relinkra connect`` — the connector CLI surface (R4B).
+"""``relinkra connect`` — the connector CLI surface (R4B + R4C.1B).
 
-Five read-only commands:
+Read-only commands:
 
     connect list             known connectors and their honest state
     connect inspect <agent>  read-only discovery of one host
     connect plan <agent>     deterministic mutation plan, writes nothing
-    connect check <agent>    validate an existing registration
+    connect check <agent>    validate an existing registration, plus the
+                             persisted host-verification evidence
     connect generic          emit the host-neutral MCP launch contract
+    connect routing          report backend ownership and context routing
 
-There is deliberately NO apply command. Every safety primitive it would
-need exists and is tested (``safe_write``, ``config_merge``), but a plan
-proves a file could be edited and proves nothing about a host then
-successfully launching the server. Until that has happened against a real
-host, writing to a developer's live configuration would be asserting
-something Relinkra has not earned.
+Write commands (R4C.1B, Claude Code only):
+
+    connect apply <agent>              execute the plan against the real
+                                       host config (backup, atomic write,
+                                       rollback on validation failure)
+    connect rollback <agent>           restore the pre-apply configuration
+                                       from its backup, digest-gated
+    connect verify <agent> --proof F   record operator-supplied evidence
+                                       that the real host launched and
+                                       served Relinkra
+
+An apply edits a file; it does not launch a host. Every write command
+reports ``config_applied_host_unverified`` and points at ``check`` /
+``verify`` for the host-side truth, and no output claims readiness from
+a config file alone.
 
 Exit codes extend the R4A contract unchanged:
 
     0  the command ran and the outcome is good
     1  the command itself failed (unknown connector, not a repository)
     2  the command ran, but the outcome needs a human decision
-       (a conflict, an unavailable plan, an invalid registration)
+       (a conflict, an unavailable plan, an invalid registration, a
+       refused apply or rollback, an invalid proof)
 
 Portability is enforced rather than intended: every payload rendered
 without ``--reveal-paths`` is audited for machine-local paths immediately
@@ -36,19 +48,36 @@ from typing import Any, List, Optional, Tuple
 
 from .backend_detection import assess_workspace
 from .backend_policy import agent_instruction_document
+from .config_merge import MergeError
 from .connect_render import (
+    render_apply,
     render_check,
     render_generic,
     render_inspect,
     render_list,
     render_plan,
+    render_rollback,
     render_routing,
+    render_verify,
+)
+from .connect_verification import (
+    STATUS_VALID,
+    ProofError,
+    assess_verification,
+    build_proof_from_payload,
+    parse_proof_json,
+    record_verification,
 )
 from .connector import (
     PLAN_READY,
     ConnectorReport,
     UnknownConnectorError,
     iter_strings,
+)
+from .connector_apply import (
+    apply_connector,
+    launch_fingerprint,
+    rollback_connector,
 )
 from .connectors import (
     CONNECTORS,
@@ -62,6 +91,7 @@ from .connectors import (
 )
 from .handoff import contains_absolute_path
 from .host_discovery import DiscoveryEnvironment
+from .safe_write import SafeWriteError, read_bounded_text
 from .backend_policy import ROUTE_MANAGED
 from .product_cli import (
     EXIT_ACTION_REQUIRED,
@@ -219,8 +249,43 @@ def cmd_plan(args) -> int:
     return EXIT_ACTION_REQUIRED
 
 
+def _verification_section(root, host: str, fingerprint: str) -> dict:
+    """The persisted host-evidence view for ``check``.
+
+    Read-only and portable: statuses, stage booleans and tool names —
+    never paths, never conversation text.
+    """
+    status, record, reasons = assess_verification(root, host, fingerprint)
+    locally_verified = bool(
+        status == STATUS_VALID
+        and record is not None
+        and record.stages
+        and all(record.stages.values())
+        and record.handoff_ok
+    )
+    return {
+        "status": status,
+        "reasons": list(reasons),
+        "record": record.to_dict() if record is not None else None,
+        # A writable local file is useful operational evidence, but it is
+        # never an independent attestation of another process.  Keep the
+        # old field for JSON compatibility while making its meaning honest.
+        "evidence_class": "local_operational" if status == STATUS_VALID else "none",
+        "locally_verified": locally_verified,
+        "currently_revalidated": False,
+        "independently_attested": False,
+        "fully_verified": False,
+    }
+
+
 def cmd_check(args) -> int:
-    """Validate an existing registration without modifying it."""
+    """Validate an existing registration without modifying it.
+
+    Also reports the persisted host-verification evidence, honestly:
+    config-side validity decides the exit code, and the host side is a
+    reported state (absent/stale/expired/valid), never an inference from
+    file existence.
+    """
     try:
         spec = resolve_connector(args.agent)
     except UnknownConnectorError as exc:
@@ -238,16 +303,196 @@ def cmd_check(args) -> int:
     launch = _launch_for(root)
     inspection = inspect_connector(spec, env)
     result = check_registration(spec, inspection, launch)
+    verification = _verification_section(
+        root, spec.connector_id, launch_fingerprint(launch)
+    )
 
+    payload = result.to_dict()
+    payload["verification"] = verification
     code = _emit(
-        result.to_dict(),
-        render_check(result),
+        payload,
+        render_check(result, verification=verification),
         as_json=args.json,
         allow_paths=False,
     )
     if code != EXIT_OK:
         return code
     return EXIT_OK if result.valid else EXIT_ACTION_REQUIRED
+
+
+def _write_exit_code(result) -> int:
+    """Map an ApplyResult onto the exit-code contract.
+
+    A refusal ran fine and needs a person (2); an unexpected error is a
+    command failure (1); success — including an honest no-op — is 0.
+    """
+    if result.refused:
+        return EXIT_ACTION_REQUIRED
+    if result.error:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_apply(args) -> int:
+    """Execute the connector's plan against its real host configuration.
+
+    The output states what was inspected, whether a change was required,
+    whether a backup exists, that the host must be restarted, and that
+    real host verification has NOT occurred — in those words, because
+    a written file is precisely the evidence people over-read.
+    """
+    try:
+        spec = resolve_connector(args.agent)
+    except UnknownConnectorError as exc:
+        _fail(str(exc), "Run 'relinkra connect list' to see known connectors.")
+        return EXIT_ERROR
+
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect apply' from inside a git repository.",
+        )
+        return EXIT_ERROR
+
+    launch = _launch_for(root)
+    result = apply_connector(spec, launch, env)
+
+    reveal = bool(getattr(args, "reveal_paths", False))
+    payload = result.to_machine_dict() if reveal else result.to_dict()
+    code = _emit(
+        payload,
+        render_apply(result, reveal=reveal),
+        as_json=args.json,
+        allow_paths=reveal,
+    )
+    if code != EXIT_OK:
+        return code
+    return _write_exit_code(result)
+
+
+def cmd_rollback(args) -> int:
+    """Restore the pre-apply configuration from its backup.
+
+    Digest-gated: a file edited after the apply is never overwritten,
+    and the refusal says so with the manual recovery path.
+    """
+    try:
+        spec = resolve_connector(args.agent)
+    except UnknownConnectorError as exc:
+        _fail(str(exc), "Run 'relinkra connect list' to see known connectors.")
+        return EXIT_ERROR
+
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect rollback' from inside a git repository.",
+        )
+        return EXIT_ERROR
+
+    result = rollback_connector(spec, env, workspace_root=root)
+
+    reveal = bool(getattr(args, "reveal_paths", False))
+    payload = result.to_machine_dict() if reveal else result.to_dict()
+    code = _emit(
+        payload,
+        render_rollback(result, reveal=reveal),
+        as_json=args.json,
+        allow_paths=reveal,
+    )
+    if code != EXIT_OK:
+        return code
+    return _write_exit_code(result)
+
+
+def cmd_verify(args) -> int:
+    """Record operator-supplied proof that the real host served Relinkra.
+
+    The proof is machine-readable JSON produced from the real host. It
+    is validated whole — unknown hosts, malformed shapes, absolute
+    paths and credential-shaped keys are all refused — then persisted
+    as the single latest record, pinned to the CURRENT launch-contract
+    fingerprint so a contract change invalidates it automatically.
+    """
+    try:
+        spec = resolve_connector(args.agent)
+    except UnknownConnectorError as exc:
+        _fail(str(exc), "Run 'relinkra connect list' to see known connectors.")
+        return EXIT_ERROR
+
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect verify' from inside a git repository.",
+        )
+        return EXIT_ERROR
+    del env  # verification reads the workspace evidence store, not hosts
+
+    proof_arg = getattr(args, "proof", None)
+    if not proof_arg:
+        _fail(
+            "Missing --proof <file>.",
+            "Produce a proof JSON from the real host and pass it with --proof.",
+        )
+        return EXIT_ERROR
+
+    try:
+        # Same discipline as every config this tool reads: bounded size,
+        # BOM tolerated, adversarial nesting converted into a refusal
+        # instead of a RecursionError traceback.
+        payload = parse_proof_json(
+            read_bounded_text(proof_arg, max_bytes=64 * 1024)
+        )
+    except (OSError, SafeWriteError, MergeError, ProofError, ValueError) as exc:
+        _fail(
+            f"the proof file could not be read: {exc.__class__.__name__}",
+            "Supply a readable JSON file produced by the real host.",
+        )
+        return EXIT_ACTION_REQUIRED
+
+    launch = _launch_for(root)
+    try:
+        record = build_proof_from_payload(
+            spec.connector_id,
+            payload,
+            root=root,
+            fingerprint=launch_fingerprint(launch),
+        )
+    except ProofError as exc:
+        _fail(
+            "the proof was rejected: " + "; ".join(exc.reasons),
+            "Fix the proof payload and re-run 'relinkra connect verify'.",
+        )
+        return EXIT_ACTION_REQUIRED
+    except RecursionError:
+        _fail(
+            "the proof was rejected: nesting too deep to process safely.",
+            "Fix the proof payload and re-run 'relinkra connect verify'.",
+        )
+        return EXIT_ACTION_REQUIRED
+
+    try:
+        record_verification(root, record)
+    except ProofError as exc:
+        _fail(
+            "the proof was rejected during persistence: " + "; ".join(exc.reasons),
+            "Fix the proof payload and re-run 'relinkra connect verify'.",
+        )
+        return EXIT_ACTION_REQUIRED
+    except (OSError, SafeWriteError) as exc:
+        _fail(
+            f"the verification record could not be persisted ({exc.__class__.__name__}).",
+            "Check that .relinkra/ is writable.",
+        )
+        return EXIT_ERROR
+
+    rendered = render_verify(record, payload)
+    code = _emit(
+        record.to_dict(), rendered, as_json=args.json, allow_paths=False
+    )
+    return code
 
 
 def cmd_routing(args) -> int:
@@ -287,6 +532,7 @@ def cmd_routing(args) -> int:
             advanced_cbm_allowed=bool(
                 config is not None and config.advanced_direct_cbm
             ),
+            verification_fingerprint=launch_fingerprint(launch),
         )
     except Exception as exc:
         # Same guard ``doctor`` has, for the same reason. This command
@@ -356,6 +602,27 @@ _COMMANDS = (
         (),
     ),
     ("generic", cmd_generic, "emit the generic MCP launch contract", False, ("reveal",)),
+    (
+        "apply",
+        cmd_apply,
+        "apply the connector plan to the real host config (writes)",
+        True,
+        ("reveal",),
+    ),
+    (
+        "rollback",
+        cmd_rollback,
+        "restore the pre-apply host configuration from its backup",
+        True,
+        ("reveal",),
+    ),
+    (
+        "verify",
+        cmd_verify,
+        "record operator proof that the real host served Relinkra",
+        True,
+        ("proof",),
+    ),
 )
 
 
@@ -390,6 +657,12 @@ def register(subparsers) -> None:
                 "--dry-run",
                 action="store_true",
                 help="accepted for symmetry; planning never writes",
+            )
+        if "proof" in extras:
+            command.add_argument(
+                "--proof",
+                default=None,
+                help="path to the operator proof JSON produced by the real host",
             )
         command.set_defaults(func=handler)
 

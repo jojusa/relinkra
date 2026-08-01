@@ -252,11 +252,26 @@ def merge_entry(existing: Any, desired: Mapping[str, Any]) -> Dict[str, Any]:
     add its own bookkeeping to the entry, or the user may add a flag —
     resetting those on every run would make ``connect`` quietly
     destructive in the one place it is supposed to be idempotent.
+
+    The environment mapping merges KEY-WISE with the same precedence:
+    an operator's own variables (``DEBUG=1``) survive, and only the
+    Relinkra-managed keys (``PYTHONPATH``) are refreshed. A whole-object
+    overlay would silently delete the operator's keys on every update.
     """
     if not isinstance(existing, Mapping):
         return dict(desired)
     merged = dict(existing)
-    merged.update(dict(desired))
+    for key, value in desired.items():
+        if (
+            key in ("env", "environment")
+            and isinstance(value, Mapping)
+            and isinstance(merged.get(key), Mapping)
+        ):
+            combined = dict(merged[key])
+            combined.update(value)
+            merged[key] = combined
+        else:
+            merged[key] = value
     return merged
 
 

@@ -51,6 +51,7 @@ from relinkra.backend_policy import (
     TrustStage,
 )
 from relinkra.connector import iter_strings
+from relinkra.connectors import claude_project_key
 from relinkra.handoff import contains_absolute_path
 from relinkra.host_discovery import (
     SYSTEM_LINUX,
@@ -128,7 +129,12 @@ class RoutingCLICase(unittest.TestCase):
 
     def claude(self, servers):
         return self.write_config(
-            ".claude", "settings.json", content={"mcpServers": servers}
+            ".claude.json",
+            content={
+                "projects": {
+                    claude_project_key(self.repo.resolve()): {"mcpServers": servers}
+                }
+            },
         )
 
     def hash_home(self):
@@ -579,15 +585,36 @@ class RealMachineNonInterferenceTests(unittest.TestCase):
         self.assertEqual(self._digest(target), before)
 
     def test_the_real_machine_is_assessed_without_claiming_a_managed_route(self):
-        # Relinkra is not registered with any host on a development
-        # machine, and the diagnostics must say so rather than inferring
-        # a route from the fact that Relinkra is what is running.
+        # A managed route may only ever follow from VALID persisted
+        # operator-verification evidence — never from configuration
+        # presence or from the fact that Relinkra is what is running.
+        # After R4C.1B the development machine may legitimately hold
+        # such evidence, so the assertion is consistency, not absence:
+        # route==managed must be exactly equivalent to valid evidence.
+        from relinkra.connect_verification import (
+            STATUS_VALID,
+            assess_verification,
+        )
+        from relinkra.connector_apply import launch_fingerprint
+        from relinkra.connectors import resolve_launch
+
+        launch = resolve_launch(
+            str(self.REPO), str(self.REPO / ".relinkra" / "registry.json")
+        )
+        status, _record, _reasons = assess_verification(
+            str(self.REPO), "claude", launch_fingerprint(launch)
+        )
+        evidence_valid = status == STATUS_VALID
         payload = json.loads(self._run("connect", "routing", "--json"))
         self.assertIn(
             payload["context_route"],
             (ROUTE_UNVERIFIED, ROUTE_MIXED, ROUTE_MANAGED),
         )
-        self.assertFalse(payload["trust_ladder"]["all_proven"])
+        self.assertEqual(
+            payload["context_route"] == ROUTE_MANAGED, evidence_valid
+        )
+        if not evidence_valid:
+            self.assertFalse(payload["trust_ladder"]["all_proven"])
 
 
 if __name__ == "__main__":

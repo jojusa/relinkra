@@ -72,6 +72,7 @@ from relinkra.connectors import (
     DEVIN_DESKTOP,
     DEVIN_DESKTOP_LEGACY_LOCATIONS,
     AmbiguousConnectorError,
+    claude_project_key,
     inspect_connector,
     resolve_connector,
 )
@@ -538,10 +539,19 @@ class SurveyTests(unittest.TestCase):
         path.write_text(json.dumps(content, indent=2), encoding="utf-8")
         return path
 
-    def test_a_managed_machine_assesses_as_managed(self):
-        self.write(
-            ".claude", "settings.json", content={"mcpServers": {"relinkra": RELINKRA_ENTRY}}
+    def claude_config(self, servers):
+        """Write the Claude state file (~/.claude.json) in its real shape."""
+        return self.write(
+            ".claude.json",
+            content={
+                "projects": {
+                    claude_project_key(self.repo): {"mcpServers": servers}
+                }
+            },
         )
+
+    def test_a_managed_machine_assesses_as_managed(self):
+        self.claude_config({"relinkra": RELINKRA_ENTRY})
         assessment = assess_workspace(
             self.env(),
             health={
@@ -556,9 +566,7 @@ class SurveyTests(unittest.TestCase):
         self.assertEqual(assessment.cbm_ownership, CBM_RELINKRA_PRIVATE)
 
     def test_a_mixed_machine_is_detected_across_two_hosts(self):
-        self.write(
-            ".claude", "settings.json", content={"mcpServers": {"relinkra": RELINKRA_ENTRY}}
-        )
+        self.claude_config({"relinkra": RELINKRA_ENTRY})
         self.write(
             ".codeium",
             "windsurf",
@@ -584,7 +592,7 @@ class SurveyTests(unittest.TestCase):
         self.assertEqual(hosts["devin-desktop"].naming, NAMING_UNVERIFIED)
 
     def test_a_connector_without_legacy_locations_is_not_applicable(self):
-        self.write(".claude", "settings.json", content={"mcpServers": {}})
+        self.claude_config({})
         hosts = {host.connector_id: host for host in survey_hosts(self.env())}
         self.assertEqual(hosts["claude"].naming, NAMING_NOT_APPLICABLE)
 
@@ -594,8 +602,7 @@ class SurveyTests(unittest.TestCase):
         self.assertNotIn("devin-cloud", ids)
 
     def test_a_malformed_config_does_not_hide_the_other_hosts(self):
-        (self.home / ".claude").mkdir(parents=True, exist_ok=True)
-        (self.home / ".claude" / "settings.json").write_text("{ broken", encoding="utf-8")
+        (self.home / ".claude.json").write_text("{ broken", encoding="utf-8")
         self.write(
             ".codeium",
             "windsurf",
@@ -612,9 +619,7 @@ class SurveyTests(unittest.TestCase):
         self.assertTrue(detected)
 
     def test_the_survey_writes_nothing(self):
-        self.write(
-            ".claude", "settings.json", content={"mcpServers": {"relinkra": RELINKRA_ENTRY}}
-        )
+        self.claude_config({"relinkra": RELINKRA_ENTRY})
         before = {
             p: p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file()
         }
@@ -628,11 +633,7 @@ class SurveyTests(unittest.TestCase):
         from relinkra.handoff import contains_absolute_path
         from relinkra.connector import iter_strings
 
-        self.write(
-            ".claude",
-            "settings.json",
-            content={"mcpServers": {"cbm": CBM_ENTRY, "relinkra": RELINKRA_ENTRY}},
-        )
+        self.claude_config({"cbm": CBM_ENTRY, "relinkra": RELINKRA_ENTRY})
         payload = assess_workspace(self.env()).to_dict()
         for value in iter_strings(payload):
             self.assertFalse(contains_absolute_path(value), value)
