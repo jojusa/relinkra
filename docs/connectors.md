@@ -17,9 +17,11 @@ relinkra connect generic
 
 Powerful inside, simple outside. Everything below is the "inside".
 
-> **Status.** This phase builds and proves the connector foundation. No
-> connector writes to a host configuration, and no connector has been proven
-> against a live host launch. See [Capability honesty](#capability-honesty).
+> **Status.** Claude Code (R4C.1B) and OpenCode (R4C.1C) have a gated write
+> path (`connect apply` / `rollback` / `verify`); every other connector is
+> read-only. No connector has been independently proven against a live host
+> launch — a written config reports `config_applied_host_unverified` until
+> real host evidence is recorded. See [Capability honesty](#capability-honesty).
 
 ---
 
@@ -40,13 +42,14 @@ discover → inspect → plan → validate plan → dry-run
 | plan | `connectors.build_plan` | yes | `connect plan` |
 | validate plan | `config_merge.decide_member` | yes | `connect plan` |
 | dry-run | planning *is* the dry run | yes | `connect plan --dry-run` |
-| backup | `safe_write.create_backup` | yes | not yet |
-| atomic merge | `safe_write.safe_replace` | yes | not yet |
-| validate result | `config_merge.validate_json_text` | yes | not yet |
-| rollback | `safe_write.safe_replace` | yes | not yet |
+| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode) |
+| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode) |
+| validate result | `config_merge.validate_json_text` | yes | `connect apply` (claude, opencode) |
+| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode) |
 
-The last four rows are built and tested. They are deliberately not wired to a
-command — see [Why there is no `apply`](#why-there-is-no-apply).
+The last four rows are wired only for the connectors whose write gate is
+open; every other connector still stops at `plan` — see
+[Apply and host proof are separate](#apply-and-host-proof-are-separate).
 
 ---
 
@@ -114,8 +117,8 @@ machine — not from documentation.
 | Connector | Support | Format verified | Evidence | Plan | Apply | Host launch proven |
 | --- | --- | --- | --- | --- | --- | --- |
 | `generic` | supported | yes | Relinkra's own stdio entry point | n/a | n/a | **no** |
-| `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | **no** | **no** |
-| `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | **no** | **no** |
+| `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | yes (R4C.1B) | **no** |
+| `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | yes (R4C.1C) | **no** |
 | `codex` | experimental | yes (read) | `[mcp_servers.<name>]` TOML tables | **no** | **no** | **no** |
 | `devin-desktop` | experimental | yes (legacy file) | `mcpServers` with `{command, args}` | yes | **no** | **no** |
 | `devin-cloud` | unsupported | no | — | no | no | no |
@@ -136,7 +139,7 @@ Nothing is globbed and no directory is walked.
 | Connector | Candidates |
 | --- | --- |
 | `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
-| `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`), `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`) — the only apply target, plus `opencode.jsonc` siblings at user and workspace scope and `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` (discoverable and scanned for direct CBM, never the apply target) |
 | `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
 | `devin-desktop` | `~/.codeium/windsurf/mcp_config.json`, `~/.codeium/windsurf-next/mcp_config.json` (legacy; still discovered) |
 
@@ -191,6 +194,33 @@ enabled for no host: adding an unknown member to a config whose validation
 behaviour is unverified could break the very file Relinkra is extending. It
 stays opt-in per connector.
 
+### Cross-scope protection during apply
+
+Hosts merge MCP scopes beside (or after) the apply target: OpenCode deep-merges
+`opencode.jsonc` after `opencode.json`, and both its `%APPDATA%` user config and
+the workspace pair register servers too. Two protections follow from that.
+
+- **Shadow refusal.** An entry named `relinkra` in ANY scope the host loads —
+  whatever it launches — shadows the managed registration: which entry runs is
+  the host's merge rule, not Relinkra's. `apply` refuses and names the scope's
+  portable display hint; `check` reports the same fact as a `conflict`. Relinkra
+  never removes or overwrites another scope's entry to resolve the ambiguity.
+  The apply target's own entry is never a shadow: it is what Relinkra manages.
+- **Fail-closed scope scanning.** Every authoritative scope is scanned for
+  direct codebase-memory registration before any write. The semantics are
+  identical between the apply gate and the routing survey: a scope that exists
+  but has no MCP container (or a non-mapping container) registers no servers and
+  is *clean*; a scope that cannot be read, parsed or walked — including a
+  `.jsonc` file using comments or trailing commas, which the strict parser
+  rejects — is *unreadable* and fails closed, never reported as clean.
+
+Only scopes the connector declares are scanned. OpenCode's container is `mcp`;
+a stray top-level `mcpServers` member is an unknown field the host never honors,
+so it neither trips the gate nor is touched by the rewrite. Claude Code is the
+opposite case: its top-level `mcpServers` IS inherited beside the targeted
+project scope, so the connector declares it as an inherited container and the
+gate scans both.
+
 ### What survives a merge
 
 - Every unrelated member, byte-for-byte where the structured representation
@@ -232,7 +262,8 @@ Plan status is three-valued:
   config, unresolved launch contract, TOML host).
 
 `apply_available` is a **separate** field. A `ready` plan with
-`apply_available: false` is the normal state in this phase.
+`apply_available: false` is expected only for connectors whose write path is
+still closed; Claude Code and OpenCode currently expose apply.
 
 `connect check` decides staleness with the **same** `decide_member` engine that
 `build_plan` uses. Answering that question a second way is exactly how a `check`
@@ -323,15 +354,11 @@ The last one is `false` everywhere and cannot be set by planning. Producing a
 plan proves a file could be edited; it says nothing about a host starting the
 server afterwards.
 
-### Why there is no `apply`
+### Apply and host proof are separate
 
-Every safety primitive an `apply` needs exists and is tested. It is not wired to
-a command because the honest gate for writing to a developer's live
-configuration is a *real host launch*, not a successful merge. Until R4C
-demonstrates that, `connect plan` shows exactly what would change and the user
-applies it themselves.
-
-This is the preferable state, not a shortfall.
+Claude Code and OpenCode have gated `connect apply` paths. A successful apply
+proves only that the configuration was safely edited; `real_host_launch_proven`
+still requires a real host launch and remains a separate claim.
 
 ---
 
@@ -378,7 +405,7 @@ NEWHOST = ConnectorSpec(
     config_format=FORMAT_JSON,
     entry_builder=_string_command_entry,
     format_verified=False,            # until read from a real config
-    apply_available=False,            # until a real host launch is proven
+    apply_available=False,            # until the write path is implemented and validated
     apply_unavailable_reason="...",
     restart_instruction="...",
 )
@@ -390,7 +417,8 @@ Rules for the new spec:
 
 1. `format_verified` stays `False` until the shape is read out of a real
    configuration file. Documentation is not evidence.
-2. `apply_available` stays `False` until a real host has launched the server.
+2. `apply_available` stays `False` until the write path is implemented and
+   validated; host launch proof is tracked separately.
 3. `marker_allowed` stays `False` until that host is shown to preserve unknown
    members across a rewrite.
 4. Location `display_hint` is a declared template (`~/.foo/config.json`), never
@@ -411,5 +439,5 @@ Required before any connector may claim `real_host_launch_proven`:
 5. Only then set `real_host_launch_proven=True` for that connector, and only
    for that one.
 
-Enabling `apply_available` additionally requires the round trip — plan, write,
-restart, verify, rollback — to be demonstrated end to end.
+Enabling `apply_available` does not establish `real_host_launch_proven`; keep
+the write-path capability and host-launch proof as separate claims.

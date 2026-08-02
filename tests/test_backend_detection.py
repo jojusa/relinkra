@@ -15,6 +15,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from relinkra.backend_detection import (
@@ -265,6 +266,23 @@ class DetectRegistrationsTests(unittest.TestCase):
         first = [item.to_dict() for item in _detect(document)]
         second = [item.to_dict() for item in _detect(document)]
         self.assertEqual(first, second)
+
+    def test_declared_inherited_containers_are_generic_and_scoped(self):
+        spec = replace(
+            CLAUDE,
+            connector_id="synthetic",
+            container_path=("target",),
+            inherited_container_paths=(("inherited",),),
+        )
+        document = {
+            "target": {"relinkra": RELINKRA_ENTRY},
+            "inherited": {"cbm": CBM_ENTRY},
+            "mcpServers": {"engram": ENGRAM_ENTRY},
+        }
+
+        backends = sorted(item.backend for item in _detect(document, spec))
+
+        self.assertEqual(backends, [BACKEND_CBM, BACKEND_RELINKRA])
 
 
 # ---------------------------------------------------------------------------

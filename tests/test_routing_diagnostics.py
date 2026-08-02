@@ -385,6 +385,30 @@ class DoctorTrustTests(RoutingCLICase):
         self.assertIn("Routing notes", out)
         self.assertIn("disagrees with what it launches", out)
 
+    def test_an_unreadable_authoritative_scope_is_explained_distinctly(self):
+        # An unreadable scope used to be folded into the same note as a
+        # name/launch conflict. It is its own fact with its own action:
+        # nothing about the entry's name is known when the scope cannot
+        # be read at all.
+        self.claude({})
+        self.write_config(
+            ".config", "opencode", "opencode.jsonc",
+            content='{\n  // a jsonc comment\n  "mcp": {}\n}\n',
+        )
+        checks = self.doctor_checks()
+        self.assertEqual(checks["CBM ownership"]["status"], WARN)
+        self.assertIn("could not be read", checks["CBM ownership"]["action"])
+        self.assertNotIn("disagrees", checks["CBM ownership"]["action"])
+        _, payload = self.routing()
+        self.assertTrue(
+            any("could not be read" in note for note in payload["notes"]),
+            payload["notes"],
+        )
+        self.assertFalse(
+            any("disagrees" in note for note in payload["notes"]),
+            payload["notes"],
+        )
+
     def test_an_unrouted_backend_warning_names_the_missing_registration(self):
         self.claude({"context7": {"command": "npx", "args": ["-y", "context7-mcp"]}})
         checks = self.doctor_checks()
@@ -585,36 +609,57 @@ class RealMachineNonInterferenceTests(unittest.TestCase):
         self.assertEqual(self._digest(target), before)
 
     def test_the_real_machine_is_assessed_without_claiming_a_managed_route(self):
-        # A managed route may only ever follow from VALID persisted
-        # operator-verification evidence — never from configuration
-        # presence or from the fact that Relinkra is what is running.
-        # After R4C.1B the development machine may legitimately hold
-        # such evidence, so the assertion is consistency, not absence:
-        # route==managed must be exactly equivalent to valid evidence.
-        from relinkra.connect_verification import (
-            STATUS_VALID,
-            assess_verification,
-        )
-        from relinkra.connector_apply import launch_fingerprint
-        from relinkra.connectors import resolve_launch
+        # A managed route requires an explicit relinkra_verified flag,
+        # and the routing/doctor commands never supply it: a writable
+        # local evidence file is operational evidence, never an
+        # independent attestation of another process. So the reported
+        # route must never become managed — whether the machine holds no
+        # host evidence or VALID evidence (as this repo currently does).
+        # The evidence store is stubbed so the assertion holds identically
+        # on every machine and never reads the live store.
+        from unittest import mock
 
-        launch = resolve_launch(
-            str(self.REPO), str(self.REPO / ".relinkra" / "registry.json")
+        from relinkra.connect_verification import (
+            HANDOFF_ROUNDTRIP,
+            HANDSHAKE_SUCCEEDED,
+            HOST_LAUNCHED,
+            STATUS_ABSENT,
+            STATUS_VALID,
+            TOOLS_CALLABLE,
+            TOOLS_VISIBLE,
+            VerificationRecord,
         )
-        status, _record, _reasons = assess_verification(
-            str(self.REPO), "claude", launch_fingerprint(launch)
+
+        valid_record = VerificationRecord(
+            host="claude",
+            timestamp="2026-01-01T00:00:00+00:00",
+            registration_fingerprint="stub",
+            stages={
+                HOST_LAUNCHED: True,
+                HANDSHAKE_SUCCEEDED: True,
+                TOOLS_VISIBLE: True,
+                TOOLS_CALLABLE: True,
+                HANDOFF_ROUNDTRIP: True,
+            },
+            handoff_ok=True,
         )
-        evidence_valid = status == STATUS_VALID
-        payload = json.loads(self._run("connect", "routing", "--json"))
-        self.assertIn(
-            payload["context_route"],
-            (ROUTE_UNVERIFIED, ROUTE_MIXED, ROUTE_MANAGED),
+        cases = (
+            (STATUS_ABSENT, None),
+            (STATUS_VALID, valid_record),
         )
-        self.assertEqual(
-            payload["context_route"] == ROUTE_MANAGED, evidence_valid
-        )
-        if not evidence_valid:
-            self.assertFalse(payload["trust_ladder"]["all_proven"])
+        for status, record in cases:
+            with self.subTest(evidence=status), mock.patch(
+                "relinkra.backend_detection.assess_verification",
+                return_value=(status, record, ()),
+            ):
+                payload = json.loads(self._run("connect", "routing", "--json"))
+            self.assertIn(
+                payload["context_route"],
+                (ROUTE_UNVERIFIED, ROUTE_MIXED, ROUTE_MANAGED),
+            )
+            self.assertNotEqual(payload["context_route"], ROUTE_MANAGED)
+            if status == STATUS_ABSENT:
+                self.assertFalse(payload["trust_ladder"]["all_proven"])
 
 
 if __name__ == "__main__":

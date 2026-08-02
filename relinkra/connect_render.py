@@ -207,7 +207,7 @@ def render_plan(plan: ConnectorPlan) -> str:
     return "\n".join(lines)
 
 
-def render_check(result, verification=None) -> str:
+def render_check(result, verification=None, host_verification_sections=None) -> str:
     lines = ["", f"Check — {result.connector_id}", ""]
     matches = result.matches_workspace
     lines.extend(
@@ -230,9 +230,33 @@ def render_check(result, verification=None) -> str:
     )
     if verification is not None:
         lines.extend(_render_verification(verification))
+    if host_verification_sections:
+        lines.extend(_render_host_verification(host_verification_sections))
     lines.append("This command wrote nothing.")
     lines.append("")
     return "\n".join(lines)
+
+
+def _render_host_verification(host_verification) -> List[str]:
+    """One row per apply-capable host, each with its own evidence state.
+
+    Rendered independently on purpose: a valid record for one host must
+    never read as evidence about another, and a single collapsed boolean
+    would do exactly that.
+    """
+    lines = ["Per-host verification"]
+    for host_id, section in host_verification.items():
+        status = section.get("status", "absent")
+        locally = _yes_no(bool(section.get("locally_verified")))
+        lines.append(
+            f"  {host_id:<16}host evidence: {status}; "
+            f"locally recorded: {locally}; independently attested: no"
+        )
+        evidence_class = section.get("evidence_class", "none")
+        if evidence_class != "none":
+            lines.append(f"  {'':<16}evidence class: {evidence_class}")
+    lines.append("")
+    return lines
 
 
 def _render_verification(verification) -> List[str]:
@@ -457,6 +481,29 @@ def render_routing(assessment) -> str:
         if host.get("naming") in ("legacy", "unverified"):
             lines.append(f"     naming: {host['naming']}")
     lines.append("")
+
+    host_verification = getattr(assessment, "host_verification", ()) or ()
+    if host_verification:
+        lines.append("Per-host verification")
+        for row in host_verification:
+            stages = row.get("stages") or {}
+            stage_summary = ", ".join(
+                f"{stage}={'yes' if value else ('unverified' if value is None else 'no')}"
+                for stage, value in stages.items()
+            )
+            lines.append(f"  {row['connector_id']}")
+            lines.append(
+                f"     config present: {_yes_no(bool(row.get('config_present')))}; "
+                f"managed registration: {_yes_no(bool(row.get('managed_registration')))}"
+            )
+            lines.append(
+                f"     host evidence: {row.get('verification_status', 'absent')}; "
+                f"handoff: {'proven' if row.get('handoff_proven') else 'unverified'}; "
+                f"independently attested: no"
+            )
+            if stage_summary:
+                lines.append(f"     {stage_summary}")
+        lines.append("")
 
     lines.append("Duplicate read/write risk")
     for finding in assessment.duplicate_findings:

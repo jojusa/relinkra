@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 
 from relinkra.connector import (
@@ -166,6 +167,28 @@ class ConnectorLocationTests(unittest.TestCase):
         posix = resolved(OPENCODE.locations, posix_env())
         self.assertIsNone(posix["opencode_user_appdata"])
 
+    def test_opencode_jsonc_siblings_resolve_beside_their_json_files(self):
+        paths = resolved(OPENCODE.locations, posix_env())
+        self.assertEqual(
+            str(paths["opencode_user_config_jsonc"]),
+            "/home/dev/.config/opencode/opencode.jsonc",
+        )
+        self.assertEqual(
+            str(paths["opencode_workspace_jsonc"]),
+            "/srv/code/repo/opencode.jsonc",
+        )
+        # Both are discovery-only authoritative scopes: scanned for direct
+        # CBM, never the apply target, which stays the .json user config.
+        flags = {loc.location_id: loc for loc in OPENCODE.locations}
+        for location_id in ("opencode_user_config_jsonc", "opencode_workspace_jsonc"):
+            with self.subTest(location=location_id):
+                self.assertTrue(flags[location_id].discovery_only)
+                self.assertTrue(flags[location_id].mcp_authoritative)
+        self.assertTrue(flags["opencode_user_appdata"].discovery_only)
+        self.assertTrue(flags["opencode_user_appdata"].mcp_authoritative)
+        self.assertFalse(flags["opencode_user_config"].discovery_only)
+        self.assertFalse(flags["opencode_user_config"].mcp_authoritative)
+
     def test_codex_home_override_wins(self):
         paths = resolved(CODEX.locations, posix_env(env={"CODEX_HOME": "/opt/codex"}))
         self.assertEqual(str(paths["codex_user_config"]), "/opt/codex/config.toml")
@@ -320,6 +343,27 @@ class ProbeTests(unittest.TestCase):
         finally:
             Path.stat = real_stat
         self.assertEqual(active_location(locations).location_id, "first")
+
+    def test_opencode_appdata_candidate_is_scanned_but_never_active(self):
+        appdata = next(
+            location
+            for location in OPENCODE.locations
+            if location.location_id == "opencode_user_appdata"
+        )
+        appdata = replace(
+            appdata,
+            build=lambda env: env.home_path("appdata-opencode.json"),
+        )
+        (self.home / "appdata-opencode.json").write_text("{}", encoding="utf-8")
+        user = next(
+            location
+            for location in OPENCODE.locations
+            if location.location_id == "opencode_user_config"
+        )
+        locations = probe((user, appdata), self.env)
+        self.assertTrue(locations[1].exists)
+        self.assertTrue(locations[1].discovery_only)
+        self.assertIsNone(active_location(locations))
 
     def test_active_location_is_none_when_nothing_exists(self):
         self.assertIsNone(active_location(probe((self.spec(),), self.env)))

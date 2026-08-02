@@ -102,6 +102,7 @@ from .connectors import (
     entry_tokens,
     inspect_connector,
 )
+from .config_merge import MergeError, parse_json_document
 from .host_discovery import DiscoveryEnvironment
 from .safe_write import SafeWriteError, read_bounded_text
 
@@ -463,6 +464,20 @@ def classify_entry(server_name: Any, entry: Any) -> BackendDetection:
     )
 
 
+def entry_matches_backend(entry: Any, backend: str) -> bool:
+    """Whether an entry carries a launch marker for ``backend``.
+
+    This deliberately ignores the configured server name and confidence.
+    A mixed launch is a conflicting detection for reporting, but it still
+    contains a direct CBM route and must trip write-path safety gates.
+    """
+    tokens = entry_tokens(entry)
+    return any(
+        markers.backend == backend and bool(_matches(markers, tokens))
+        for markers in BACKEND_MARKERS
+    )
+
+
 def detect_registrations(inspection: InspectionResult) -> Tuple[BackendDetection, ...]:
     """Classify every MCP entry in one host's parsed configuration.
 
@@ -485,13 +500,21 @@ def detect_registrations(inspection: InspectionResult) -> Tuple[BackendDetection
     if not isinstance(node, Mapping):
         return ()
     containers = [node]
-    # Claude's top-level user-scope entries can affect the active project
-    # even when the project-local container is selected.  Inspect both
-    # effective scopes and never let the friendly key hide direct CBM.
-    if getattr(spec, "connector_id", "") == "claude":
-        top_level = document.get("mcpServers") if isinstance(document, Mapping) else None
-        if isinstance(top_level, Mapping) and top_level is not node:
-            containers.append(top_level)
+    # Hosts can declare containers inherited beside the selected target.
+    # Inspect each effective scope without allowing an alias of the target
+    # (or the same inherited container declared twice) to duplicate entries.
+    for inherited_path in getattr(spec, "inherited_container_paths", ()):
+        inherited: Any = document
+        for key in inherited_path:
+            if not isinstance(inherited, Mapping):
+                break
+            inherited = inherited.get(key)
+            if inherited is None:
+                break
+        if isinstance(inherited, Mapping) and not any(
+            inherited is container for container in containers
+        ):
+            containers.append(inherited)
     detections = [
         classify_entry(name, entry)
         for container in containers
@@ -584,6 +607,60 @@ def host_routing(spec: ConnectorSpec, inspection: InspectionResult) -> HostRouti
     )
 
 
+def _authoritative_scope_survey(
+    spec: ConnectorSpec, env: DiscoveryEnvironment
+) -> Tuple[Tuple[BackendDetection, ...], bool]:
+    """Cross-scope direct-CBM survey of one connector's authoritative scopes.
+
+    Reads every DECLARED location the host loads MCP servers from
+    (``mcp_authoritative``) — user and workspace scope alike, so a
+    merged-in sibling (OpenCode's ``.jsonc``) cannot hide a direct CBM
+    registration — and classifies what it finds under the connector's
+    static container path. An authoritative scope that exists but cannot
+    be read, parsed or walked is reported UNREADABLE — fail closed,
+    never "clean" — exactly like an unreadable active config. Aligned
+    with the apply scanner: a scope that exists but has no container (or
+    a non-mapping container) registers no servers, which is clean, not
+    unreadable.
+    """
+    detections: List[BackendDetection] = []
+    unreadable = False
+    for location in spec.locations:
+        if not location.mcp_authoritative:
+            continue
+        pure = location.build(env)
+        if pure is None:
+            continue
+        scope_path = Path(str(pure))
+        if not scope_path.exists():
+            continue
+        try:
+            if scope_path.is_symlink() or not scope_path.is_file():
+                raise OSError("authoritative MCP scope is not a regular file")
+            scope_document = parse_json_document(read_bounded_text(scope_path))
+        except (OSError, SafeWriteError, ValueError, TypeError, RecursionError, MergeError):
+            unreadable = True
+            continue
+        if not isinstance(scope_document, Mapping):
+            unreadable = True
+            continue
+        node: Any = scope_document
+        for key in spec.container_path:
+            if not isinstance(node, Mapping):
+                node = None
+                break
+            node = node.get(key)
+        if not isinstance(node, Mapping):
+            # The scope exists but registers no servers; that is clean,
+            # not unreadable.
+            continue
+        detections.extend(
+            classify_entry(name, entry)
+            for name, entry in sorted(node.items(), key=str)
+        )
+    return tuple(detections), unreadable
+
+
 def survey_hosts(
     env: DiscoveryEnvironment,
     specs: Sequence[ConnectorSpec] = CONNECTORS,
@@ -595,39 +672,17 @@ def survey_hosts(
             continue
         inspection = inspect_connector(spec, env)
         host = host_routing(spec, inspection)
-        if spec.connector_id == "claude" and env.workspace_root is not None:
-            scope_path = Path(str(env.workspace_root)) / ".mcp.json"
-            if scope_path.exists():
-                unreadable = False
-                scope_detections = []
-                try:
-                    if scope_path.is_symlink() or not scope_path.is_file():
-                        raise OSError("project MCP scope is not a regular file")
-                    text = read_bounded_text(scope_path)
-                    scope_document = json.loads(text)
-                    scope_servers = (
-                        scope_document.get("mcpServers")
-                        if isinstance(scope_document, Mapping)
-                        else None
-                    )
-                    if not isinstance(scope_servers, Mapping):
-                        unreadable = True
-                    else:
-                        scope_detections = [
-                            classify_entry(name, entry)
-                            for name, entry in sorted(scope_servers.items(), key=str)
-                        ]
-                except (OSError, SafeWriteError, ValueError, TypeError, RecursionError):
-                    unreadable = True
-                host = HostRouting(
-                    connector_id=host.connector_id,
-                    discovery_status=host.discovery_status,
-                    config_readable=host.config_readable and not unreadable,
-                    detections=host.detections + tuple(scope_detections),
-                    naming=host.naming,
-                    active_location_id=host.active_location_id,
-                    authoritative_scope_unreadable=unreadable,
-                )
+        scope_detections, unreadable = _authoritative_scope_survey(spec, env)
+        if scope_detections or unreadable:
+            host = HostRouting(
+                connector_id=host.connector_id,
+                discovery_status=host.discovery_status,
+                config_readable=host.config_readable and not unreadable,
+                detections=host.detections + scope_detections,
+                naming=host.naming,
+                active_location_id=host.active_location_id,
+                authoritative_scope_unreadable=unreadable,
+            )
         surveyed.append(host)
     return tuple(surveyed)
 
@@ -662,45 +717,80 @@ def build_trust_ladder(
     ladder exists to prevent.
 
     When ``workspace_root`` is supplied, the six host-side rungs are
-    populated from persisted local operational evidence instead:
-    a VALID record records a rung (``valid local host evidence <timestamp>``),
-    and absent, stale or expired evidence leaves the rung UNVERIFIED
-    with the reason named. Config-side rungs keep their structural
-    behaviour either way.
+    populated from persisted local operational evidence instead,
+    assessed independently for EVERY apply-capable connector: a VALID
+    record from at least one host records a rung (``valid local host
+    evidence (<host>) <timestamp>``), and absent, stale or expired
+    evidence leaves the rung UNVERIFIED with the reason named per host.
+    One host's missing evidence never degrades another's valid record.
+    Config-side rungs keep their structural behaviour either way.
     """
     configured = any(host.config_readable for host in hosts)
 
-    verification_status = ""
-    verification_record = None
+    # Local operational evidence is assessed PER HOST, for every
+    # connector the registry says can be written — never for one
+    # hardcoded host. A host-side rung is proven when at least one host
+    # holds VALID evidence recording that stage, and the evidence string
+    # names the host(s) providing it. One host's missing or stale
+    # evidence never degrades another host's valid evidence.
+    host_evidence: Dict[str, Tuple[str, Any]] = {}
     if workspace_root is not None:
-        try:
-            verification_status, verification_record, _reasons = assess_verification(
-                workspace_root, "claude", verification_fingerprint
-            )
-        except Exception:
-            # Evidence that cannot be read is evidence that does not
-            # exist; the ladder reports unverified, never a traceback.
-            verification_status, verification_record = STATUS_ABSENT, None
+        for spec in CONNECTORS:
+            if not spec.apply_available:
+                continue
+            try:
+                status, record, _reasons = assess_verification(
+                    workspace_root, spec.connector_id, verification_fingerprint
+                )
+            except Exception:
+                # Evidence that cannot be read is evidence that does not
+                # exist; the ladder reports unverified, never a traceback.
+                status, record = STATUS_ABSENT, None
+            host_evidence[spec.connector_id] = (status, record)
+
+    _STATUS_NOTES = {
+        STATUS_ABSENT: "no local host evidence has been recorded",
+        STATUS_STALE_FINGERPRINT: (
+            "the recorded local host evidence is stale: the launch contract changed"
+        ),
+        STATUS_EXPIRED: "the recorded local host evidence expired",
+        STATUS_INVALID: "the recorded local host evidence is structurally invalid",
+    }
 
     def _host_stage(stage_key: str, default_value, default_evidence: str):
         if workspace_root is None:
             return default_value, default_evidence
-        if verification_status == STATUS_VALID and verification_record is not None:
-            stamp = verification_record.timestamp
-            if bool(verification_record.stages.get(stage_key, False)):
-                return True, f"valid local host evidence {stamp}; not independently attested"
+        proving = []
+        reported_not_achieved = []
+        for host_id, (status, record) in host_evidence.items():
+            if status == STATUS_VALID and record is not None:
+                if bool(record.stages.get(stage_key, False)):
+                    proving.append((host_id, record.timestamp))
+                else:
+                    reported_not_achieved.append((host_id, record.timestamp))
+        if proving:
+            named = ", ".join(f"({host}) {stamp}" for host, stamp in proving)
+            return (
+                True,
+                f"valid local host evidence {named}; not independently attested",
+            )
+        if reported_not_achieved:
+            named = ", ".join(
+                f"({host}) {stamp}" for host, stamp in reported_not_achieved
+            )
             return (
                 False,
-                f"local host evidence {stamp} reports this stage as not achieved",
+                f"local host evidence {named} reports this stage as not achieved",
             )
-        note = {
-            STATUS_ABSENT: "no local host evidence has been recorded",
-            STATUS_STALE_FINGERPRINT: (
-                "the recorded local host evidence is stale: the launch contract changed"
-            ),
-            STATUS_EXPIRED: "the recorded local host evidence expired",
-            STATUS_INVALID: "the recorded local host evidence is structurally invalid",
-        }.get(verification_status, "local host evidence is unavailable")
+        if not host_evidence or all(
+            status == STATUS_ABSENT for status, _ in host_evidence.values()
+        ):
+            note = "no local host evidence has been recorded"
+        else:
+            note = "; ".join(
+                f"{host_id}: {_STATUS_NOTES.get(status, 'local host evidence is unavailable')}"
+                for host_id, (status, _record) in host_evidence.items()
+            )
         return None, f"{default_evidence}; {note}"
 
     handshake_value, handshake_evidence = _host_stage(
@@ -818,6 +908,71 @@ def build_trust_ladder(
 # ---------------------------------------------------------------------------
 
 
+def host_verification_view(
+    hosts: Sequence[HostRouting],
+    *,
+    workspace_root=None,
+    verification_fingerprint: str = "",
+) -> Tuple[dict, ...]:
+    """Per-host verification state, one portable row per apply-capable host.
+
+    Each row states INDEPENDENTLY what is known about one host: whether
+    its configuration was read, whether a managed Relinkra registration
+    was detected in it, and what the persisted local host evidence says
+    about launch, handshake, tools and handoff. Rows are never collapsed
+    into one boolean, and no row is promoted by another host's evidence.
+    """
+    if workspace_root is None:
+        return ()
+    routing_by_id = {host.connector_id: host for host in hosts}
+    rows = []
+    for spec in CONNECTORS:
+        if not spec.apply_available:
+            continue
+        host_id = spec.connector_id
+        try:
+            status, record, _reasons = assess_verification(
+                workspace_root, host_id, verification_fingerprint
+            )
+        except Exception:
+            status, record = STATUS_ABSENT, None
+        valid = status == STATUS_VALID and record is not None
+        stages = record.stages if valid else {}
+        routing = routing_by_id.get(host_id)
+        rows.append(
+            {
+                "connector_id": host_id,
+                "config_present": bool(routing and routing.config_readable),
+                "managed_registration": bool(
+                    routing and routing.backends(BACKEND_RELINKRA)
+                ),
+                "verification_status": status,
+                "stages": {
+                    stage: (bool(stages.get(stage)) if valid else None)
+                    for stage in (
+                        HOST_LAUNCHED,
+                        HANDSHAKE_SUCCEEDED,
+                        TOOLS_VISIBLE,
+                        TOOLS_CALLABLE,
+                        HANDOFF_ROUNDTRIP,
+                    )
+                },
+                "handoff_proven": (
+                    bool(record.handoff_ok) if valid else None
+                ),
+                "locally_verified": bool(
+                    valid
+                    and record.stages
+                    and all(record.stages.values())
+                    and record.handoff_ok
+                ),
+                "evidence_class": "local_operational" if valid else "none",
+                "independently_attested": False,
+            }
+        )
+    return tuple(rows)
+
+
 def _declared_tool_count() -> int:
     """How many MCP tools this installation declares. Never spawns one."""
     try:
@@ -859,11 +1014,15 @@ def assess_routing(
     engram_detections = [
         item for host in hosts for item in host.backends(BACKEND_ENGRAM)
     ]
-    conflicting = any(
+    name_conflicting = any(
         item.confidence == DETECTION_CONFLICTING
         for host in hosts
         for item in host.detections
-    ) or any(getattr(host, "authoritative_scope_unreadable", False) for host in hosts)
+    )
+    scope_unreadable = any(
+        getattr(host, "authoritative_scope_unreadable", False) for host in hosts
+    )
+    conflicting = name_conflicting or scope_unreadable
 
     inputs = RouteInputs(
         hosts_inspected=sum(1 for host in hosts if host.config_readable),
@@ -907,10 +1066,15 @@ def assess_routing(
         remediation.append(REMEDIATION_UNCLASSIFIED_ENGRAM)
 
     notes: List[str] = []
-    if conflicting:
+    if name_conflicting:
         notes.append(
             "At least one registration's name disagrees with what it launches; "
             "ownership was not inferred from the name."
+        )
+    if scope_unreadable:
+        notes.append(
+            "An authoritative MCP scope could not be read; its registrations "
+            "are unknown. Repair or remove the unreadable configuration file."
         )
     unknown = sum(
         1
@@ -955,6 +1119,11 @@ def assess_routing(
             verification_fingerprint=verification_fingerprint,
         ),
         hosts=tuple(host.to_dict() for host in hosts),
+        host_verification=host_verification_view(
+            hosts,
+            workspace_root=workspace_root,
+            verification_fingerprint=verification_fingerprint,
+        ),
         remediation=tuple(remediation),
         route_remediation=route_remediation,
         notes=tuple(notes),
@@ -1017,6 +1186,8 @@ __all__ = [
     "build_trust_ladder",
     "classify_entry",
     "detect_registrations",
+    "entry_matches_backend",
     "host_routing",
+    "host_verification_view",
     "survey_hosts",
 ]

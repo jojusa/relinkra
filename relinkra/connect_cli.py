@@ -10,7 +10,7 @@ Read-only commands:
     connect generic          emit the host-neutral MCP launch contract
     connect routing          report backend ownership and context routing
 
-Write commands (R4C.1B, Claude Code only):
+Write commands (R4C.1B Claude Code, R4C.1C OpenCode):
 
     connect apply <agent>              execute the plan against the real
                                        host config (backup, atomic write,
@@ -61,6 +61,7 @@ from .connect_render import (
     render_verify,
 )
 from .connect_verification import (
+    STATUS_ABSENT,
     STATUS_VALID,
     ProofError,
     assess_verification,
@@ -76,6 +77,7 @@ from .connector import (
 )
 from .connector_apply import (
     apply_connector,
+    authoritative_scope_status,
     launch_fingerprint,
     rollback_connector,
 )
@@ -255,7 +257,17 @@ def _verification_section(root, host: str, fingerprint: str) -> dict:
     Read-only and portable: statuses, stage booleans and tool names —
     never paths, never conversation text.
     """
-    status, record, reasons = assess_verification(root, host, fingerprint)
+    try:
+        status, record, reasons = assess_verification(root, host, fingerprint)
+    except Exception:
+        # A corrupt or undecodable evidence store must never crash
+        # ``check``: the honest state is "evidence unavailable", which is
+        # reported exactly like absent evidence, with the reason named.
+        status, record = STATUS_ABSENT, None
+        reasons = (
+            "the host evidence store could not be assessed; treating the "
+            "evidence as absent.",
+        )
     locally_verified = bool(
         status == STATUS_VALID
         and record is not None
@@ -278,13 +290,21 @@ def _verification_section(root, host: str, fingerprint: str) -> dict:
     }
 
 
+def _apply_capable_host_ids() -> Tuple[str, ...]:
+    """Connectors with an open write path, from the registry — never a
+    hardcoded list, so a newly opened connector appears everywhere the
+    per-host evidence view is rendered."""
+    return tuple(spec.connector_id for spec in CONNECTORS if spec.apply_available)
+
+
 def cmd_check(args) -> int:
     """Validate an existing registration without modifying it.
 
     Also reports the persisted host-verification evidence, honestly:
     config-side validity decides the exit code, and the host side is a
     reported state (absent/stale/expired/valid), never an inference from
-    file existence.
+    file existence. Every apply-capable host gets its own row; they are
+    never collapsed into one boolean.
     """
     try:
         spec = resolve_connector(args.agent)
@@ -302,16 +322,35 @@ def cmd_check(args) -> int:
 
     launch = _launch_for(root)
     inspection = inspect_connector(spec, env)
-    result = check_registration(spec, inspection, launch)
-    verification = _verification_section(
-        root, spec.connector_id, launch_fingerprint(launch)
+    unreadable_scope_finding, shadow_hints = authoritative_scope_status(
+        spec,
+        env,
+        target_path=inspection.location.path if inspection.location else None,
     )
+    result = check_registration(
+        spec,
+        inspection,
+        launch,
+        shadow_hints=shadow_hints,
+        authoritative_scope_finding=unreadable_scope_finding or "",
+    )
+    fingerprint = launch_fingerprint(launch)
+    verification = _verification_section(root, spec.connector_id, fingerprint)
+    host_verification = {
+        host_id: _verification_section(root, host_id, fingerprint)
+        for host_id in _apply_capable_host_ids()
+    }
 
     payload = result.to_dict()
     payload["verification"] = verification
+    payload["host_verification_sections"] = host_verification
     code = _emit(
         payload,
-        render_check(result, verification=verification),
+        render_check(
+            result,
+            verification=verification,
+            host_verification_sections=host_verification,
+        ),
         as_json=args.json,
         allow_paths=False,
     )

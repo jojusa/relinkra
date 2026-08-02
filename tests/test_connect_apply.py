@@ -502,11 +502,19 @@ class ApplyRefusalTests(ConnectApplyCase):
         self.assertTrue(path.is_symlink())
 
     def test_other_connectors_still_refuse_writes(self):
+        # R4C.1C opened the write path for OpenCode; codex and
+        # devin-desktop stay read-only.
+        self.write_config(
+            ".config", "opencode", "opencode.json", content={"mcp": {}}
+        )
         code, payload, _ = self.run_json("apply", "opencode")
-        self.assertEqual(code, EXIT_ACTION_REQUIRED)
-        self.assertTrue(payload["refusal_reason"])
-        code, _, _ = self.run_json("apply", "codex")
-        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["write_succeeded"])
+        for agent in ("codex", "devin-desktop"):
+            code, payload, _ = self.run_json("apply", agent)
+            self.assertEqual(code, EXIT_ACTION_REQUIRED, agent)
+            self.assertTrue(payload["refusal_reason"], agent)
+            self.assertFalse(payload["write_attempted"], agent)
 
 
 class ApplyFailureSemanticsTests(ConnectApplyCase):
@@ -775,6 +783,13 @@ class ClassificationTests(unittest.TestCase):
         ):
             with self.subTest(entry=entry):
                 self.assertEqual(classify_server_entry(entry), "cbm")
+
+    def test_a_mixed_relinkra_and_cbm_launch_is_classified_as_cbm(self):
+        entry = {
+            "command": "python",
+            "args": ["-m", SERVER_MODULE, "codebase-memory-mcp"],
+        }
+        self.assertEqual(classify_server_entry(entry), "cbm")
 
     def test_entries_equivalent_is_exact_for_workspace_and_interpreter(self):
         # Equivalence drives no-op vs UPDATE decisions, so it is EXACT:
@@ -1516,12 +1531,23 @@ class CriticalClosureMutationTests(ConnectApplyCase):
 
     def test_unsupported_connector_rollback_is_refused_before_discovery(self):
         result = rollback_connector(
-            relinkra_connectors.OPENCODE,
+            relinkra_connectors.CODEX,
             self.env(),
             workspace_root=self.repo,
         )
         self.assertTrue(result.refused)
         self.assertFalse(result.rollback_attempted)
+
+    def test_opencode_rollback_is_supported_and_reaches_the_receipt_gate(self):
+        # R4C.1C: rollback is no longer refused as unsupported; with no
+        # prior apply it reaches the ordinary receipt/backup gate instead.
+        result = rollback_connector(
+            relinkra_connectors.OPENCODE,
+            self.env(),
+            workspace_root=self.repo,
+        )
+        self.assertTrue(result.refused)
+        self.assertIn("no machine receipt and no backup", result.refusal_reason)
 
     def test_top_level_direct_cbm_is_detected_even_when_project_scope_is_selected(self):
         document = {
@@ -1532,6 +1558,7 @@ class CriticalClosureMutationTests(ConnectApplyCase):
             connector_apply._direct_cbm_entries(
                 document,
                 ("projects", claude_project_key(self.repo), "mcpServers"),
+                relinkra_connectors.CLAUDE.inherited_container_paths,
             ),
             0,
         )

@@ -14,7 +14,7 @@ Honesty is enforced structurally. ``format_verified`` is set only where
 the shape was read out of a real local config, and it gates whether a
 plan can be produced at all. ``apply_available`` is a second, stricter
 gate, opened per connector only when the write path exists: R4C.1B opens
-it for Claude Code alone. Even then, a successful apply proves a file
+it for Claude Code and R4C.1C extends it to OpenCode. Even then, a successful apply proves a file
 was edited and says nothing about the host launching the server
 afterwards — that evidence lives in ``connect_verification``.
 """
@@ -359,6 +359,22 @@ def launches_relinkra(entry: Any) -> bool:
     return base in (CONSOLE_SCRIPT, CONSOLE_SCRIPT + ".exe")
 
 
+def is_managed_entry(entry: Any) -> bool:
+    """Whether an entry is Relinkra-managed rather than a mixed launch.
+
+    ``launches_relinkra`` remains the tolerant launch-shape predicate used
+    by callers that only need to know what an entry starts. Ownership paths
+    must additionally reject a launch carrying a direct CBM marker.
+    """
+    if not launches_relinkra(entry):
+        return False
+    # Lazy import avoids the backend-detection module's import of this
+    # module's token flattener during module initialization.
+    from .backend_detection import BACKEND_CBM, entry_matches_backend
+
+    return not entry_matches_backend(entry, BACKEND_CBM)
+
+
 # ---------------------------------------------------------------------------
 # Entry builders — one per verified host format
 # ---------------------------------------------------------------------------
@@ -488,6 +504,12 @@ class ConnectorSpec:
     #: Called with the root (or None outside a repository); a None
     #: result falls back to the static ``container_path``.
     container_resolver: Optional[Callable[[Optional[Any]], Optional[Tuple[str, ...]]]] = None
+    #: Top-level server containers the host INHERITS alongside the
+    #: targeted one (Claude Code's top-level ``mcpServers``, inherited by
+    #: projects that do not override it). Empty for hosts whose container
+    #: is itself top-level or that have no inheritance — the direct-CBM
+    #: gate scans exactly what is declared here, never a hardcoded key.
+    inherited_container_paths: Tuple[Tuple[str, ...], ...] = ()
     config_format: str = FORMAT_JSON
     entry_builder: Optional[Callable[[LaunchContract], Dict[str, Any]]] = None
     #: True only when the shape was read out of a real configuration file.
@@ -544,6 +566,9 @@ def _claude_locations() -> Tuple[LocationSpec, ...]:
             display_hint="<workspace>/.mcp.json",
             build=lambda env: env.workspace_path(".mcp.json"),
             discovery_only=True,
+            # Approval-gated but honored: a direct CBM registration here
+            # is a live bypass, so apply and routing surveys scan it.
+            mcp_authoritative=True,
         ),
         LocationSpec(
             location_id="claude_user_settings",
@@ -565,6 +590,20 @@ def _claude_locations() -> Tuple[LocationSpec, ...]:
 
 
 def _opencode_locations() -> Tuple[LocationSpec, ...]:
+    """OpenCode's MCP configuration locations, in preference order.
+
+    Verified against the real local ``~/.config/opencode/opencode.json``:
+    the USER-scope file is the active config and the only apply target.
+    Live discovery against upstream (packages/opencode/src/config/config.ts,
+    ConfigPaths) proved OpenCode loads BOTH ``opencode.json`` AND
+    ``opencode.jsonc`` from the same directory and deep-merges them, jsonc
+    applied AFTER json so jsonc wins on conflicts — so every ``.jsonc``
+    sibling is declared here, discoverable and scanned for direct CBM, but
+    deliberately never the apply target (``discovery_only``): only the
+    ``.json`` user file is ever mutated. The workspace ``opencode.json`` /
+    ``opencode.jsonc`` pair is honored by the host as project config, so
+    both stay discoverable and CBM-scanned under the same rule.
+    """
     return (
         LocationSpec(
             location_id="opencode_user_config",
@@ -574,11 +613,25 @@ def _opencode_locations() -> Tuple[LocationSpec, ...]:
             build=lambda env: env.config_home("opencode", "opencode.json"),
         ),
         LocationSpec(
+            location_id="opencode_user_config_jsonc",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.config/opencode/opencode.jsonc",
+            build=lambda env: env.config_home("opencode", "opencode.jsonc"),
+            discovery_only=True,
+            mcp_authoritative=True,
+        ),
+        LocationSpec(
             location_id="opencode_user_appdata",
             scope=SCOPE_USER,
             config_format=FORMAT_JSON,
             display_hint="%APPDATA%/opencode/opencode.json",
             build=lambda env: env.app_data("opencode", "opencode.json"),
+            # OpenCode 1.18.11 uses ~/.config/opencode as the user config
+            # path on this host. Keep the Windows candidate discoverable and
+            # authoritative for CBM scanning, but never make it writable.
+            discovery_only=True,
+            mcp_authoritative=True,
         ),
         LocationSpec(
             location_id="opencode_workspace",
@@ -586,6 +639,17 @@ def _opencode_locations() -> Tuple[LocationSpec, ...]:
             config_format=FORMAT_JSON,
             display_hint="<workspace>/opencode.json",
             build=lambda env: env.workspace_path("opencode.json"),
+            discovery_only=True,
+            mcp_authoritative=True,
+        ),
+        LocationSpec(
+            location_id="opencode_workspace_jsonc",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/opencode.jsonc",
+            build=lambda env: env.workspace_path("opencode.jsonc"),
+            discovery_only=True,
+            mcp_authoritative=True,
         ),
     )
 
@@ -697,6 +761,9 @@ CLAUDE = ConnectorSpec(
     # (projects[<project-key>].mcpServers) whenever a workspace is known.
     container_path=("mcpServers",),
     container_resolver=_claude_container,
+    # Claude Code inherits the top-level ~/.claude.json mcpServers into
+    # projects that do not override it, so the CBM gate scans both.
+    inherited_container_paths=(("mcpServers",),),
     config_format=FORMAT_JSON,
     entry_builder=_string_command_entry,
     format_verified=True,
@@ -706,7 +773,8 @@ CLAUDE = ConnectorSpec(
         "2.1.220 state file. Empirically verified: Claude Code 2.1+ does "
         "NOT honor mcpServers from ~/.claude/settings.json."
     ),
-    # R4C.1B opens the write path for Claude Code ONLY. The apply engine
+    # R4C.1B opened the write path for Claude Code first; R4C.1C
+    # extended the same engine and gates to OpenCode. The apply engine
     # still refuses unsafe targets, conflicts and direct CBM exposure,
     # and a written config is reported as host-unverified.
     apply_available=True,
@@ -741,14 +809,53 @@ OPENCODE = ConnectorSpec(
     entry_builder=_list_command_entry,
     format_verified=True,
     format_evidence=(
-        "'mcp' object with {type: local, command: [...]} entries, read from a "
-        "real local OpenCode configuration."
+        "'mcp' object with {type: local, command: [...]} entries, read from "
+        "the real local ~/.config/opencode/opencode.json: a regular 94 KB "
+        "JSON file whose 'mcp' container holds a local entry "
+        "('engram': {type: local, command: ['engram', 'mcp', ...]}) and a "
+        "remote entry ('context7': {type: remote, url}), beside '$schema', "
+        "'agent', 'default_agent', 'permission' and 'share' top-level keys. "
+        "Verified against upstream (packages/opencode/src/config/config.ts, "
+        "ConfigPaths): OpenCode loads opencode.json AND opencode.jsonc from "
+        "the same directory and deep-merges them, jsonc applied after json "
+        "so jsonc wins on conflicts."
     ),
-    apply_available=False,
-    apply_unavailable_reason=_NO_APPLY,
+    # R4C.1C opens the write path for OpenCode, on the same engine and
+    # the same gates as Claude Code (R4C.1B): unsafe targets, conflicts
+    # and direct CBM exposure are refused, and a written config is
+    # reported as host-unverified.
+    apply_available=True,
+    apply_unavailable_reason="",
     restart_instruction="Restart OpenCode so it re-reads its configuration.",
     security_notes=(
-        "Remote (URL) MCP entries in the same file are left untouched.",
+        "Unrelated MCP entries in the same file — local ones like the "
+        "'engram' launch and remote (URL) ones like 'context7' — are "
+        "preserved untouched, as are unknown top-level and nested fields "
+        "('$schema', agents, permissions).",
+        "An entry of the same name that does not launch Relinkra is treated "
+        "as a conflict and never overwritten.",
+        "The apply target is the USER-scope 'mcp' container "
+        "(~/.config/opencode/opencode.json). The entry pins "
+        "--workspace-root/--registry to one workspace, so in other "
+        "workspaces it points at this workspace's registry — the same "
+        "documented tradeoff class as the global 'engram' entry already "
+        "present there.",
+        "OpenCode deep-merges opencode.json AND opencode.jsonc (jsonc "
+        "wins on conflicts, verified against upstream ConfigPaths). Both "
+        "are discovered and scanned for direct CBM; only the '.json' user "
+        "file is ever mutated — the '.jsonc' siblings are never written.",
+        "An entry named 'relinkra' in ANY merged-in scope (a '.jsonc' "
+        "sibling, the %APPDATA% user config or the workspace pair) shadows "
+        "the managed registration: apply refuses and check reports the "
+        "conflict, whatever that entry launches. Relinkra never removes or "
+        "overwrites another scope's entry to resolve the ambiguity.",
+        "A workspace-scope opencode.json / opencode.jsonc remains "
+        "discoverable and is scanned for direct CBM, but neither is the "
+        "apply target.",
+        "The '.jsonc' files are read with the strict JSON parser: a file "
+        "using JSONC comments or trailing commas is treated as an "
+        "unreadable authoritative scope and fails closed, never parsed "
+        "leniently.",
         "The program is written as element 0 of 'command'; no shell string is "
         "ever produced.",
     ),
@@ -1066,7 +1173,7 @@ def inspect_connector(
         return result
 
     result.existing_entry = entry
-    is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+    is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     if not is_managed(entry):
         result.registration_state = REGISTRATION_CONFLICT
         result.warn(
@@ -1245,7 +1352,7 @@ def build_plan(
 
     desired = spec.entry_builder(launch)
     document = inspection.document if inspection.document is not None else {}
-    is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+    is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     container_path = inspection.container_path or spec.container_path
 
     try:
@@ -1434,6 +1541,9 @@ def check_registration(
     spec: ConnectorSpec,
     inspection: InspectionResult,
     launch: LaunchContract,
+    *,
+    shadow_hints: Tuple[str, ...] = (),
+    authoritative_scope_finding: str = "",
 ) -> CheckResult:
     """Validate the registration that is already there, changing nothing.
 
@@ -1442,6 +1552,13 @@ def check_registration(
     is valid MCP configuration and still wrong for the user standing
     here, so it is reported as its own fact rather than folded into
     ``valid``.
+
+    ``shadow_hints`` names authoritative scopes — other than the
+    inspected target — holding an entry under the managed server name.
+    The host merges those scopes beside the target, so such an entry
+    SHADOWS the target registration at runtime: the state is reported
+    as a conflict even when the inspected file itself is clean, because
+    which entry the host runs is the host's merge rule, not Relinkra's.
     """
     result = CheckResult(
         connector_id=spec.connector_id,
@@ -1450,6 +1567,21 @@ def check_registration(
     )
     result.warnings.extend(inspection.warnings)
 
+    if authoritative_scope_finding:
+        result.registration_state = REGISTRATION_UNKNOWN
+        result.findings.append(authoritative_scope_finding)
+        return result
+
+    if shadow_hints:
+        joined = ", ".join(shadow_hints)
+        result.registration_state = REGISTRATION_CONFLICT
+        result.findings.append(
+            f"an entry named '{MANAGED_SERVER_NAME}' in {joined} shadows the "
+            "managed registration: the host merges that scope beside this "
+            "configuration, so which entry runs is the host's merge rule, "
+            "not Relinkra's."
+        )
+        return result
     if inspection.registration_state == REGISTRATION_CONFLICT:
         result.findings.append(
             f"an entry named '{MANAGED_SERVER_NAME}' exists but does not "
@@ -1523,7 +1655,7 @@ def check_registration(
                 MANAGED_SERVER_NAME,
                 spec.entry_builder(launch),
                 is_managed=ownership_test(
-                    launches_relinkra, marker_allowed=spec.marker_allowed
+                    is_managed_entry, marker_allowed=spec.marker_allowed
                 ),
             )
         except MergeError:

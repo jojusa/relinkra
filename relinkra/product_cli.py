@@ -661,7 +661,39 @@ def routing_checks(assessment) -> List[Check]:
         ),
         _ladder_check(assessment.ladder),
     ]
+    host_verification = getattr(assessment, "host_verification", ()) or ()
+    if host_verification:
+        checks.append(_host_verification_check(host_verification))
     return checks
+
+
+def _host_verification_check(host_verification) -> Check:
+    """One row summarising per-host evidence, never collapsing hosts.
+
+    Each apply-capable host's local operational evidence is assessed
+    independently; the row is PASS only when EVERY host holds valid
+    local evidence, and the detail names each host's own status so one
+    host's proof can never read as another's.
+    """
+    if all(row.get("locally_verified") for row in host_verification):
+        return Check(
+            "Host verification",
+            PASS,
+            "every apply-capable host holds valid local operational evidence; "
+            "not independently attested",
+        )
+    detail = "; ".join(
+        f"{row.get('connector_id', '?')}: {row.get('verification_status', 'absent')}"
+        for row in host_verification
+    )
+    return Check(
+        "Host verification",
+        WARN,
+        f"local host evidence per host — {detail}",
+        "Run the host, then record evidence with 'relinkra connect verify "
+        "<agent> --proof <file>'. Configuration presence is never treated "
+        "as host proof.",
+    )
 
 
 #: The two ways an ownership axis lands on ``unknown``, and what to do
@@ -678,6 +710,11 @@ _UNKNOWN_OWNERSHIP_ACTION_UNROUTED = (
     "so nothing observable owns it. Register Relinkra to bring it under the "
     "managed route."
 )
+_UNKNOWN_OWNERSHIP_ACTION_UNREADABLE = (
+    "An authoritative MCP scope could not be read, so ownership cannot be "
+    "determined. Repair or remove the unreadable configuration file; nothing "
+    "was changed."
+)
 
 
 def _ownership_action(assessment, state: str) -> str:
@@ -693,11 +730,12 @@ def _ownership_action(assessment, state: str) -> str:
     if state not in (backend_policy.CBM_UNKNOWN, backend_policy.ENGRAM_UNKNOWN):
         return ""
     conflicting = any("disagrees" in note for note in assessment.notes)
-    return (
-        _UNKNOWN_OWNERSHIP_ACTION_CONFLICT
-        if conflicting
-        else _UNKNOWN_OWNERSHIP_ACTION_UNROUTED
-    )
+    if conflicting:
+        return _UNKNOWN_OWNERSHIP_ACTION_CONFLICT
+    unreadable = any("could not be read" in note for note in assessment.notes)
+    if unreadable:
+        return _UNKNOWN_OWNERSHIP_ACTION_UNREADABLE
+    return _UNKNOWN_OWNERSHIP_ACTION_UNROUTED
 
 
 def _duplicate_detail(assessment) -> str:

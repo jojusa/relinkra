@@ -160,13 +160,14 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(DEVIN_CLOUD.format_verified)
         self.assertEqual(DEVIN_CLOUD.locations, ())
 
-    def test_only_claude_may_write_in_this_phase(self):
-        # R4C.1B opened the write path for Claude Code alone. Every other
-        # connector keeps the structural guarantee behind "live host
-        # configs unmodified".
+    def test_only_claude_and_opencode_may_write_in_this_phase(self):
+        # R4C.1B opened the write path for Claude Code; R4C.1C extended
+        # it to OpenCode. Every other connector keeps the structural
+        # guarantee behind "live host configs unmodified".
+        writable = {"claude", "opencode"}
         for spec in CONNECTORS:
             with self.subTest(connector=spec.connector_id):
-                if spec.connector_id == "claude":
+                if spec.connector_id in writable:
                     self.assertTrue(spec.apply_available)
                     self.assertFalse(spec.apply_unavailable_reason)
                 else:

@@ -159,6 +159,15 @@ class LocationSpec:
     #: no longer honors, and approval-gated scopes this phase must not
     #: write to.
     discovery_only: bool = False
+    #: True for scopes the host loads MCP servers from, so a direct
+    #: backend registration there is a live bypass route. Such a scope is
+    #: scanned for direct CBM during apply and routing surveys whether or
+    #: not it is the write target — approval-gated (``.mcp.json``),
+    #: merged-in (``opencode.jsonc``, either scope) and project-level
+    #: (``opencode.json``) scopes are authoritative exactly this way,
+    #: while files the host no longer honors for MCP
+    #: (``settings.local.json``) are not.
+    mcp_authoritative: bool = False
 
     @property
     def classification(self) -> str:

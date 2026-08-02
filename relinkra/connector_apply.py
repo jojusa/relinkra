@@ -35,9 +35,9 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
-from .backend_detection import classify_entry
+from .backend_detection import classify_entry, entry_matches_backend
 from .backend_policy import BACKEND_CBM, DETECTION_DETECTED
 from .config_merge import (
     ACTION_NO_OP,
@@ -65,12 +65,13 @@ from .connectors import (
     build_plan,
     container_path_for,
     entry_tokens,
+    is_managed_entry,
     inspect_connector,
     launch_contract_document,
     launches_relinkra,
 )
 from .handoff import contains_absolute_path, scrub_absolute_paths
-from .host_discovery import DiscoveryEnvironment
+from .host_discovery import SCOPE_WORKSPACE, DiscoveryEnvironment
 from .memory import sanitize_error
 from .registry import interprocess_lock
 from .safe_write import (
@@ -204,6 +205,11 @@ def classify_server_entry(entry: Any) -> str:
     ``backend_detection`` — one definition of "what CBM looks like",
     shared by detection and by this gate, so the two cannot drift.
     """
+    # A mixed Relinkra+CBM launch is conflicting evidence, not a managed
+    # registration. The direct-CBM marker must win before tolerant Relinkra
+    # ownership recognition, otherwise the apply gate silently accepts it.
+    if entry_matches_backend(entry, BACKEND_CBM):
+        return CLASS_CBM
     if launches_relinkra(entry):
         return CLASS_RELINKRA
     detection = classify_entry("", entry)
@@ -493,20 +499,29 @@ def _container(document: Mapping[str, Any], path: Sequence[str]) -> Any:
     return node
 
 
-def _direct_cbm_entries(document: Mapping[str, Any], container_path: Sequence[str]) -> int:
-    """Count direct CBM entries in every effective Claude JSON scope.
+def _direct_cbm_entries(
+    document: Mapping[str, Any],
+    container_path: Sequence[str],
+    inherited_container_paths: Sequence[Sequence[str]] = (),
+) -> int:
+    """Count direct CBM entries in the targeted and inherited scopes.
 
-    Claude's project-local container is not the only scope that can affect a
-    process: a top-level ``mcpServers`` registration is inherited by hosts
-    that do not override it.  The friendly key is deliberately ignored.
+    The targeted container is scanned first. Some hosts ALSO honor
+    top-level server containers that are inherited beside the targeted
+    one (Claude Code's top-level ``mcpServers``); those are scanned only
+    when the connector declares them in ``inherited_container_paths`` —
+    a host whose container is itself the top level, or that honors no
+    other scope, declares nothing and gets no extra scan. The friendly
+    key is deliberately ignored.
     """
     containers = []
     target = _container(document, container_path)
     if isinstance(target, Mapping):
         containers.append(target)
-    top_level = document.get("mcpServers") if isinstance(document, Mapping) else None
-    if isinstance(top_level, Mapping) and top_level is not target:
-        containers.append(top_level)
+    for inherited in inherited_container_paths:
+        node = _container(document, inherited)
+        if isinstance(node, Mapping) and all(node is not seen for seen in containers):
+            containers.append(node)
     return sum(
         1
         for container in containers
@@ -515,32 +530,117 @@ def _direct_cbm_entries(document: Mapping[str, Any], container_path: Sequence[st
     )
 
 
-def _workspace_scope_direct_cbm(env: DiscoveryEnvironment) -> Tuple[int, bool]:
-    """Inspect the present project ``.mcp.json`` without guessing paths.
+def _authoritative_scope_scan(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    target_path: Optional[Path] = None,
+) -> Tuple[int, Optional[Any], Tuple[str, ...]]:
+    """Scan every authoritative MCP scope beside the apply target.
 
-    Returns ``(count, readable)``.  An unreadable authoritative scope is not
-    reported as clean; callers fail closed rather than claiming direct CBM is
-    absent.
+    Iterates the spec's DECLARED locations the host loads MCP servers
+    from (``mcp_authoritative``) — never a hardcoded filename — under
+    the connector's static container path, and reports three facts:
+
+    * how many entries classify as direct CBM;
+    * the first scope that could not be read, parsed or walked
+      (unreadable scopes fail closed, never report "clean");
+    * every scope holding an entry under the managed server name — of
+      ANY class. The host merges those scopes beside (or after) the
+      apply target, so such an entry SHADOWS the managed registration
+      at runtime whatever it launches.
+
+    A scope that exists but has no container (or a non-mapping
+    container) registers no servers: that is clean, not unreadable. The
+    apply target itself is skipped: its own contents are judged
+    separately, and its managed entry is Relinkra's, not a shadow.
+
+    Returns ``(cbm_count, unreadable_location, shadow_hints)`` where the
+    hints are portable display hints, never paths.
     """
-    if env.workspace_root is None:
-        return 0, True
-    path = Path(str(env.workspace_root)) / ".mcp.json"
-    if not path.exists():
-        return 0, True
-    try:
-        if not _regular_non_reparse_file(path):
-            return 0, False
-        document = parse_json_document(read_bounded_text(path))
-    except (OSError, SafeWriteError, ValueError):
-        return 0, False
-    if not isinstance(document, Mapping):
-        return 0, False
-    container = document.get("mcpServers")
-    if not isinstance(container, Mapping):
-        return 0, True
+    count = 0
+    shadows: List[str] = []
+    target_key = (
+        os.path.normcase(os.path.normpath(str(target_path)))
+        if target_path is not None
+        else None
+    )
+    for location in spec.locations:
+        if not location.mcp_authoritative:
+            continue
+        pure = location.build(env)
+        if pure is None:
+            continue
+        path = Path(str(pure))
+        if target_key is not None and os.path.normcase(
+            os.path.normpath(str(path))
+        ) == target_key:
+            continue
+        if not path.exists():
+            continue
+        try:
+            if not _regular_non_reparse_file(path):
+                return 0, location, ()
+            document = parse_json_document(read_bounded_text(path))
+        except (OSError, SafeWriteError, ValueError, MergeError):
+            # A scope that does not parse — including a .jsonc file using
+            # comments or trailing commas, which the strict parser rejects
+            # — is unreadable, never "clean".
+            return 0, location, ()
+        if not isinstance(document, Mapping):
+            return 0, location, ()
+        container = _container(document, spec.container_path)
+        if not isinstance(container, Mapping):
+            continue
+        if MANAGED_SERVER_NAME in container:
+            shadows.append(location.display_hint)
+        count += sum(
+            1
+            for entry in container.values()
+            if classify_server_entry(entry) == CLASS_CBM
+        )
+    return count, None, tuple(shadows)
+
+
+def shadow_registration_hints(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    target_path: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """Portable hints of authoritative scopes shadowing the managed name.
+
+    Read-only. Used by ``check`` to report what ``apply`` refuses: an
+    entry under Relinkra's server name in a scope the host merges beside
+    the target configuration.
+    """
+    _count, _unreadable, shadows = _authoritative_scope_scan(
+        spec, env, target_path
+    )
+    return shadows
+
+
+def authoritative_scope_status(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    target_path: Optional[Path] = None,
+) -> Tuple[Optional[str], Tuple[str, ...]]:
+    """Return the portable unreadable-scope finding and shadow hints.
+
+    ``check`` must consume the same fail-closed authoritative-scope scan as
+    ``apply``. Keep the legacy ``shadow_registration_hints`` helper intact
+    for callers that only need shadow names.
+    """
+    _count, unreadable, shadows = _authoritative_scope_scan(
+        spec, env, target_path
+    )
+    if unreadable is None:
+        return None, shadows
+    label = "project" if unreadable.scope == SCOPE_WORKSPACE else "user"
     return (
-        sum(1 for entry in container.values() if classify_server_entry(entry) == CLASS_CBM),
-        True,
+        f"an authoritative {label} MCP scope could not be read "
+        f"({unreadable.display_hint}); refusing to claim direct CBM is absent. "
+        "Repair or remove the unreadable MCP configuration before re-running "
+        "connect check or apply.",
+        shadows,
     )
 
 
@@ -662,15 +762,39 @@ def _apply_inner(
         spec, env.workspace_root
     )
 
-    cbm_exposures = _direct_cbm_entries(document, container_path)
-    workspace_cbm_exposures, workspace_scope_readable = _workspace_scope_direct_cbm(env)
-    if not workspace_scope_readable:
+    cbm_exposures = _direct_cbm_entries(
+        document, container_path, spec.inherited_container_paths
+    )
+    scope_cbm_exposures, unreadable_location, shadow_hints = _authoritative_scope_scan(
+        spec, env, target_path=target
+    )
+    if unreadable_location is not None:
+        label = (
+            "project"
+            if unreadable_location.scope == SCOPE_WORKSPACE
+            else "user"
+        )
         return _refuse(
             result,
-            "an authoritative project MCP scope could not be read; refusing to claim direct CBM is absent.",
-            ("Repair or remove the unreadable .mcp.json, then re-run apply. Nothing was changed.",),
+            f"an authoritative {label} MCP scope could not be read "
+            f"({unreadable_location.display_hint}); refusing to claim direct CBM is absent.",
+            ("Repair or remove the unreadable MCP configuration, then re-run apply. Nothing was changed.",),
         )
-    cbm_exposures += workspace_cbm_exposures
+    if shadow_hints:
+        joined = ", ".join(shadow_hints)
+        return _refuse(
+            result,
+            f"an entry named '{MANAGED_SERVER_NAME}' in {joined} shadows the "
+            "managed registration: the host merges that scope beside the "
+            "apply target, so which entry runs is the host's merge rule, "
+            "not Relinkra's. Relinkra never removes or overwrites another "
+            "scope's entry.",
+            (
+                f"Remove or rename the '{MANAGED_SERVER_NAME}' entry in "
+                f"{joined}, then re-run 'relinkra connect apply'. Nothing was changed.",
+            ),
+        )
+    cbm_exposures += scope_cbm_exposures
     if cbm_exposures:
         result.warnings += (
             "direct_cbm_exposure: the configuration registers the "
@@ -706,7 +830,7 @@ def _apply_inner(
         return _refuse(result, reason, actions)
 
     desired = spec.entry_builder(launch)
-    is_managed = ownership_test(launches_relinkra, marker_allowed=spec.marker_allowed)
+    is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     try:
         decision = decide_member(
             document,
@@ -778,7 +902,7 @@ def _apply_inner(
             if isinstance(candidate_container, Mapping)
             else None
         )
-        if candidate_entry is None or not launches_relinkra(candidate_entry):
+        if candidate_entry is None or not is_managed_entry(candidate_entry):
             raise MergeError("the written configuration has no managed Relinkra entry")
         candidate_decision = decide_member(
             candidate_document,
@@ -820,8 +944,16 @@ def _apply_inner(
         result.rollback_succeeded = bool(exc.rolled_back)
         result.error = _sanitize(str(exc))
         result.actions = (
-            "The written content failed validation and the original file "
-            "was restored. Re-run 'relinkra connect plan' before retrying.",
+            (
+                "The written content failed validation and the original file "
+                "was restored. Re-run 'relinkra connect plan' before retrying.",
+            )
+            if exc.rolled_back
+            else (
+                "The written content failed validation and the original file "
+                "could NOT be restored; restore it from the backup before "
+                "retrying.",
+            )
         )
         return result
     except (SafeWriteError, OSError) as exc:
@@ -900,7 +1032,7 @@ def _verify_registration(
     container = _container(document, container_path)
     entry = container.get(MANAGED_SERVER_NAME) if isinstance(container, Mapping) else None
     result.registration_present = entry is not None
-    result.registration_managed = bool(entry is not None and launches_relinkra(entry))
+    result.registration_managed = bool(entry is not None and is_managed_entry(entry))
     try:
         decision = decide_member(
             document,
@@ -1191,7 +1323,7 @@ def _rollback_inner(
             if isinstance(container, Mapping)
             else None
         )
-        if not (entry is not None and launches_relinkra(entry)):
+        if not (entry is not None and is_managed_entry(entry)):
             return _refuse(
                 result,
                 "the current configuration contains no Relinkra-managed "
@@ -1277,7 +1409,7 @@ def _rollback_inner(
                 if isinstance(container_now, Mapping)
                 else None
             )
-            if not (entry_now is not None and launches_relinkra(entry_now)):
+            if not (entry_now is not None and is_managed_entry(entry_now)):
                 return _refuse(
                     result,
                     "the Relinkra-managed entry disappeared before the "
@@ -1361,7 +1493,7 @@ def _rollback_inner(
         container.get(MANAGED_SERVER_NAME) if isinstance(container, Mapping) else None
     )
     result.registration_present = entry is not None
-    result.registration_managed = bool(entry is not None and launches_relinkra(entry))
+    result.registration_managed = bool(entry is not None and is_managed_entry(entry))
     result.registration_matches_expected = False
     result.actions = (
         f"Run 'relinkra connect check {spec.connector_id}' to confirm the "
@@ -1380,8 +1512,10 @@ __all__ = [
     "STAGE_CONFIG_APPLIED_HOST_UNVERIFIED",
     "ApplyResult",
     "apply_connector",
+    "authoritative_scope_status",
     "classify_server_entry",
     "entries_equivalent",
     "launch_fingerprint",
     "rollback_connector",
+    "shadow_registration_hints",
 ]
