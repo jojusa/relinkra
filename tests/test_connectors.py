@@ -160,11 +160,12 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(DEVIN_CLOUD.format_verified)
         self.assertEqual(DEVIN_CLOUD.locations, ())
 
-    def test_only_claude_and_opencode_may_write_in_this_phase(self):
+    def test_only_claude_opencode_and_codex_may_write_in_this_phase(self):
         # R4C.1B opened the write path for Claude Code; R4C.1C extended
-        # it to OpenCode. Every other connector keeps the structural
+        # it to OpenCode; R4C.1D extended it to Codex via a scoped
+        # textual TOML editor. Every other connector keeps the structural
         # guarantee behind "live host configs unmodified".
-        writable = {"claude", "opencode"}
+        writable = {"claude", "opencode", "codex"}
         for spec in CONNECTORS:
             with self.subTest(connector=spec.connector_id):
                 if spec.connector_id in writable:
@@ -326,6 +327,40 @@ class OwnershipTests(unittest.TestCase):
         self.assertTrue(
             launches_relinkra({"command": "/opt/tools/relinkra-mcp", "args": []})
         )
+        self.assertTrue(
+            launches_relinkra(
+                {
+                    "command": r"C:\Python311\PYTHON.EXE",
+                    "args": ["-m", SERVER_MODULE],
+                }
+            )
+        )
+        self.assertTrue(
+            launches_relinkra(
+                {
+                    "command": r".\venv\Scripts\python3.12.exe",
+                    "args": ["-m", SERVER_MODULE],
+                }
+            )
+        )
+        self.assertTrue(
+            launches_relinkra({"command": "RELINKRA-MCP.EXE", "args": []})
+        )
+
+    def test_module_ownership_requires_a_python_module_launch_slot(self):
+        self.assertTrue(
+            launches_relinkra({"command": "python", "args": ["-m", SERVER_MODULE]})
+        )
+        for entry in (
+            {"command": "node", "args": ["-m", SERVER_MODULE]},
+            {"command": "python", "args": ["wrapper.py", "-m", SERVER_MODULE]},
+            {"command": "python", "args": ["-m", "relinkra.other"]},
+            {"command": "python", "args": [SERVER_MODULE]},
+            {"command": "python", "args": [SERVER_MODULE, "-m"]},
+            {"command": "python", "args": ["--", "-m", SERVER_MODULE]},
+        ):
+            with self.subTest(entry=entry):
+                self.assertFalse(launches_relinkra(entry))
 
     def test_similar_but_different_command_is_not_ours(self):
         self.assertFalse(
@@ -431,6 +466,15 @@ class DiscoveryStateTests(HostFixtureCase):
         inspection = self.inspect(CLAUDE)
         self.assertEqual(inspection.discovery_status, DISCOVERY_CONFIG_MALFORMED)
         self.assertTrue(any(w.code == "config_malformed" for w in inspection.warnings))
+
+    def test_deep_toml_recursion_is_reported_malformed_without_raising(self):
+        nested = "value = " + ("{a = " * 500) + "0" + ("}" * 500) + "\n"
+        self.write_config(".codex", "config.toml", content=nested)
+        inspection = self.inspect(CODEX)
+        self.assertEqual(inspection.discovery_status, DISCOVERY_CONFIG_MALFORMED)
+        self.assertTrue(any(w.code == "config_malformed" for w in inspection.warnings))
+        plan = self.plan(CODEX)
+        self.assertEqual(plan.status, PLAN_UNAVAILABLE)
 
     def test_opencode_permission_denied_stays_unverified(self):
         real_stat = Path.stat
@@ -592,11 +636,16 @@ class PlanTests(HostFixtureCase):
         self.assertEqual(plan.status, PLAN_UNAVAILABLE)
         self.assertIn("no local configuration file", plan.unavailable_reason)
 
-    def test_codex_stays_read_only(self):
+    def test_codex_plans_against_its_toml_container(self):
+        # R4C.1D opened the Codex write path: planning a TOML host goes
+        # through the same format-agnostic decision as JSON hosts.
         self.write_config(".codex", "config.toml", content='[mcp_servers.other]\ncommand = "x"\n')
         plan = self.plan(CODEX)
-        self.assertEqual(plan.status, PLAN_UNAVAILABLE)
-        self.assertIn("TOML", plan.unavailable_reason)
+        self.assertEqual(plan.status, PLAN_READY)
+        detail = next(
+            op.detail for op in plan.operations if op.op == OP_ADD_OBJECT_MEMBER
+        )
+        self.assertIn("mcp_servers.relinkra", detail)
 
     def test_opencode_uses_its_own_entry_shape(self):
         self.write_config(
@@ -781,7 +830,7 @@ class CheckPlanAgreementTests(HostFixtureCase):
             {
                 "mcpServers": {
                     MANAGED_SERVER_NAME: {
-                        "command": "an-older-interpreter",
+                        "command": "python3.10",
                         "args": list(LAUNCH.args),
                     }
                 }

@@ -41,7 +41,7 @@ from relinkra.connect_verification import (
     STATUS_VALID,
     assess_verification,
 )
-from relinkra.connector import MANAGED_SERVER_NAME, iter_strings
+from relinkra.connector import FORMAT_JSON, MANAGED_SERVER_NAME, iter_strings
 from relinkra.connector_apply import (
     apply_connector,
     launch_fingerprint,
@@ -62,14 +62,17 @@ from relinkra.host_discovery import (
     SYSTEM_WINDOWS,
     DiscoveryEnvironment,
 )
+from relinkra.identity import explicit_identity
 from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
     WARN,
+    WorkspaceConfig,
     main,
     registry_path,
 )
+from relinkra.registry import Registry
 from relinkra.safe_write import digest_text, read_bounded_text
 
 _SECRET = "sk-live-OPENCODE-DO-NOT-LEAK-0123456789"
@@ -90,6 +93,14 @@ class ConnectApplyOpenCodeCase(unittest.TestCase):
         self.repo = base / "repo"
         (self.repo / ".git").mkdir(parents=True)
         self.root = self.repo.resolve()
+        workspace = Registry(str(registry_path(self.repo))).register_workspace(
+            str(self.repo), explicit_identity("fixture")
+        )
+        WorkspaceConfig(
+            project_id=workspace.project_id,
+            workspace_id=workspace.workspace_id,
+        ).save(self.repo)
+        self.workspace_id = workspace.workspace_id
 
         outer = self
 
@@ -228,6 +239,7 @@ class ConnectApplyOpenCodeCase(unittest.TestCase):
 
     def valid_proof(self):
         return {
+            "workspace_id": self.workspace_id,
             "stages": {
                 "host_launched": True,
                 "handshake_succeeded": True,
@@ -624,17 +636,19 @@ class OpenCodeBackupConfinementTests(ConnectApplyOpenCodeCase):
     def test_a_post_write_validation_failure_restores_the_original(self):
         path = self.opencode_config({"mcp": {"c7": dict(_REMOTE_ENTRY)}})
         before = path.read_bytes()
-        real_validator = connector_apply.validate_json_text
+        real_adapter = connector_apply.adapter_for(FORMAT_JSON)
+        real_validate = real_adapter.validate
         calls = []
 
         def flaky_validator(text):
             calls.append(1)
             if len(calls) > 1:
                 raise ValueError("simulated post-write validation failure")
-            return real_validator(text)
+            return real_validate(text)
 
+        flaky_adapter = replace(real_adapter, validate=flaky_validator)
         with mock.patch.object(
-            connector_apply, "validate_json_text", side_effect=flaky_validator
+            connector_apply, "adapter_for", return_value=flaky_adapter
         ):
             code, payload, _ = self.run_json("apply", "opencode")
         self.assertEqual(code, EXIT_ERROR)
@@ -739,7 +753,7 @@ class OpenCodeRollbackGateTests(ConnectApplyOpenCodeCase):
         self.opencode_config({"mcp": {}})
         result = rollback_connector(OPENCODE, self.env(), workspace_root=self.repo)
         self.assertTrue(result.refused)
-        self.assertIn("no machine receipt and no backup", result.refusal_reason)
+        self.assertIn("no machine receipt", result.refusal_reason)
 
 
 class OpenCodeVerifyTests(ConnectApplyOpenCodeCase):

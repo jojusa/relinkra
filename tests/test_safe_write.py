@@ -83,6 +83,10 @@ class ReadTests(TempCase):
         self.assertEqual(digest_text("a"), digest_text("a"))
         self.assertNotEqual(digest_text("a"), digest_text("b"))
 
+    def test_security_digest_distinguishes_line_endings_and_bom(self):
+        self.assertNotEqual(digest_text("a\n"), digest_text("a\r\n"))
+        self.assertNotEqual(digest_text("a"), digest_text("\ufeffa"))
+
     def test_detect_newline(self):
         self.assertEqual(detect_newline("a\r\nb"), "\r\n")
         self.assertEqual(detect_newline("a\nb"), "\n")
@@ -197,6 +201,7 @@ class SafeReplaceTests(TempCase):
         self.assertTrue(receipt.backup_created)
         self.assertEqual(receipt.digest_before, digest_text('{"a": 1}'))
         self.assertEqual(receipt.digest_after, digest_text('{"a": 2}\n'))
+        self.assertEqual(receipt.backup_digest, digest_text('{"a": 1}'))
         self.assertEqual(json.loads(self.target.read_text(encoding="utf-8")), {"a": 2})
 
     def test_creates_an_absent_file_without_a_backup(self):

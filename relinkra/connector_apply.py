@@ -39,22 +39,17 @@ from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from .backend_detection import classify_entry, entry_matches_backend
 from .backend_policy import BACKEND_CBM, DETECTION_DETECTED
+from .config_formats import adapter_for
 from .config_merge import (
     ACTION_NO_OP,
     MergeError,
-    apply_member,
     decide_member,
-    detect_indent,
     ownership_test,
-    parse_json_document,
-    serialize_json_document,
-    validate_json_text,
 )
 from .connector import (
     DISCOVERY_CONFIG_MALFORMED,
     DISCOVERY_CONFIG_UNSUPPORTED,
     DISCOVERY_DISCOVERED,
-    FORMAT_JSON,
     MANAGED_SERVER_NAME,
     PLAN_READY,
     LaunchContract,
@@ -82,7 +77,7 @@ from .safe_write import (
     UnsafeTargetError,
     assert_writable_target,
     atomic_write_text,
-    detect_newline,
+    digest_bytes,
     digest_text,
     read_bounded_text,
     safe_replace,
@@ -367,13 +362,13 @@ def _persist_receipt(result: ApplyResult, *, backup_path: Optional[Path]) -> Non
     The receipt is what explicit rollback and check freshness read, but
     the apply itself already succeeded by the time it is written — a
     read-only state directory must not convert a good write into a
-    reported failure. Rollback then falls back to newest-backup
-    discovery.
+    reported failure. Without the receipt, a later rollback cannot
+    attribute any backup to this apply and must refuse.
     """
     if not result.workspace_root:
         result.warnings += (
             "no workspace root was resolved, so no machine receipt was "
-            "recorded; rollback will fall back to backup-file discovery",
+            "recorded; rollback cannot attribute a backup to this apply",
         )
         return
     payload = {
@@ -396,7 +391,7 @@ def _persist_receipt(result: ApplyResult, *, backup_path: Optional[Path]) -> Non
     except OSError as exc:
         result.warnings += (
             f"the machine receipt could not be recorded ({_sanitize(str(exc))}); "
-            "rollback will fall back to backup-file discovery",
+            "rollback cannot attribute a backup to this apply",
         )
 
 
@@ -438,8 +433,8 @@ def _load_receipt(root, connector_id: str) -> Optional[dict]:
             return {_INVALID_RECEIPT: "receipt backup_path is invalid"}
         return data
     except (OSError, ValueError, RecursionError, TypeError):
-        # The receipt exists but cannot be parsed.  Never fall back to a
-        # guessed sibling backup in that case.
+        # The receipt exists but cannot be parsed, so its target and
+        # provenance cannot be trusted.
         return {_INVALID_RECEIPT: "receipt is malformed or oversized"}
 
 
@@ -580,7 +575,10 @@ def _authoritative_scope_scan(
         try:
             if not _regular_non_reparse_file(path):
                 return 0, location, ()
-            document = parse_json_document(read_bounded_text(path))
+            adapter = adapter_for(location.config_format)
+            if adapter is None:
+                return 0, location, ()
+            document = adapter.parse(read_bounded_text(path))
         except (OSError, SafeWriteError, ValueError, MergeError):
             # A scope that does not parse — including a .jsonc file using
             # comments or trailing commas, which the strict parser rejects
@@ -693,7 +691,8 @@ def _apply_inner(
             ("Resolve the Relinkra installation first, then re-run apply.",),
         )
 
-    if spec.config_format != FORMAT_JSON or spec.entry_builder is None:
+    adapter = adapter_for(spec.config_format)
+    if adapter is None or spec.entry_builder is None:
         return _refuse(
             result,
             "this host's configuration format is not writable in this phase.",
@@ -720,6 +719,23 @@ def _apply_inner(
             (
                 "Repair the configuration by hand, then re-run "
                 "'relinkra connect apply'.",
+            ),
+        )
+
+    if inspection.raw_text is not None and inspection.document is None:
+        # The file was read but not parsed — today exactly one case: TOML
+        # on an interpreter without tomllib. The registration state is
+        # UNKNOWN, and writing against an unknown state would be guessing.
+        detail = next(
+            (warning.message for warning in inspection.warnings),
+            "the host configuration could not be parsed on this interpreter.",
+        )
+        return _refuse(
+            result,
+            detail,
+            (
+                "Use a Python 3.11+ interpreter to manage this host's "
+                "configuration. Nothing was changed.",
             ),
         )
 
@@ -849,7 +865,7 @@ def _apply_inner(
         # Idempotent re-apply: no backup, no write. Everything is
         # verified by re-reading instead of by trusting the inspection.
         _verify_registration(
-            result, target, container_path, desired, is_managed=is_managed
+            result, target, container_path, desired, is_managed=is_managed, adapter=adapter
         )
         result.validation_succeeded = result.registration_matches_expected
         result.verification_stage = STAGE_CONFIG_APPLIED_HOST_UNVERIFIED
@@ -860,9 +876,6 @@ def _apply_inner(
         )
         return result
 
-    merged = apply_member(
-        document, container_path, MANAGED_SERVER_NAME, decision.member
-    )
     # Newline and trailing-newline detection must look at the raw BYTES:
     # the inspection text went through universal-newline reading, which
     # has already normalized every CRLF away. Reformatting the user's
@@ -879,12 +892,19 @@ def _apply_inner(
                 f"the host configuration could not be read: {_sanitize(str(exc))}",
                 ("Fix the file permissions, then re-run apply.",),
             )
-    text = serialize_json_document(
-        merged,
-        indent=detect_indent(raw_text or ""),
-        newline=detect_newline(byte_text),
-        trailing_newline=(not byte_text) or byte_text.endswith("\n"),
-    )
+    try:
+        text = adapter.serialize_member(
+            byte_text, document, container_path, MANAGED_SERVER_NAME, decision.member
+        )
+    except MergeError as exc:
+        return _refuse(
+            result,
+            str(exc),
+            (
+                "Repair the configuration by hand, then re-run "
+                "'relinkra connect plan'. Nothing was changed.",
+            ),
+        )
     expected_digest = digest_text(raw_text) if raw_text is not None else None
 
     def _validate_written_registration(candidate: str) -> None:
@@ -894,8 +914,8 @@ def _apply_inner(
         path as a parse failure; validating only after safe_replace returned
         used to leave a semantically invalid config on disk.
         """
-        validate_json_text(candidate)
-        candidate_document = parse_json_document(candidate)
+        adapter.validate(candidate)
+        candidate_document = adapter.parse(candidate)
         candidate_container = _container(candidate_document, container_path)
         candidate_entry = (
             candidate_container.get(MANAGED_SERVER_NAME)
@@ -973,13 +993,10 @@ def _apply_inner(
     if receipt.backup_path is not None:
         result.real_backup_path = str(receipt.backup_path)
         result.backup_ref = receipt.backup_path.name
-        try:
-            result.backup_digest = digest_text(read_bounded_text(receipt.backup_path))
-        except (SafeWriteError, OSError):
-            result.backup_digest = None
+        result.backup_digest = receipt.backup_digest
 
     _verify_registration(
-        result, target, container_path, desired, is_managed=is_managed
+        result, target, container_path, desired, is_managed=is_managed, adapter=adapter
     )
     result.validation_succeeded = (
         result.registration_present and result.registration_matches_expected
@@ -1011,6 +1028,7 @@ def _verify_registration(
     desired: Any,
     *,
     is_managed,
+    adapter,
 ) -> None:
     """Re-read the file and semantically verify the Relinkra entry.
 
@@ -1023,8 +1041,8 @@ def _verify_registration(
     """
     try:
         written = read_bounded_text(target)
-        document = parse_json_document(written)
-    except (SafeWriteError, OSError, ValueError) as exc:
+        document = adapter.parse(written)
+    except (SafeWriteError, OSError, ValueError, MergeError) as exc:
         result.error = _sanitize(str(exc))
         return
     if result.digest_after is None:
@@ -1066,32 +1084,6 @@ def _backup_index(target: Path, candidate: Path) -> int:
     return -1
 
 
-def _newest_backup(target: Path) -> Optional[Path]:
-    """The newest backup sibling of ``target``, deterministically.
-
-    "Newest" is the highest collision suffix, not the mtime: timestamps
-    lie across copies and filesystems, and the suffix order is the order
-    the backups were created in.
-    """
-    try:
-        candidates = [
-            path
-            for path in target.parent.glob(target.name + BACKUP_SUFFIX + "*")
-            if _regular_non_reparse_file(path)
-        ]
-    except OSError:
-        return None
-    indexed = [
-        (index, path)
-        for path in candidates
-        for index in (_backup_index(target, path),)
-        if index >= 0
-    ]
-    if not indexed:
-        return None
-    return max(indexed, key=lambda pair: pair[0])[1]
-
-
 def rollback_connector(
     spec: ConnectorSpec, env: DiscoveryEnvironment, *, workspace_root
 ) -> ApplyResult:
@@ -1105,10 +1097,9 @@ def rollback_connector(
     our backup would be the same silent data loss the apply path refuses
     to cause.
 
-    PROVENANCE GATE. Without a receipt, a restore happens only when the
-    current file parses and still contains a structurally Relinkra-owned
-    entry — proof that what is about to be replaced is plausibly ours.
-    A file that fails that test is left alone and reported.
+    RECEIPT PROVENANCE. A missing receipt provides no attributable target,
+    backup or pre-apply state, so rollback refuses without inspecting or
+    replacing a sibling backup.
     """
     result = ApplyResult(host=spec.connector_id)
     if not spec.apply_available:
@@ -1136,15 +1127,23 @@ def _rollback_inner(
     result: ApplyResult,
 ) -> ApplyResult:
     receipt = _load_receipt(root, spec.connector_id) if root is not None else None
-    if receipt is not None and receipt.get(_INVALID_RECEIPT):
+    if receipt is None:
+        return _refuse(
+            result,
+            "no machine receipt was found, so no backup is attributable to this apply; refusing rollback.",
+            (
+                "Restore the configuration by hand from a trusted copy. "
+                "Nothing was changed.",
+            ),
+        )
+    if receipt.get(_INVALID_RECEIPT):
         return _refuse(
             result,
             "the machine receipt is malformed or unsupported; refusing to guess a target or backup.",
             ("Remove the stale receipt and restore the configuration by hand. Nothing was changed.",),
         )
-    if receipt is not None:
-        fingerprint = str(receipt.get("launch_fingerprint") or "")
-        result.launch_fingerprint = fingerprint
+    fingerprint = str(receipt.get("launch_fingerprint") or "")
+    result.launch_fingerprint = fingerprint
 
     inspection = inspect_connector(spec, env)
     location = _preferred_location(spec, inspection)
@@ -1162,7 +1161,29 @@ def _rollback_inner(
             ("Nothing was changed.",),
         )
     result.discovered = inspection.discovery_status == DISCOVERY_DISCOVERED
-    result.format_supported = spec.config_format == FORMAT_JSON
+    adapter = adapter_for(spec.config_format)
+    result.format_supported = adapter is not None
+    if adapter is None:
+        return _refuse(
+            result,
+            "this host's configuration format is not readable in this phase.",
+            ("Nothing was changed.",),
+        )
+    if not adapter.parser_available():
+        # A rollback re-validates the restored bytes. Without a parser
+        # that validation cannot run, and restoring blind would convert
+        # the strongest rollback guarantee into an unverified overwrite —
+        # refuse BEFORE any byte is touched.
+        return _refuse(
+            result,
+            "the parser for this host's configuration format is "
+            "unavailable on this interpreter (TOML requires Python 3.11+), "
+            "so a restored configuration could not be verified.",
+            (
+                "Use a Python 3.11+ interpreter to roll back this host's "
+                "configuration, or restore it by hand. Nothing was changed.",
+            ),
+        )
     container_path = inspection.container_path or container_path_for(
         spec, env.workspace_root
     )
@@ -1172,86 +1193,77 @@ def _rollback_inner(
     # git-ignored directory, so its target is a CLAIM, not a fact —
     # adopting it blindly would let a stale or crafted receipt aim the
     # restore (and the created-by-apply unlink) at an arbitrary file.
-    if receipt is not None:
-        recorded_target = Path(str(receipt["target_path"]))
-        if not _safe_receipt_path(recorded_target) or not _same_real_path(
-            recorded_target, target
-        ):
+    recorded_target = Path(str(receipt["target_path"]))
+    if not _safe_receipt_path(recorded_target) or not _same_real_path(
+        recorded_target, target
+    ):
+        return _refuse(
+            result,
+            "the machine receipt names a configuration target outside "
+            "this host's known locations; refusing to touch it.",
+            (
+                "Remove the stale receipt or restore by hand. "
+                "Nothing was changed.",
+            ),
+        )
+    if receipt.get("workspace_root") != str(root.resolve() if root else ""):
+        return _refuse(
+            result,
+            "the machine receipt belongs to another workspace; refusing rollback.",
+            ("Use the connector from the workspace that created the receipt. Nothing was changed.",),
+        )
+    project_id = _project_id_for(root) if root is not None else ""
+    if project_id and receipt.get("project_id") != project_id:
+        return _refuse(
+            result,
+            "the machine receipt belongs to another project; refusing rollback.",
+            ("Use the workspace that created the receipt. Nothing was changed.",),
+        )
+
+    # Only the backup named by the receipt is acceptable. Silently
+    # substituting a sibling could restore bytes from a different apply.
+    backup: Optional[Path] = None
+    if receipt.get("backup_path"):
+        recorded = Path(str(receipt["backup_path"]))
+        expected_parent = target.parent.resolve()
+        valid_name = _backup_index(target, recorded) >= 0
+        if valid_name and not recorded.exists() and not recorded.is_symlink():
             return _refuse(
                 result,
-                "the machine receipt names a configuration target outside "
-                "this host's known locations; refusing to touch it.",
+                "the machine receipt names a backup that no longer exists; refusing rollback.",
+                ("Restore the configuration by hand from a trusted copy. Nothing was changed.",),
+            )
+        if (
+            _safe_receipt_path(recorded)
+            and valid_name
+            and recorded.parent.resolve() == expected_parent
+            and _regular_non_reparse_file(recorded)
+        ):
+            backup = recorded
+        else:
+            return _refuse(
+                result,
+                "the machine receipt names a backup outside the target's managed backup contract; refusing rollback.",
+                ("Restore from a trusted copy by hand. Nothing was changed.",),
+            )
+        if receipt.get("digest_before") is not None and receipt.get("backup_digest") is None:
+            return _refuse(
+                result,
+                "the machine receipt has no backup digest; refusing rollback without provenance.",
                 (
-                    "Remove the stale receipt or restore by hand. "
-                    "Nothing was changed.",
+                    "Restore the configuration by hand if you kept a "
+                    "copy. Nothing was changed.",
                 ),
             )
-        if receipt.get("workspace_root") != str(root.resolve() if root else ""):
-            return _refuse(
-                result,
-                "the machine receipt belongs to another workspace; refusing rollback.",
-                ("Use the connector from the workspace that created the receipt. Nothing was changed.",),
-            )
-        project_id = _project_id_for(root) if root is not None else ""
-        if project_id and receipt.get("project_id") != project_id:
-            return _refuse(
-                result,
-                "the machine receipt belongs to another project; refusing rollback.",
-                ("Use the workspace that created the receipt. Nothing was changed.",),
-            )
-
-    # Backup selection is receipt-first. When a receipt exists, ONLY the
-    # backup it names is acceptable: silently substituting the newest
-    # sibling could restore bytes from a different, older apply. The
-    # newest-sibling discovery fallback exists for exactly one case —
-    # the receipt itself was never persisted (a degraded apply warned
-    # about) — so "no receipt" is the only path that may guess.
-    backup: Optional[Path] = None
-    if receipt is not None:
-        if receipt.get("backup_path"):
-            recorded = Path(str(receipt["backup_path"]))
-            expected_parent = target.parent.resolve()
-            valid_name = _backup_index(target, recorded) >= 0
-            if valid_name and not recorded.exists() and not recorded.is_symlink():
-                return _refuse(
-                    result,
-                    "the machine receipt names a backup that no longer exists; refusing to guess which sibling backup belongs to this apply.",
-                    ("Restore the configuration by hand from a trusted copy. Nothing was changed.",),
-                )
-            if (
-                _safe_receipt_path(recorded)
-                and
-                valid_name
-                and recorded.parent.resolve() == expected_parent
-                and _regular_non_reparse_file(recorded)
-            ):
-                backup = recorded
-            else:
-                return _refuse(
-                    result,
-                    "the machine receipt names a backup outside the target's managed backup contract; refusing rollback.",
-                    ("Restore from a trusted copy by hand. Nothing was changed.",),
-                )
-            if receipt.get("digest_before") is not None and receipt.get("backup_digest") is None:
-                return _refuse(
-                    result,
-                    "the machine receipt has no backup digest; refusing rollback without provenance.",
-                    (
-                        "Restore the configuration by hand if you kept a "
-                        "copy. Nothing was changed.",
-                    ),
-                )
-    elif receipt is None:
-        backup = _newest_backup(target)
     if backup is not None:
         result.backup_ref = backup.name
         result.real_backup_path = str(backup)
 
-    created_by_apply = bool(receipt is not None and receipt.get("digest_before") is None)
+    created_by_apply = bool(receipt.get("digest_before") is None)
     if backup is None and not created_by_apply:
         return _refuse(
             result,
-            "no machine receipt and no backup file were found for this host, "
+            "the machine receipt has no attributable backup for this apply, "
             "so there is nothing safe to restore from.",
             (
                 "If you kept a copy of the pre-apply configuration, restore "
@@ -1278,65 +1290,36 @@ def _rollback_inner(
     current_digest = digest_text(current)
     result.digest_before = current_digest
 
-    recorded_after = ""
-    if receipt is not None:
-        recorded_after = str(receipt.get("digest_after") or "")
-        if not recorded_after:
-            # Fail closed: without the post-apply digest the external-edit
-            # gate cannot run, and skipping it would convert the
-            # strongest protection into a restore over a stranger's edits.
-            return _refuse(
-                result,
-                "the machine receipt is incomplete (no post-apply digest); "
-                "refusing to roll back against an unverifiable state.",
-                (
-                    "Restore the configuration by hand from the backup. "
-                    "Nothing was changed.",
-                ),
-            )
-        if current_digest != recorded_after:
-            return _refuse(
-                result,
-                "the configuration was edited after Relinkra applied it; "
-                "rolling back would overwrite those external edits.",
-                (
-                    f"Restore manually from the backup '{result.backup_ref or '(unknown)'}' "
-                    "if you are certain, then re-run 'relinkra connect check'. "
-                    "Nothing was changed.",
-                ),
-            )
-    else:
-        # Provenance gate: without a receipt, only a file that still
-        # holds a structurally Relinkra-owned entry is eligible.
-        try:
-            document = parse_json_document(current)
-        except ValueError as exc:
-            return _refuse(
-                result,
-                f"the current configuration does not parse ({_sanitize(str(exc))}), "
-                "so its provenance cannot be established.",
-                ("Restore the file by hand. Nothing was changed.",),
-            )
-        container = _container(document, container_path)
-        entry = (
-            container.get(MANAGED_SERVER_NAME)
-            if isinstance(container, Mapping)
-            else None
+    recorded_after = str(receipt.get("digest_after") or "")
+    if not recorded_after:
+        # Fail closed: without the post-apply digest the external-edit
+        # gate cannot run, and skipping it would convert the
+        # strongest protection into a restore over a stranger's edits.
+        return _refuse(
+            result,
+            "the machine receipt is incomplete (no post-apply digest); "
+            "refusing to roll back against an unverifiable state.",
+            (
+                "Restore the configuration by hand from the backup. "
+                "Nothing was changed.",
+            ),
         )
-        if not (entry is not None and is_managed_entry(entry)):
-            return _refuse(
-                result,
-                "the current configuration contains no Relinkra-managed "
-                "entry, so there is nothing attributable to roll back.",
-                ("Nothing was changed.",),
-            )
+    if current_digest != recorded_after:
+        return _refuse(
+            result,
+            "the configuration was edited after Relinkra applied it; "
+            "rolling back would overwrite those external edits.",
+            (
+                f"Restore manually from the backup '{result.backup_ref or '(unknown)'}' "
+                "if you are certain, then re-run 'relinkra connect check'. "
+                "Nothing was changed.",
+            ),
+        )
 
     result.rollback_attempted = True
 
     restored_text: Optional[str] = None
-    recorded_backup_digest = (
-        str(receipt.get("backup_digest") or "") if receipt is not None else ""
-    )
+    recorded_backup_digest = str(receipt.get("backup_digest") or "")
     if not created_by_apply:
         try:
             backup_bytes = backup.read_bytes()
@@ -1344,7 +1327,7 @@ def _rollback_inner(
         except (OSError, UnicodeDecodeError) as exc:
             result.error = _sanitize(str(exc))
             return result
-        if recorded_backup_digest and digest_text(restored_text) != recorded_backup_digest:
+        if recorded_backup_digest and digest_bytes(backup_bytes) != recorded_backup_digest:
             return _refuse(
                 result,
                 "the recorded backup does not match the receipt's backup "
@@ -1381,7 +1364,7 @@ def _rollback_inner(
                 f"the current configuration could not be re-read: {_sanitize(str(exc))}",
                 ("Restore the file by hand. Nothing was changed.",),
             )
-        if receipt is not None and digest_text(current_now) != recorded_after:
+        if digest_text(current_now) != recorded_after:
             return _refuse(
                 result,
                 "the configuration was edited after Relinkra applied it; "
@@ -1392,31 +1375,6 @@ def _rollback_inner(
                     "Nothing was changed.",
                 ),
             )
-        if receipt is None:
-            # The provenance gate is re-run on the in-lock bytes too.
-            try:
-                document_now = parse_json_document(current_now)
-            except ValueError:
-                return _refuse(
-                    result,
-                    "the current configuration no longer parses, so its "
-                    "provenance cannot be re-established.",
-                    ("Restore the file by hand. Nothing was changed.",),
-                )
-            container_now = _container(document_now, container_path)
-            entry_now = (
-                container_now.get(MANAGED_SERVER_NAME)
-                if isinstance(container_now, Mapping)
-                else None
-            )
-            if not (entry_now is not None and is_managed_entry(entry_now)):
-                return _refuse(
-                    result,
-                    "the Relinkra-managed entry disappeared before the "
-                    "restore; there is nothing attributable to roll back.",
-                    ("Nothing was changed.",),
-                )
-
         # Re-read and re-authenticate the backup while the target lock is
         # held.  The pre-lock read is only an early refusal; using those
         # bytes after an external backup edit would restore stale or forged
@@ -1429,14 +1387,15 @@ def _rollback_inner(
                     ("Restore the configuration by hand. Nothing was changed.",),
                 )
             try:
-                restored_text = backup.read_bytes().decode("utf-8")
+                backup_bytes = backup.read_bytes()
+                restored_text = backup_bytes.decode("utf-8")
             except (OSError, UnicodeDecodeError) as exc:
                 return _refuse(
                     result,
                     f"the managed backup could not be read before restore: {_sanitize(str(exc))}",
                     ("Restore the configuration by hand. Nothing was changed.",),
                 )
-            if recorded_backup_digest and digest_text(restored_text) != recorded_backup_digest:
+            if recorded_backup_digest and digest_bytes(backup_bytes) != recorded_backup_digest:
                 return _refuse(
                     result,
                     "the managed backup changed before restore; refusing rollback.",
@@ -1463,8 +1422,8 @@ def _rollback_inner(
         try:
             atomic_write_text(target, restored_text, mode=mode)
             written = read_bounded_text(target)
-            validate_json_text(written)
-        except (SafeWriteError, OSError, ValueError) as exc:
+            adapter.validate(written)
+        except (SafeWriteError, OSError, ValueError, MergeError) as exc:
             result.error = _sanitize(str(exc))
             return result
 
@@ -1488,7 +1447,7 @@ def _rollback_inner(
     result.rollback_succeeded = True
     result.validation_succeeded = True
 
-    container = _container(parse_json_document(written), container_path)
+    container = _container(adapter.parse(written), container_path)
     entry = (
         container.get(MANAGED_SERVER_NAME) if isinstance(container, Mapping) else None
     )

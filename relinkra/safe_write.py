@@ -106,6 +106,7 @@ class WriteReceipt:
     digest_before: Optional[str]
     digest_after: str
     created: bool
+    backup_digest: Optional[str] = None
 
     @property
     def backup_created(self) -> bool:
@@ -117,6 +118,7 @@ class WriteReceipt:
             "backup_created": self.backup_created,
             "digest_before": self.digest_before,
             "digest_after": self.digest_after,
+            "backup_digest": self.backup_digest,
         }
 
 
@@ -125,14 +127,14 @@ class WriteReceipt:
 # ---------------------------------------------------------------------------
 
 
-def digest_text(text: str) -> str:
-    """Content digest used for preconditions. Stable across platforms.
+def digest_bytes(data: bytes) -> str:
+    """Hash exact configuration bytes for security-sensitive gates."""
+    return hashlib.sha256(data).hexdigest()
 
-    Hashes the UTF-8 bytes of the decoded text rather than the raw file
-    bytes, so a BOM or a CRLF/LF difference alone does not read as "the
-    file changed under us" and needlessly abort a write.
-    """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def digest_text(text: str) -> str:
+    """Content digest API retained for decoded UTF-8 configuration text."""
+    return digest_bytes(text.encode("utf-8"))
 
 
 def read_bounded_text(
@@ -155,13 +157,13 @@ def read_bounded_text(
         raise ConfigTooLargeError(
             f"configuration file is {size} bytes, over the {max_bytes} byte limit"
         )
-    with open(target, "r", encoding=encoding, errors="strict") as handle:
-        text = handle.read(max_bytes + 1)
-    if len(text.encode(encoding, errors="replace")) > max_bytes:
+    with open(target, "rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
         raise ConfigTooLargeError(
             f"configuration file exceeds the {max_bytes} byte limit"
         )
-    return text
+    return raw.decode(encoding, errors="strict")
 
 
 def detect_newline(text: str) -> str:
@@ -374,6 +376,18 @@ def safe_replace(
                 ) from exc
 
         backup_path = create_backup(target) if (backup and existed) else None
+        try:
+            # Bind the backup's exact bytes while the transaction lock is
+            # still held. The caller must never hash this provenance after
+            # safe_replace returns, when an external writer can race it.
+            backup_digest = (
+                digest_bytes(backup_path.read_bytes())
+                if backup_path is not None
+                else None
+            )
+        except BaseException:
+            _discard_backup(backup_path)
+            raise
         mode = _current_mode(target) if existed else None
 
         try:
@@ -430,6 +444,7 @@ def safe_replace(
             digest_before=digest_before,
             digest_after=digest_after,
             created=not existed,
+            backup_digest=backup_digest,
         )
 
 

@@ -42,10 +42,10 @@ discover → inspect → plan → validate plan → dry-run
 | plan | `connectors.build_plan` | yes | `connect plan` |
 | validate plan | `config_merge.decide_member` | yes | `connect plan` |
 | dry-run | planning *is* the dry run | yes | `connect plan --dry-run` |
-| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode) |
-| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode) |
-| validate result | `config_merge.validate_json_text` | yes | `connect apply` (claude, opencode) |
-| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode) |
+| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode, codex) |
+| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode, codex) |
+| validate result | `config_formats.adapter_for(...).validate` | yes | `connect apply` (claude, opencode, codex) |
+| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode, codex) |
 
 The last four rows are wired only for the connectors whose write gate is
 open; every other connector still stops at `plan` — see
@@ -60,6 +60,8 @@ open; every other connector still stops at `plan` — see
 | `relinkra/connector.py` | Domain vocabulary: states, launch contract, plan, capability matrix. No I/O. |
 | `relinkra/host_discovery.py` | Bounded, declared candidate locations; pure path resolution; probing. |
 | `relinkra/config_merge.py` | Non-destructive structured merge and deterministic serialization. |
+| `relinkra/config_formats.py` | Per-format adapter seam (parse / validate / serialize_member) keyed off `spec.config_format`; JSON and TOML adapters. |
+| `relinkra/toml_edit.py` | Scoped, comment-preserving textual TOML editor (Codex); tomllib parsing plus byte-exact region replacement, fail-closed. |
 | `relinkra/safe_write.py` | Backup, atomic write, rollback, size bounds, advisory locking. |
 | `relinkra/connectors.py` | The registry: per-host declarations, launch resolution, plan building. |
 | `relinkra/connect_cli.py` | Command dispatch, exit codes, the portability audit. |
@@ -119,16 +121,42 @@ machine — not from documentation.
 | `generic` | supported | yes | Relinkra's own stdio entry point | n/a | n/a | **no** |
 | `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | yes (R4C.1B) | **no** |
 | `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | yes (R4C.1C) | **no** |
-| `codex` | experimental | yes (read) | `[mcp_servers.<name>]` TOML tables | **no** | **no** | **no** |
+| `codex` | experimental | yes | `[mcp_servers.<name>]` TOML tables | yes | yes (R4C.1D) | **no** |
 | `devin-desktop` | experimental | yes (legacy file) | `mcpServers` with `{command, args}` | yes | **no** | **no** |
 | `devin-cloud` | unsupported | no | — | no | no | no |
 
-Codex is read-only: rewriting TOML without destroying the user's comments and
-formatting needs a round-tripping writer, which is out of scope here. Reading it
-requires `tomllib` (Python 3.11+); on older interpreters the registration state
-is reported `unknown` rather than guessed from a regex.
+Codex writes use a **scoped textual TOML editor**: only the byte extent of the
+`[mcp_servers.relinkra]` table is replaced (or appended at end of file), while
+every other table, comment, quoting style, line ending and the UTF-8 BOM is
+preserved byte-for-byte. Parsing and post-write validation always go through
+`tomllib`, and the candidate text is re-parsed and compared against the
+structured merge before any write is accepted. This strategy was chosen over
+the official `codex mcp add` (codex-cli 0.146.0), which drops comments
+adjacent to the `mcp_servers` region it rewrites and normalizes CRLF to LF
+globally; no comment-preserving TOML library is available to a stdlib-only
+project. Dotted-key or inline-table representations of the managed member
+(`mcp_servers.relinkra = {...}`) are **refused**, never rewritten. Reading and
+writing require `tomllib` (Python 3.11+); on older interpreters the
+registration state is reported `unknown` and writes refuse, rather than
+guessing from a regex.
 
 Devin appears so the roadmap is visible. Nothing about it is implemented.
+
+### Verification evidence schema
+
+Persisted connector proof uses `relinkra.connect-verification/v2`. The version
+bump is intentional: `workspace_id` is now a required storage field, so the
+exact record shape changed.
+
+| Field | Rule |
+| --- | --- |
+| `workspace_id` | Always serialized; either JSON `null` or a registry-backed `ws_` id matching `^ws_[0-9a-f]{32}$` and the current workspace. |
+| `null` | Valid local-operational evidence that makes no workspace-local identity claim; it is not independent attestation. The completed Codex proof uses this value. |
+| v1 record | Legacy and fail-closed. It is not migrated, rewritten or trusted. |
+
+Host isolation, workspace-root binding and the existing local-operational trust
+semantics remain unchanged. Missing, malformed, copied or mismatched workspace
+identity evidence is unusable rather than partially trusted.
 
 ### Config locations
 
@@ -244,7 +272,10 @@ produce equal dictionaries — that is what makes `connect plan` safe to run
 repeatedly and what the idempotency proof compares.
 
 Operations: `no_op`, `backup_file`, `create_file`, `add_object_member`,
-`replace_managed_member`, `validate_json`, `request_restart`.
+`replace_managed_member`, `validate_json`, `request_restart`. The
+`validate_json` token predates the format-adapter seam and is format-generic:
+it means "re-parse the written file with the host format's parser" (TOML for
+Codex).
 
 Every operation carries preconditions, postconditions and rollback information
 as **data**, because the process that plans is not the process that would
@@ -259,11 +290,11 @@ Plan status is three-valued:
 - `ready` — the merge is computable and safe.
 - `blocked` — a conflict. A person must decide.
 - `unavailable` — no plan could be built (unverified format, unparseable
-  config, unresolved launch contract, TOML host).
+  config, unresolved launch contract, unsupported format).
 
 `apply_available` is a **separate** field. A `ready` plan with
 `apply_available: false` is expected only for connectors whose write path is
-still closed; Claude Code and OpenCode currently expose apply.
+still closed; Claude Code, OpenCode and Codex currently expose apply.
 
 `connect check` decides staleness with the **same** `decide_member` engine that
 `build_plan` uses. Answering that question a second way is exactly how a `check`

@@ -304,7 +304,9 @@ class PlanTests(ConnectCLICase):
         self.assertTrue(payload["conflicts"])
 
     def test_unavailable_plan_needs_a_human(self):
-        code, payload, _ = self.run_json("plan", "codex")
+        # devin-cloud has no local configuration file, so no plan can be
+        # built for it; codex plans are ready since R4C.1D.
+        code, payload, _ = self.run_json("plan", "devin-cloud")
         self.assertEqual(code, EXIT_ACTION_REQUIRED)
         self.assertEqual(payload["status"], "unavailable")
 

@@ -175,6 +175,20 @@ class FalseFriendlyNameTests(unittest.TestCase):
         self.assertEqual(result.confidence, DETECTION_CONFLICTING)
         self.assertEqual(result.backend, BACKEND_UNKNOWN)
 
+    def test_wrapper_and_node_module_tokens_are_not_relinkra(self):
+        for entry in (
+            {"command": "node", "args": ["-m", "relinkra.mcp_cli"]},
+            {
+                "command": "python",
+                "args": ["wrapper.py", "-m", "relinkra.mcp_cli"],
+            },
+            {"command": "sh", "args": ["-c", "python -m relinkra.mcp_cli"]},
+        ):
+            with self.subTest(entry=entry):
+                result = classify_entry("relinkra", entry)
+                self.assertEqual(result.backend, BACKEND_UNKNOWN)
+                self.assertEqual(result.confidence, DETECTION_CONFLICTING)
+
     def test_a_name_that_merely_contains_a_hint_is_not_a_match(self):
         # "engramophone" is not Engram. Hints match whole tokens only.
         result = classify_entry("engramophone", UNRELATED_ENTRY)

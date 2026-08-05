@@ -124,6 +124,9 @@ OP_BACKUP_FILE = "backup_file"
 OP_CREATE_FILE = "create_file"
 OP_ADD_OBJECT_MEMBER = "add_object_member"
 OP_REPLACE_MANAGED_MEMBER = "replace_managed_member"
+#: The token predates the format-adapter seam and is format-generic: it
+#: means "re-parse the written file with the host format's parser", which
+#: is TOML for Codex. Kept for plan-output compatibility.
 OP_VALIDATE_JSON = "validate_json"
 OP_REQUEST_RESTART = "request_restart"
 OPERATIONS = frozenset(

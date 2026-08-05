@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .config_formats import adapter_for
 from .config_merge import (
     ACTION_ADD,
     ACTION_CONFLICT,
@@ -326,6 +327,26 @@ def _launch_command_and_args(entry: Any) -> Tuple[Optional[str], Tuple[str, ...]
     return executable, tuple(command_args) + extra_args
 
 
+def _is_python_interpreter(command: str) -> bool:
+    """Whether an executable token plausibly names a Python interpreter."""
+    base = _basename(command).lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base in {"py", "pypy", "pypy3"}:
+        return True
+    for prefix in ("python", "pythonw"):
+        if base == prefix:
+            return True
+        version = base[len(prefix) :]
+        if version and version[0].isdigit() and all(
+            character.isdigit() or character == "." for character in version
+        ):
+            return True
+    return base.endswith(("-python", "_python"))
+
+
 def launches_relinkra(entry: Any) -> bool:
     """Structural ownership test: does this entry start Relinkra?
 
@@ -348,15 +369,15 @@ def launches_relinkra(entry: Any) -> bool:
     # let foreign wrappers such as ``node wrapper.js relinkra.mcp_cli``
     # masquerade as Relinkra and be overwritten.
     module_positions = [index for index, token in enumerate(args) if token == "-m"]
-    if len(module_positions) == 1:
+    if _is_python_interpreter(command) and len(module_positions) == 1:
         index = module_positions[0]
-        if index + 1 < len(args) and args[index + 1] == SERVER_MODULE:
+        if index == 0 and index + 1 < len(args) and args[index + 1] == SERVER_MODULE:
             return True
 
     # Console-script ownership belongs to the executable token only.  A
     # script name appearing in an arbitrary argument is not a launch target.
-    base = _basename(command)
-    return base in (CONSOLE_SCRIPT, CONSOLE_SCRIPT + ".exe")
+    base = _basename(command).lower()
+    return base in (CONSOLE_SCRIPT.lower(), (CONSOLE_SCRIPT + ".exe").lower())
 
 
 def is_managed_entry(entry: Any) -> bool:
@@ -874,20 +895,26 @@ CODEX = ConnectorSpec(
     entry_builder=_toml_command_entry,
     format_verified=True,
     format_evidence=(
-        "'[mcp_servers.<name>]' tables with command/args, read from a real "
-        "local Codex configuration."
+        "'[mcp_servers.<name>]' tables with command/args/env/cwd/url, read "
+        "from a real local Codex configuration and from the schema the "
+        "official 'codex mcp add' (codex-cli 0.146.0) writes. Global user "
+        "scope at ~/.codex/config.toml, overridable with CODEX_HOME."
     ),
-    apply_available=False,
-    apply_unavailable_reason=(
-        "Codex stores configuration as TOML. Relinkra can read it, but a "
-        "comment-preserving TOML writer is out of scope for R4B, so writes "
-        "stay disabled."
-    ),
+    apply_available=True,
+    apply_unavailable_reason="",
     restart_instruction="Restart the Codex CLI so it re-reads config.toml.",
     security_notes=(
-        "TOML is read only. Relinkra never rewrites config.toml in this phase.",
-        "Reading requires tomllib (Python 3.11+); older interpreters report "
-        "the registration state as unknown rather than guessing.",
+        "Writes use a scoped textual TOML editor: only the byte extent of "
+        "the '[mcp_servers.relinkra]' table is replaced; every other table, "
+        "comment, quoting style, line ending and the BOM are preserved "
+        "byte-for-byte. The official 'codex mcp add' was rejected because "
+        "it drops comments adjacent to the mcp_servers region and "
+        "normalizes CRLF to LF globally.",
+        "Dotted-key or inline-table representations of the managed member "
+        "are refused, never rewritten.",
+        "Reading and writing require tomllib (Python 3.11+); older "
+        "interpreters report the registration state as unknown and refuse "
+        "to write, rather than guessing.",
     ),
 )
 
@@ -1016,9 +1043,13 @@ def _load_toml(text: str) -> Optional[Dict[str, Any]]:
         import tomllib
     except ImportError:
         return None
+    # A UTF-8 BOM is legal in files Windows tools write and is not legal
+    # TOML; stripping it here matches the JSON reader's tolerance.
+    if text.startswith("\ufeff"):
+        text = text[1:]
     try:
         return tomllib.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise MalformedConfigError(f"configuration is not valid TOML: {exc}") from exc
 
 
@@ -1345,9 +1376,25 @@ def build_plan(
         )
         return plan
 
-    if spec.config_format == FORMAT_TOML:
+    if inspection.raw_text is not None and inspection.document is None:
+        # The file was read but not parsed (TOML on an interpreter
+        # without tomllib). The registration state is UNKNOWN, and a
+        # plan built on an unknown state would be a guess.
         plan.status = PLAN_UNAVAILABLE
-        plan.unavailable_reason = spec.apply_unavailable_reason
+        plan.unavailable_reason = next(
+            (warning.message for warning in inspection.warnings),
+            "the existing configuration could not be parsed on this "
+            "interpreter.",
+        )
+        return plan
+
+    if adapter_for(spec.config_format) is None:
+        plan.status = PLAN_UNAVAILABLE
+        plan.unavailable_reason = (
+            spec.apply_unavailable_reason
+            or "this host's configuration format is not writable in this "
+            "phase."
+        )
         return plan
 
     desired = spec.entry_builder(launch)
@@ -1486,7 +1533,9 @@ def build_plan(
             target_ref=plan.target_ref,
             detail="re-parse the written file before accepting the change",
             preconditions=("the write completed",),
-            postconditions=("the written configuration parses as JSON",),
+            postconditions=(
+                f"the written configuration parses as {spec.config_format.upper()}",
+            ),
             rollback="restore the target from the backup copy",
         )
     )

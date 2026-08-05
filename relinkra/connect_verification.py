@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,11 +36,13 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 from .connector import iter_strings
 from .connectors import resolve_connector
 from .handoff import contains_absolute_path
+from .identity import canonicalize_path, derive_workspace_id, normalize_os_family
+from .registry import Registry, RegistryError, _WORKSPACE_ID_RE
 from .safe_write import SafeWriteError, atomic_write_text, read_bounded_text
 from .connector import UnknownConnectorError
 
 #: Bumped when the shape of a stored verification record changes.
-VERIFICATION_VERSION = "relinkra.connect-verification/v1"
+VERIFICATION_VERSION = "relinkra.connect-verification/v2"
 
 # The verification file is operator-supplied local evidence, not an
 # attestation channel.  Keep its grammar deliberately small and bounded so
@@ -121,6 +124,20 @@ _SECRET_KEY_PARTS = frozenset(
     {"token", "secret", "password", "passwd", "oauth", "apikey", "api_key"}
 )
 _KEY_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:"
+    r"bearer\s+[a-z0-9._~+/\-]{6,}"
+    r"|sk[-_](?:live|test)[-_][a-z0-9_-]{4,}"
+    r"|sk-[a-z0-9]{20,}"
+    r"|xox[baprs]-[a-z0-9-]{10,}"
+    r"|gh[pousr]_[a-z0-9]{20,}"
+    r"|github_pat_[a-z0-9_]{20,}"
+    r"|glpat-[a-z0-9_-]{15,}"
+    r"|akia[0-9a-z]{16}"
+    r"|aiza[0-9a-z_-]{35}"
+    r"|hf_[a-z0-9]{20,}"
+    r")(?:$|[^a-z0-9])"
+)
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 _STORAGE_KEYS = frozenset(
@@ -128,7 +145,7 @@ _STORAGE_KEYS = frozenset(
         "schema_version", "host", "timestamp", "registration_fingerprint",
         "revision", "project_id", "stages", "tools_visible", "tools_invoked",
         "handoff_ok", "ttl_seconds", "source", "workspace_root",
-        "evidence_class", "independently_attested",
+        "workspace_id", "evidence_class", "independently_attested",
     }
 )
 _PORTABLE_KEYS = _STORAGE_KEYS - {"workspace_root"}
@@ -213,9 +230,10 @@ class VerificationRecord:
 
     ``workspace_root`` is machine-local: it is needed to detect a record
     being replayed against a different workspace, and it is exactly what
-    :meth:`to_dict` must never emit. The portable rendering carries
-    stages, tool names and timestamps — facts a reader can act on —
-    and nothing that locates the machine.
+    :meth:`to_dict` must never emit. ``workspace_id`` is portable opaque
+    identity; when non-null it must be backed by the current registry entry.
+    The portable rendering carries stages, tool names and timestamps — facts
+    a reader can act on — and nothing that locates the machine.
     """
 
     host: str
@@ -228,6 +246,7 @@ class VerificationRecord:
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     source: str = SOURCE_OPERATOR_PROOF
     workspace_root: str = ""
+    workspace_id: Optional[str] = None
     project_id: str = ""
     revision: str = ""
     schema_version: str = VERIFICATION_VERSION
@@ -247,6 +266,7 @@ class VerificationRecord:
             "handoff_ok": self.handoff_ok,
             "ttl_seconds": self.ttl_seconds,
             "source": self.source,
+            "workspace_id": self.workspace_id,
             "evidence_class": "local_operational",
             "independently_attested": False,
         }
@@ -306,6 +326,12 @@ class VerificationRecord:
             )
             if field_name != "workspace_root" and contains_absolute_path(data[field_name]):
                 raise ProofError([f"{field_name} contains a machine-local path"])
+        workspace_id = data.get("workspace_id")
+        if workspace_id is not None:
+            if not isinstance(workspace_id, str) or not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+                raise ProofError([
+                    "workspace_id must be null or match ^ws_[0-9a-f]{32}$"
+                ])
         if data.get("source") != SOURCE_OPERATOR_PROOF:
             raise ProofError(["source must be 'operator-proof'"])
         if data.get("evidence_class") != "local_operational":
@@ -328,6 +354,7 @@ class VerificationRecord:
             ttl_seconds=ttl,
             source=data["source"],
             workspace_root=data["workspace_root"],
+            workspace_id=workspace_id,
             project_id=data["project_id"],
             revision=revision,
             schema_version=data["schema_version"],
@@ -408,6 +435,17 @@ def _record_validation_reasons(
         reasons.append("the recorded proof names a different host")
     if record.workspace_root != str(Path(root).resolve()):
         reasons.append("the recorded proof belongs to a different workspace")
+    if record.workspace_id is not None:
+        expected_workspace_id = _workspace_id_for(root)
+        if expected_workspace_id is None:
+            reasons.append(
+                "the recorded proof carries a workspace_id that cannot be "
+                "validated against the registry-backed current workspace"
+            )
+        elif record.workspace_id != expected_workspace_id:
+            reasons.append(
+                "the recorded proof belongs to a different workspace identity"
+            )
     current_project = _project_id_for(root)
     if current_project and record.project_id != current_project:
         reasons.append("the recorded proof belongs to a different project")
@@ -498,6 +536,11 @@ def _secret_shaped_key(key: object) -> bool:
     return bool(parts & _SECRET_KEY_PARTS)
 
 
+def _credential_shaped_value(value: str) -> bool:
+    """Whether a tool-name value resembles a portable credential."""
+    return bool(_CREDENTIAL_VALUE_RE.search(value))
+
+
 def _walk_keys(value):
     if isinstance(value, Mapping):
         for key, item in value.items():
@@ -529,6 +572,39 @@ def _project_id_for(root) -> str:
         return ""
 
 
+def _workspace_id_for(root) -> Optional[str]:
+    """Return the registry-backed identity expected for ``root``.
+
+    A workspace id in ``.relinkra/config.json`` is only a pin. It becomes
+    usable verification context after the registry proves that the pin names
+    the current canonical path, project and OS-derived workspace id.
+    """
+    try:
+        from .product_cli import WorkspaceConfig, registry_path
+
+        config = WorkspaceConfig.load(Path(root))
+        if config is None or not config.project_id or not config.workspace_id:
+            return None
+        if not _WORKSPACE_ID_RE.fullmatch(config.workspace_id):
+            return None
+        registry = Registry(str(registry_path(Path(root))))
+        workspace = registry.get_workspace(config.workspace_id)
+        if workspace is None or workspace.project_id != config.project_id:
+            return None
+        canonical_root = canonicalize_path(str(root))
+        os_family = normalize_os_family(sys.platform)
+        if workspace.canonical_path != canonical_root or workspace.os != os_family:
+            return None
+        expected = derive_workspace_id(
+            workspace.project_id, canonical_root, os_family
+        )
+        if workspace.workspace_id != config.workspace_id or workspace.workspace_id != expected:
+            return None
+        return expected
+    except (OSError, RegistryError, TypeError, ValueError):
+        return None
+
+
 def _has_control_chars(text: str) -> bool:
     return any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
 
@@ -547,7 +623,8 @@ def build_proof_from_payload(
                      "handoff_roundtrip": true},
           "tools_visible": ["context_packet", ...],
           "tools_invoked": ["context_packet", ...],
-          "handoff_ok": true
+          "handoff_ok": true,
+          "workspace_id": "ws_..." or null
         }
 
     Anything else — unknown hosts, unknown stages, missing required
@@ -565,7 +642,9 @@ def build_proof_from_payload(
     if not isinstance(payload, Mapping):
         raise ProofError(["the proof payload must be a JSON object"])
     _json_depth(payload)
-    allowed_payload_keys = {"stages", "tools_visible", "tools_invoked", "handoff_ok"}
+    allowed_payload_keys = {
+        "stages", "tools_visible", "tools_invoked", "handoff_ok", "workspace_id"
+    }
     unknown_payload = sorted(set(payload) - allowed_payload_keys)
     if unknown_payload:
         reasons.append(
@@ -601,6 +680,8 @@ def build_proof_from_payload(
             # Evidence gets pasted, shared and rendered on terminals;
             # control characters turn a name into an escape sequence.
             reasons.append(f"'{key}' contains control character(s)")
+        elif any(_credential_shaped_value(item) for item in value):
+            reasons.append(f"'{key}' contains credential-shaped value(s)")
         elif len(value) > MAX_TOOL_COUNT:
             reasons.append(f"'{key}' exceeds the tool-count limit")
         elif any(len(item) > MAX_TOOL_NAME_LENGTH for item in value):
@@ -608,6 +689,27 @@ def build_proof_from_payload(
 
     if not isinstance(payload.get("handoff_ok"), bool):
         reasons.append("'handoff_ok' must be a boolean")
+
+    if "workspace_id" not in payload:
+        reasons.append("missing proof field: workspace_id")
+    else:
+        workspace_id = payload.get("workspace_id")
+        if workspace_id is not None:
+            if not isinstance(workspace_id, str) or not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+                reasons.append(
+                    "'workspace_id' must be null or match ^ws_[0-9a-f]{32}$"
+                )
+            else:
+                expected_workspace_id = _workspace_id_for(root)
+                if expected_workspace_id is None:
+                    reasons.append(
+                        "'workspace_id' cannot be validated against the "
+                        "registry-backed current workspace"
+                    )
+                elif workspace_id != expected_workspace_id:
+                    reasons.append(
+                        "'workspace_id' does not match the current workspace identity"
+                    )
 
     if isinstance(stages, Mapping):
         prerequisites = {
@@ -661,6 +763,7 @@ def build_proof_from_payload(
         tools_invoked=tuple(str(item) for item in payload.get("tools_invoked") or ()),
         handoff_ok=bool(payload.get("handoff_ok")),
         workspace_root=str(Path(root).resolve()),
+        workspace_id=payload.get("workspace_id"),
         project_id=_project_id_for(root),
         revision=_revision_for(root),
     )

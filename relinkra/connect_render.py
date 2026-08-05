@@ -400,7 +400,7 @@ def render_rollback(result, *, reveal: bool = False) -> str:
     else:
         lines.append(
             f"The previous configuration bytes were restored to {shown_path or 'the host config'} "
-            "and re-validated as JSON."
+            "and re-validated."
         )
         if result.registration_present:
             lines.append(

@@ -15,6 +15,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -45,7 +46,7 @@ from relinkra.connect_verification import (
     assess_verification,
     build_proof_from_payload,
 )
-from relinkra.connector import MANAGED_SERVER_NAME, iter_strings
+from relinkra.connector import FORMAT_JSON, MANAGED_SERVER_NAME, iter_strings
 from relinkra.connector_apply import (
     apply_connector,
     classify_server_entry,
@@ -65,13 +66,16 @@ from relinkra.host_discovery import (
     SYSTEM_WINDOWS,
     DiscoveryEnvironment,
 )
+from relinkra.identity import explicit_identity
 from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    WorkspaceConfig,
     main,
     registry_path,
 )
+from relinkra.registry import Registry
 from relinkra.safe_write import (
     ContentValidationError,
     PreconditionError,
@@ -97,6 +101,14 @@ class ConnectApplyCase(unittest.TestCase):
         # The CLI resolves the workspace root before use; the fixture key
         # must be computed from exactly that resolved form.
         self.root = self.repo.resolve()
+        workspace = Registry(str(registry_path(self.repo))).register_workspace(
+            str(self.repo), explicit_identity("fixture")
+        )
+        WorkspaceConfig(
+            project_id=workspace.project_id,
+            workspace_id=workspace.workspace_id,
+        ).save(self.repo)
+        self.workspace_id = workspace.workspace_id
 
         outer = self
 
@@ -207,6 +219,7 @@ class ConnectApplyCase(unittest.TestCase):
 
     def valid_proof(self):
         return {
+            "workspace_id": self.workspace_id,
             "stages": {
                 "host_launched": True,
                 "handshake_succeeded": True,
@@ -502,15 +515,15 @@ class ApplyRefusalTests(ConnectApplyCase):
         self.assertTrue(path.is_symlink())
 
     def test_other_connectors_still_refuse_writes(self):
-        # R4C.1C opened the write path for OpenCode; codex and
-        # devin-desktop stay read-only.
+        # R4C.1C opened the write path for OpenCode and R4C.1D for Codex;
+        # devin-desktop stays read-only.
         self.write_config(
             ".config", "opencode", "opencode.json", content={"mcp": {}}
         )
         code, payload, _ = self.run_json("apply", "opencode")
         self.assertEqual(code, EXIT_OK, payload)
         self.assertTrue(payload["write_succeeded"])
-        for agent in ("codex", "devin-desktop"):
+        for agent in ("devin-desktop",):
             code, payload, _ = self.run_json("apply", agent)
             self.assertEqual(code, EXIT_ACTION_REQUIRED, agent)
             self.assertTrue(payload["refusal_reason"], agent)
@@ -538,17 +551,19 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
     def test_a_post_write_validation_failure_rolls_back_automatically(self):
         path = self.claude_config({"mcpServers": {"c7": {"command": "npx", "args": []}}})
         before = path.read_bytes()
-        real_validator = connector_apply.validate_json_text
+        real_adapter = connector_apply.adapter_for(FORMAT_JSON)
+        real_validate = real_adapter.validate
         calls = []
 
         def flaky_validator(text):
             calls.append(1)
             if len(calls) > 1:
                 raise ValueError("simulated post-write validation failure")
-            return real_validator(text)
+            return real_validate(text)
 
+        flaky_adapter = replace(real_adapter, validate=flaky_validator)
         with mock.patch.object(
-            connector_apply, "validate_json_text", side_effect=flaky_validator
+            connector_apply, "adapter_for", return_value=flaky_adapter
         ):
             code, payload, _ = self.run_json("apply", "claude")
         self.assertEqual(code, EXIT_ERROR)
@@ -603,6 +618,47 @@ class RollbackTests(ConnectApplyCase):
             self.mcp_servers(document)["c7"], {"command": "npx", "args": []}
         )
 
+    def test_crlf_config_rollback_restores_the_exact_bytes(self):
+        # The receipt's backup digest and the rollback digest gates must
+        # hash the same byte representation; a mismatch reads every CRLF
+        # backup as "tampered" and bricks rollback for JSON hosts too.
+        original = json.dumps(
+            {
+                "projects": {
+                    self.claude_key(): {
+                        "mcpServers": {"c7": {"command": "npx", "args": []}}
+                    }
+                }
+            },
+            indent=2,
+        ).replace("\n", "\r\n") + "\r\n"
+        path = self.write_config(".claude.json", content=original)
+        before = path.read_bytes()
+        code, _, _ = self.run_json("apply", "claude")
+        self.assertEqual(code, EXIT_OK)
+        code, payload, _ = self.run_json("rollback", "claude")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["rollback_succeeded"])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_rollback_refuses_line_ending_only_external_edits(self):
+        original = (
+            json.dumps(
+                {"projects": {self.claude_key(): {"mcpServers": {}}}},
+                indent=2,
+            ).replace("\n", "\r\n")
+            + "\r\n"
+        )
+        path = self.write_config(".claude.json", content=original)
+        self.assertEqual(self.run_json("apply", "claude")[0], EXIT_OK)
+        path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n"))
+        kept = path.read_bytes()
+        code, payload, _ = self.run_json("rollback", "claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("external edits", payload["refusal_reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertEqual(path.read_bytes(), kept)
+
     def test_rollback_removes_a_file_the_apply_created(self):
         code, _, _ = self.run_json("apply", "claude")
         self.assertEqual(code, EXIT_OK)
@@ -631,20 +687,22 @@ class RollbackTests(ConnectApplyCase):
         self.claude_config({"mcpServers": {}})
         code, payload, _ = self.run_json("rollback", "claude")
         self.assertEqual(code, EXIT_ACTION_REQUIRED)
-        self.assertIn("no machine receipt and no backup", payload["refusal_reason"])
+        self.assertIn("no machine receipt", payload["refusal_reason"])
 
-    def test_rollback_falls_back_to_newest_backup_without_a_receipt(self):
+    def test_rollback_refuses_a_valid_backup_without_a_receipt(self):
         path = self.claude_config({"mcpServers": {"c7": {"command": "npx", "args": []}}})
-        before = path.read_bytes()
         code, _, _ = self.run_json("apply", "claude")
         self.assertEqual(code, EXIT_OK)
-        # Remove the receipt: rollback must fall back to backup discovery.
+        after_apply = path.read_bytes()
         receipt = self.repo / ".relinkra" / "connect-apply" / "claude.json"
         receipt.unlink()
+        backup = path.with_name(path.name + ".relinkra-backup")
+        backup.write_bytes(b'{"mcpServers": {}, "tampered": true}\n')
         code, payload, _ = self.run_json("rollback", "claude")
-        self.assertEqual(code, EXIT_OK, payload)
-        self.assertTrue(payload["rollback_succeeded"])
-        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("no machine receipt", payload["refusal_reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertEqual(path.read_bytes(), after_apply)
 
 
 class PortabilityAndSecretsTests(ConnectApplyCase):
@@ -849,6 +907,7 @@ class VerificationStoreTests(ConnectApplyCase):
         self.assertIsNotNone(record)
         self.assertTrue(record.stages["handshake_succeeded"])
         self.assertEqual(record.tools_visible, ("context_packet", "memory_search"))
+        self.assertEqual(record.workspace_id, self.workspace_id)
 
     def test_a_fingerprint_change_invalidates_the_evidence(self):
         self.record_proof()
@@ -899,6 +958,27 @@ class VerifyCommandTests(ConnectApplyCase):
         self.assertEqual(code, EXIT_ACTION_REQUIRED)
         self.assertIn("handshake_succeeded", err)
 
+    def test_a_proof_missing_workspace_id_is_rejected(self):
+        proof = self.valid_proof()
+        del proof["workspace_id"]
+        code, _, err = self.run_verify(proof)
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("workspace_id", err)
+
+    def test_a_proof_with_malformed_workspace_id_is_rejected(self):
+        proof = self.valid_proof()
+        proof["workspace_id"] = "ws_not-an-id"
+        code, _, err = self.run_verify(proof)
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("^ws_[0-9a-f]{32}$", err)
+
+    def test_a_proof_with_a_different_workspace_id_is_rejected(self):
+        proof = self.valid_proof()
+        proof["workspace_id"] = "ws_" + "f" * 32
+        code, _, err = self.run_verify(proof)
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("workspace identity", err)
+
     def test_a_proof_with_absolute_paths_is_rejected(self):
         proof = self.valid_proof()
         proof["tools_visible"] = [str(self.home / "tool")]
@@ -911,6 +991,15 @@ class VerifyCommandTests(ConnectApplyCase):
             with self.subTest(key=key):
                 proof = self.valid_proof()
                 proof[key] = "value"
+                code, _, err = self.run_verify(proof)
+                self.assertEqual(code, EXIT_ACTION_REQUIRED)
+                self.assertIn("credential-shaped", err)
+
+    def test_a_proof_with_credential_shaped_tool_values_is_rejected(self):
+        for field in ("tools_visible", "tools_invoked"):
+            with self.subTest(field=field):
+                proof = self.valid_proof()
+                proof[field] = ["sk-live-0123456789abcdef"]
                 code, _, err = self.run_verify(proof)
                 self.assertEqual(code, EXIT_ACTION_REQUIRED)
                 self.assertIn("credential-shaped", err)
@@ -976,6 +1065,49 @@ class CheckVerificationSectionTests(ConnectApplyCase):
         self.assertFalse(verification["fully_verified"])
         self.assertFalse(verification["independently_attested"])
         self.assertTrue(verification["record"]["stages"]["host_launched"])
+
+    def test_check_treats_missing_workspace_id_as_absent(self):
+        store = self.record_proof_store()
+        data = json.loads(store.read_text(encoding="utf-8"))
+        del data["workspace_id"]
+        store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        code, payload, _ = self.run_json("check", "claude")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(payload["verification"]["status"], STATUS_ABSENT)
+        self.assertFalse(payload["verification"]["locally_verified"])
+
+    def test_check_rejects_a_wrong_workspace_identity(self):
+        store = self.record_proof_store()
+        data = json.loads(store.read_text(encoding="utf-8"))
+        data["workspace_id"] = "ws_" + "0" * 32
+        store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        code, payload, _ = self.run_json("check", "claude")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(payload["verification"]["status"], STATUS_INVALID)
+        self.assertFalse(payload["verification"]["locally_verified"])
+
+    def test_check_rejects_a_copied_record_from_another_workspace(self):
+        store = self.record_proof_store()
+        data = json.loads(store.read_text(encoding="utf-8"))
+        data["workspace_root"] = str(self._temp.name + "-foreign")
+        store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        code, payload, _ = self.run_json("check", "claude")
+        self.assertEqual(code, EXIT_OK)
+        verification = payload["verification"]
+        self.assertEqual(verification["status"], STATUS_INVALID)
+        self.assertFalse(verification["locally_verified"])
+        self.assertTrue(
+            any("different workspace" in reason for reason in verification["reasons"])
+        )
+
+    def record_proof_store(self):
+        self.claude_config(
+            {MANAGED_SERVER_NAME: self.registered_claude_entry()}
+        )
+        proof_path = self.write_proof(self.valid_proof())
+        code, _, err = self.run_cli("verify", "claude", "--proof", str(proof_path))
+        self.assertEqual(code, EXIT_OK, err)
+        return self.repo / ".relinkra" / "connect-verification" / "claude.json"
 
     def test_check_human_output_states_the_host_caveat(self):
         self.claude_config(
@@ -1171,6 +1303,29 @@ class RollbackHardeningTests(ConnectApplyCase):
         self.assertIn("backup digest", payload["refusal_reason"])
         self.assertEqual(self.claude_path().read_bytes(), kept)
 
+    def test_backup_digest_is_bound_before_post_apply_tampering(self):
+        path = self.claude_config({"mcpServers": {}})
+        before = path.read_bytes()
+        real_safe_replace = connector_apply.safe_replace
+
+        def replace_then_tamper(*args, **kwargs):
+            receipt = real_safe_replace(*args, **kwargs)
+            receipt.backup_path.write_bytes(b'{"mcpServers": {}, "race": true}\n')
+            return receipt
+
+        with mock.patch.object(
+            connector_apply, "safe_replace", side_effect=replace_then_tamper
+        ):
+            result = apply_connector(CLAUDE, self.launch(), self.env())
+        self.assertTrue(result.write_succeeded)
+        self.assertEqual(result.backup_digest, digest_text(before.decode("utf-8")))
+        kept = path.read_bytes()
+        code, payload, _ = self.run_json("rollback", "claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("backup digest", payload["refusal_reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertEqual(path.read_bytes(), kept)
+
     def test_rollback_fails_closed_on_an_incomplete_receipt(self):
         self.claude_config({"mcpServers": {}})
         self._apply()
@@ -1239,10 +1394,10 @@ class RollbackHardeningTests(ConnectApplyCase):
             "does not match the recorded pre-apply digest", payload["error"]
         )
 
-    def test_rollback_without_receipt_picks_the_highest_suffix_backup(self):
+    def test_rollback_refuses_without_receipt_even_with_sibling_backups(self):
         path = self.claude_config({"mcpServers": {}})
-        first_bytes = path.read_bytes()
-        self._apply()  # base backup (suffix index 0) holds first_bytes
+        self._apply()
+        after_apply = path.read_bytes()
         newer = self.claude_path().with_name(".claude.json.relinkra-backup-1")
         newer_content = (
             json.dumps({"mcpServers": {}, "newer_state": True}, indent=2) + "\n"
@@ -1250,12 +1405,10 @@ class RollbackHardeningTests(ConnectApplyCase):
         newer.write_bytes(newer_content.encode("utf-8"))
         self._receipt_path().unlink()
         code, payload, _ = self.run_json("rollback", "claude")
-        self.assertEqual(code, EXIT_OK, payload)
-        # Highest suffix == newest; a min() mutant would restore first_bytes.
-        self.assertEqual(
-            self.claude_path().read_bytes(), newer_content.encode("utf-8")
-        )
-        self.assertNotEqual(first_bytes, newer_content.encode("utf-8"))
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("no machine receipt", payload["refusal_reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertEqual(self.claude_path().read_bytes(), after_apply)
 
 
 class NoOpVerificationTests(ConnectApplyCase):
@@ -1547,7 +1700,7 @@ class CriticalClosureMutationTests(ConnectApplyCase):
             workspace_root=self.repo,
         )
         self.assertTrue(result.refused)
-        self.assertIn("no machine receipt and no backup", result.refusal_reason)
+        self.assertIn("no machine receipt", result.refusal_reason)
 
     def test_top_level_direct_cbm_is_detected_even_when_project_scope_is_selected(self):
         document = {

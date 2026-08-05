@@ -102,7 +102,8 @@ from .connectors import (
     entry_tokens,
     inspect_connector,
 )
-from .config_merge import MergeError, parse_json_document
+from .config_formats import adapter_for
+from .config_merge import MergeError
 from .host_discovery import DiscoveryEnvironment
 from .safe_write import SafeWriteError, read_bounded_text
 
@@ -259,6 +260,21 @@ def _matches(markers: BackendMarkers, tokens: Sequence[str]) -> Tuple[str, ...]:
     return tuple(sorted(set(found)))
 
 
+def _matches_entry(
+    markers: BackendMarkers, entry: Any, tokens: Sequence[str]
+) -> Tuple[str, ...]:
+    """Apply launch-shape ownership before matching Relinkra markers."""
+    if markers.backend == BACKEND_RELINKRA:
+        # Keep backend classification aligned with connector ownership. In
+        # particular, a wrapper or node command must not become Relinkra
+        # merely because it carries the module token as an argument.
+        from .connectors import launches_relinkra
+
+        if not launches_relinkra(entry):
+            return ()
+    return _matches(markers, tokens)
+
+
 def _name_backends(server_name: str) -> Tuple[str, ...]:
     """Backends whose name hints the server name carries."""
     lowered = (server_name or "").strip().lower()
@@ -389,7 +405,7 @@ def classify_entry(server_name: Any, entry: Any) -> BackendDetection:
 
     matched: Dict[str, Tuple[str, ...]] = {}
     for markers in BACKEND_MARKERS:
-        found = _matches(markers, tokens)
+        found = _matches_entry(markers, entry, tokens)
         if found:
             matched[markers.backend] = found
 
@@ -473,7 +489,7 @@ def entry_matches_backend(entry: Any, backend: str) -> bool:
     """
     tokens = entry_tokens(entry)
     return any(
-        markers.backend == backend and bool(_matches(markers, tokens))
+        markers.backend == backend and bool(_matches_entry(markers, entry, tokens))
         for markers in BACKEND_MARKERS
     )
 
@@ -637,7 +653,10 @@ def _authoritative_scope_survey(
         try:
             if scope_path.is_symlink() or not scope_path.is_file():
                 raise OSError("authoritative MCP scope is not a regular file")
-            scope_document = parse_json_document(read_bounded_text(scope_path))
+            adapter = adapter_for(location.config_format)
+            if adapter is None:
+                raise MergeError("no parser for the scope's declared format")
+            scope_document = adapter.parse(read_bounded_text(scope_path))
         except (OSError, SafeWriteError, ValueError, TypeError, RecursionError, MergeError):
             unreadable = True
             continue
