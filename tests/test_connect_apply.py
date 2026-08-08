@@ -515,15 +515,16 @@ class ApplyRefusalTests(ConnectApplyCase):
         self.assertTrue(path.is_symlink())
 
     def test_other_connectors_still_refuse_writes(self):
-        # R4C.1C opened the write path for OpenCode and R4C.1D for Codex;
-        # devin-desktop stays read-only.
+        # R4C.1C opened the write path for OpenCode, R4C.1D for Codex
+        # and R4C.1E Gate B for Devin Desktop; the generic launch
+        # contract and the hosted devin-cloud connector stay read-only.
         self.write_config(
             ".config", "opencode", "opencode.json", content={"mcp": {}}
         )
         code, payload, _ = self.run_json("apply", "opencode")
         self.assertEqual(code, EXIT_OK, payload)
         self.assertTrue(payload["write_succeeded"])
-        for agent in ("devin-desktop",):
+        for agent in ("generic", "devin-cloud"):
             code, payload, _ = self.run_json("apply", agent)
             self.assertEqual(code, EXIT_ACTION_REQUIRED, agent)
             self.assertTrue(payload["refusal_reason"], agent)

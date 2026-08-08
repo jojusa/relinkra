@@ -479,10 +479,27 @@ def _safe_receipt_path(path: Path) -> bool:
 
 
 def _preferred_location(spec: ConnectorSpec, inspection):
-    """Where a write would go: the active config, else the first candidate."""
-    if inspection.location is not None:
+    """Where a write would go: the active config, else the first candidate.
+
+    A legacy location of a renamed host is never the target, even when
+    it is the active config the inspection read: the write aims at the
+    first declared current-product candidate instead — a create path
+    when nothing current exists yet. This mirrors ``_preferred_target``
+    in connectors, which ``build_plan`` uses; apply and rollback must
+    resolve the SAME target the plan promised. Driven entirely off
+    ``spec.legacy_location_ids``, so connectors without legacy locations
+    keep the exact behavior they had.
+    """
+    legacy_ids = spec.legacy_location_ids
+    if (
+        inspection.location is not None
+        and inspection.location.location_id not in legacy_ids
+    ):
         return inspection.location
-    return inspection.locations[0] if inspection.locations else None
+    for location in inspection.locations:
+        if location.location_id not in legacy_ids:
+            return location
+    return None
 
 
 def _container(document: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -570,8 +587,15 @@ def _authoritative_scope_scan(
             os.path.normpath(str(path))
         ) == target_key:
             continue
-        if not path.exists():
+        try:
+            path.stat()
+        except FileNotFoundError:
             continue
+        except OSError:
+            # A denied stat is unknown state, not absence.  The host may
+            # still load this scope, so skipping it would permit a direct
+            # CBM or shadow registration to hide behind permissions.
+            return 0, location, ()
         try:
             if not _regular_non_reparse_file(path):
                 return 0, location, ()
@@ -597,6 +621,83 @@ def _authoritative_scope_scan(
             if classify_server_entry(entry) == CLASS_CBM
         )
     return count, None, tuple(shadows)
+
+
+def legacy_scope_findings(
+    spec: ConnectorSpec, env: DiscoveryEnvironment
+) -> Tuple[str, ...]:
+    """Human-readable findings about LEGACY/evidence-only MCP scopes.
+
+    Read-only and never blocking. A renamed host's retired locations are
+    not authoritative scopes, so a direct CBM entry there must NOT refuse
+    an apply to the current-product target — but it must never pass
+    silently either, because the current product may still READ the
+    legacy file (Devin Desktop watches ``~/.codeium/*/mcp_config.json``
+    and imports it into the live MCP registry, TrustedOnNonce, proven in
+    the shipped bundles). The legacy file is never modified or removed.
+
+    Driven entirely off ``spec.legacy_location_ids``: connectors without
+    legacy locations get an empty tuple and no behavior change. A legacy
+    file that cannot be read or parsed fails closed as a finding too —
+    "unknown" is never reported as "clean".
+    """
+    if not spec.legacy_location_ids:
+        return ()
+    findings: List[str] = []
+    for location in spec.locations:
+        if location.location_id not in spec.legacy_location_ids:
+            continue
+        pure = location.build(env)
+        if pure is None:
+            continue
+        path = Path(str(pure))
+        try:
+            path.stat()
+        except FileNotFoundError:
+            # Plain absence is not a finding: nothing is there to judge.
+            continue
+        except OSError:
+            # Path.exists() would suppress this stat failure and read as
+            # "absent" — "unknown" must never pass as "clean" here.
+            findings.append(
+                f"a legacy MCP scope could not be read "
+                f"({location.display_hint}); refusing to claim direct CBM "
+                "is absent from the legacy scopes. Repair or remove the "
+                "unreadable legacy configuration."
+            )
+            continue
+        try:
+            if not _regular_non_reparse_file(path):
+                raise SafeWriteError("not a regular file")
+            adapter = adapter_for(location.config_format)
+            if adapter is None:
+                raise SafeWriteError("no parser for this configuration format")
+            document = adapter.parse(read_bounded_text(path))
+            if not isinstance(document, Mapping):
+                raise SafeWriteError("the configuration is not an object")
+        except (OSError, SafeWriteError, ValueError, MergeError):
+            findings.append(
+                f"a legacy MCP scope could not be read "
+                f"({location.display_hint}); refusing to claim direct CBM "
+                "is absent from the legacy scopes. Repair or remove the "
+                "unreadable legacy configuration."
+            )
+            continue
+        container = _container(document, spec.container_path)
+        if not isinstance(container, Mapping):
+            continue
+        if any(
+            classify_server_entry(entry) == CLASS_CBM
+            for entry in container.values()
+        ):
+            findings.append(
+                f"direct_cbm_exposure: the legacy '{location.display_hint}' "
+                "configuration registers the codebase-memory backend "
+                "directly. The current product still imports that file, "
+                "so the bypass route is live; Relinkra never removes or "
+                "rewrites it — remove it by hand for the route to be clean."
+            )
+    return tuple(findings)
 
 
 def shadow_registration_hints(
@@ -703,6 +804,9 @@ def _apply_inner(
     result.warnings += tuple(
         f"{warning.code}: {warning.message}" for warning in inspection.warnings
     )
+    # Legacy/evidence-only scopes of a renamed host are surfaced loudly
+    # but never block: only authoritative-scope CBM gates the write.
+    result.warnings += legacy_scope_findings(spec, env)
     result.discovered = inspection.discovery_status == DISCOVERY_DISCOVERED
 
     if inspection.discovery_status in (
@@ -770,7 +874,16 @@ def _apply_inner(
             ),
         )
 
-    document = inspection.document if inspection.document is not None else {}
+    # The document the decision merges into must be the TARGET's content.
+    # When the preferred target is not the inspected location — a
+    # legacy-only install whose apply aims at a current-product create
+    # path — the inspected document describes another file, so the merge
+    # starts from empty exactly as ``build_plan`` does.
+    document = (
+        inspection.document
+        if inspection.document is not None and location is inspection.location
+        else {}
+    )
     result.format_supported = True
     # The container the inspection read — workspace-resolved for hosts
     # like Claude Code whose LOCAL scope is keyed by project.
@@ -858,7 +971,9 @@ def _apply_inner(
     except MergeError as exc:
         return _refuse(result, str(exc), ("Repair the configuration, then re-run apply.",))
 
-    raw_text = inspection.raw_text
+    raw_text = (
+        inspection.raw_text if location is inspection.location else None
+    )
     result.change_required = decision.changes_anything
 
     if decision.action == ACTION_NO_OP:
@@ -1475,6 +1590,7 @@ __all__ = [
     "classify_server_entry",
     "entries_equivalent",
     "launch_fingerprint",
+    "legacy_scope_findings",
     "rollback_connector",
     "shadow_registration_hints",
 ]

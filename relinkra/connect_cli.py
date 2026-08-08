@@ -79,6 +79,7 @@ from .connector_apply import (
     apply_connector,
     authoritative_scope_status,
     launch_fingerprint,
+    legacy_scope_findings,
     rollback_connector,
 )
 from .connectors import (
@@ -333,6 +334,7 @@ def cmd_check(args) -> int:
         launch,
         shadow_hints=shadow_hints,
         authoritative_scope_finding=unreadable_scope_finding or "",
+        legacy_scope_findings=legacy_scope_findings(spec, env),
     )
     fingerprint = launch_fingerprint(launch)
     verification = _verification_section(root, spec.connector_id, fingerprint)

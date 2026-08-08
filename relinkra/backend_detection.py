@@ -631,24 +631,32 @@ def _authoritative_scope_survey(
     Reads every DECLARED location the host loads MCP servers from
     (``mcp_authoritative``) — user and workspace scope alike, so a
     merged-in sibling (OpenCode's ``.jsonc``) cannot hide a direct CBM
-    registration — and classifies what it finds under the connector's
-    static container path. An authoritative scope that exists but cannot
-    be read, parsed or walked is reported UNREADABLE — fail closed,
-    never "clean" — exactly like an unreadable active config. Aligned
-    with the apply scanner: a scope that exists but has no container (or
-    a non-mapping container) registers no servers, which is clean, not
-    unreadable.
+    registration — plus a renamed host's ``legacy_location_ids`` as
+    evidence-only scopes. This keeps a current Devin file from hiding a
+    directly callable CBM left in an imported Windsurf file without ever
+    making that legacy file a write target. A surveyed scope that exists
+    but cannot be read, parsed or walked is reported UNREADABLE — fail
+    closed, never "clean" — exactly like an unreadable active config.
+    Aligned with the apply scanner: a scope that exists but has no
+    container (or a non-mapping container) registers no servers, which is
+    clean, not unreadable.
     """
     detections: List[BackendDetection] = []
     unreadable = False
     for location in spec.locations:
-        if not location.mcp_authoritative:
+        legacy_ids = getattr(spec, "legacy_location_ids", ())
+        if not location.mcp_authoritative and location.location_id not in legacy_ids:
             continue
         pure = location.build(env)
         if pure is None:
             continue
         scope_path = Path(str(pure))
-        if not scope_path.exists():
+        try:
+            scope_path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable = True
             continue
         try:
             if scope_path.is_symlink() or not scope_path.is_file():

@@ -693,15 +693,60 @@ def _codex_locations() -> Tuple[LocationSpec, ...]:
 def _devin_desktop_locations() -> Tuple[LocationSpec, ...]:
     """Where the local desktop agent keeps its MCP configuration.
 
-    Every entry here is a LEGACY Windsurf/Codeium location, and every one
-    of them is real: they are the files the product actually writes today
-    on this machine. The current Devin Desktop location is deliberately
-    absent — inventing a path so the table looks complete would make
-    ``inspect`` report a missing file at a location that may not exist,
-    which is worse than admitting the gap. See
-    :data:`DEVIN_DESKTOP_NAMING`.
+    Declaration order IS precedence, and it follows the current
+    product's own contract rather than a guess: ``devin mcp add --help``
+    (devin 3000.3.27, Devin Desktop 3.6.27) documents three scopes —
+    workspace-local ``.devin/mcp_config.local.json`` (the default,
+    overriding project), workspace-project ``.devin/mcp_config.json``
+    and user ``~/.config/devin/mcp_config.json``. The Windows app
+    profile ``%APPDATA%\\Devin\\mcp_config.json`` is not in the CLI
+    text but is the file the installed product actually holds live MCP
+    servers in on this machine, so it outranks the CLI-documented user
+    path on observed liveness. Both user scopes are authoritative so
+    the shadow scan reports divergence instead of guessing a merge
+    rule.
+
+    The legacy Windsurf/Codeium files come LAST: they are still read
+    as evidence — the current product WATCHES and imports them one-way
+    into its MCP registry (TrustedOnNonce, proven in the shipped
+    bundles) — but they are never authoritative and never the active
+    target of a plan. See :data:`DEVIN_DESKTOP_NAMING`.
     """
     return (
+        LocationSpec(
+            location_id="devin_workspace_local_mcp",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/.devin/mcp_config.local.json",
+            build=lambda env: env.workspace_path(
+                ".devin", "mcp_config.local.json"
+            ),
+            mcp_authoritative=True,
+        ),
+        LocationSpec(
+            location_id="devin_workspace_project_mcp",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/.devin/mcp_config.json",
+            build=lambda env: env.workspace_path(".devin", "mcp_config.json"),
+            mcp_authoritative=True,
+        ),
+        LocationSpec(
+            location_id="devin_user_appdata_mcp",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="%APPDATA%/Devin/mcp_config.json",
+            build=lambda env: env.app_data("Devin", "mcp_config.json"),
+            mcp_authoritative=True,
+        ),
+        LocationSpec(
+            location_id="devin_user_config_mcp",
+            scope=SCOPE_USER,
+            config_format=FORMAT_JSON,
+            display_hint="~/.config/devin/mcp_config.json",
+            build=lambda env: env.config_home("devin", "mcp_config.json"),
+            mcp_authoritative=True,
+        ),
         LocationSpec(
             location_id="windsurf_user_mcp",
             scope=SCOPE_USER,
@@ -734,17 +779,12 @@ DEVIN_DESKTOP_NAMING = (
     "Windsurf (Codeium) is now Devin Desktop. The connector id is "
     "'devin-desktop'; 'windsurf' and 'codeium' remain aliases, and the "
     "~/.codeium locations stay discoverable because a rename does not move "
-    "anyone's existing configuration. A current Devin Desktop configuration "
-    "location will be declared once one has been observed locally — it is "
-    "not guessed here."
+    "anyone's existing configuration — and because the current product "
+    "still watches and imports them one-way into its MCP registry. The "
+    "current-product locations are declared from the 'devin mcp add' "
+    "scope documentation and the observed %APPDATA%/Devin app profile."
 )
 
-
-_NO_APPLY = (
-    "host writes stay disabled for this connector (R4C). Use "
-    "'relinkra connect plan' and apply the change by hand until a write "
-    "path is opened for it."
-)
 
 GENERIC = ConnectorSpec(
     connector_id="generic",
@@ -934,23 +974,66 @@ DEVIN_DESKTOP = ConnectorSpec(
     container_path=("mcpServers",),
     config_format=FORMAT_JSON,
     entry_builder=_string_command_entry,
-    # Verified against the LEGACY file only. The evidence string says so
-    # explicitly, because "format verified" for a renamed product is the
-    # easiest place to quietly inherit a claim that was never re-checked.
+    # Verified against the current product on this machine, not inherited
+    # from the rename: the evidence names the CLI scope documentation AND
+    # the files the installed product actually holds, because "format
+    # verified" for a renamed product is the easiest place to quietly
+    # inherit a claim that was never re-checked.
     format_verified=True,
     format_evidence=(
-        "'mcpServers' object with {command, args} entries, read from a real "
-        "local ~/.codeium/windsurf/mcp_config.json. The current Devin Desktop "
-        "configuration format has NOT been verified locally."
+        "'mcpServers' object with {command, args} entries. Current-product "
+        "evidence, proven locally on Devin Desktop 3.6.27 (product.json "
+        "1.126.0 stable, CLI devin 3000.3.27): 'devin mcp add --help' "
+        "documents workspace-local .devin/mcp_config.local.json (default, "
+        "overrides project), workspace-project .devin/mcp_config.json and "
+        "user ~/.config/devin/mcp_config.json; the product's own config "
+        "base is the lLr/f$ pair in the shipped bundles "
+        "(out/vs/sessions/sessions.desktop.main.js and "
+        "out/vs/workbench/api/node/extensionHostProcess.js): Windows -> "
+        "<home>/AppData/Roaming/devin, POSIX -> <home>/.config/devin, so "
+        "the CLI user scope IS the app profile on Windows. The running "
+        "product holds its live mcpServers in "
+        "%APPDATA%/Devin/mcp_config.json. The legacy "
+        "~/.codeium/windsurf/mcp_config.json is a watched one-way IMPORT "
+        "source (adapter with discoverySource 'windsurf', getFilePath -> "
+        "<home>/.codeium/<windsurf|windsurf-insiders|windsurf-next>/"
+        "mcp_config.json, watchFile -> adaptFile into the MCP registry, "
+        "trustBehavior TrustedOnNonce, order 400); no write-to-legacy path "
+        "exists in the workbench bundles. The byte-identity observed on "
+        "this machine is the 2026-06-03 migration artifact "
+        "(.devin-migration-complete marker; CLI migrations/"
+        "mcp_to_dedicated_file.rs), not an ongoing mirror."
     ),
-    apply_available=False,
-    apply_unavailable_reason=_NO_APPLY,
+    # R4C.1E Gate B opens the write path. Gate B1 machine evidence proved
+    # the mirror semantics (PROVEN_MULTI_SOURCE): the authoritative
+    # user-scope write target on Windows is the product's own
+    # %APPDATA%/Devin/mcp_config.json (= the CLI user scope), and the
+    # legacy paths are evidence-only import sources, never write targets.
+    # The same engine and the same gates as Claude Code (R4C.1B),
+    # OpenCode (R4C.1C) and Codex (R4C.1D) apply: unsafe targets,
+    # conflicts and direct CBM exposure in authoritative scopes are
+    # refused, and a written config is reported as host-unverified.
+    apply_available=True,
+    apply_unavailable_reason="",
     restart_instruction=(
         "Reload the MCP configuration from the Cascade/MCP panel."
     ),
     security_notes=(
         "Unrelated MCP servers in mcp_config.json are preserved untouched.",
-        "Legacy ~/.codeium locations are read, never migrated or deleted.",
+        "Legacy ~/.codeium locations are watched one-way import sources "
+        "(TrustedOnNonce, proven in the shipped workbench bundles): they "
+        "are read as evidence, never migrated, deleted or written, and "
+        "are never the plan target.",
+        "A direct codebase-memory (CBM) registration in a legacy file IS "
+        "imported into the live host registry by the current product, so "
+        "check and apply surface it loudly as a finding; per the phase "
+        "contract it does not block apply to the current-product target "
+        "(only authoritative-scope CBM blocks), and Relinkra never "
+        "removes it.",
+        "Workspace scopes (.devin/mcp_config.local.json overriding "
+        ".devin/mcp_config.json) and both user scopes are authoritative: "
+        "an entry shadowing the managed name in any of them is reported "
+        "as a conflict, never merged away.",
     ),
 )
 
@@ -1288,10 +1371,24 @@ def _preferred_target(
     spec: ConnectorSpec, inspection: InspectionResult
 ) -> Optional[ConfigLocation]:
     """Where a write WOULD go: the active config, else the first
-    declared writable candidate. Declaration order is the preference."""
-    if inspection.location is not None:
+    declared writable candidate. Declaration order is the preference.
+
+    A legacy location of a renamed host is never the target, even when
+    it is the active config the inspection read: the plan points at the
+    first declared current-product candidate instead — a create path
+    when nothing current exists yet, the same contract a host with no
+    configuration at all gets.
+    """
+    legacy_ids = spec.legacy_location_ids
+    if (
+        inspection.location is not None
+        and inspection.location.location_id not in legacy_ids
+    ):
         return inspection.location
-    return inspection.locations[0] if inspection.locations else None
+    for location in inspection.locations:
+        if location.location_id not in legacy_ids:
+            return location
+    return None
 
 
 def _describe_entry(entry: Mapping[str, Any]) -> str:
@@ -1398,7 +1495,16 @@ def build_plan(
         return plan
 
     desired = spec.entry_builder(launch)
-    document = inspection.document if inspection.document is not None else {}
+    # The document the decision merges into must be the TARGET's content.
+    # When the preferred target is not the inspected location — a
+    # legacy-only install whose plan aims at a current-product create
+    # path — the inspected document describes another file, so the plan
+    # starts from empty exactly as an absent config does.
+    document = (
+        inspection.document
+        if inspection.document is not None and location is inspection.location
+        else {}
+    )
     is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     container_path = inspection.container_path or spec.container_path
 
@@ -1593,6 +1699,7 @@ def check_registration(
     *,
     shadow_hints: Tuple[str, ...] = (),
     authoritative_scope_finding: str = "",
+    legacy_scope_findings: Tuple[str, ...] = (),
 ) -> CheckResult:
     """Validate the registration that is already there, changing nothing.
 
@@ -1608,6 +1715,13 @@ def check_registration(
     SHADOWS the target registration at runtime: the state is reported
     as a conflict even when the inspected file itself is clean, because
     which entry the host runs is the host's merge rule, not Relinkra's.
+
+    ``legacy_scope_findings`` names facts about the connector's
+    LEGACY/evidence-only locations (a direct CBM entry the host still
+    imports, an unreadable legacy file). They are surfaced as warnings,
+    never as findings: the ``valid``/exit semantics describe the
+    CURRENT-product registration, and a legacy-scope fact must not flip
+    them — but it must never pass silently either.
     """
     result = CheckResult(
         connector_id=spec.connector_id,
@@ -1615,6 +1729,8 @@ def check_registration(
         target_ref=_target_ref(spec, inspection.location),
     )
     result.warnings.extend(inspection.warnings)
+    for message in legacy_scope_findings:
+        result.warnings.append(ConnectorWarning("legacy_scope", message))
 
     if authoritative_scope_finding:
         result.registration_state = REGISTRATION_UNKNOWN
@@ -1650,6 +1766,23 @@ def check_registration(
     if inspection.existing_entry is None:
         result.findings.append("no Relinkra registration found for this host.")
         return result
+
+    if (
+        inspection.location is not None
+        and inspection.location.location_id in spec.legacy_location_ids
+    ):
+        # A registration at a LEGACY location of a renamed host is not a
+        # current-product registration, however equivalent its content:
+        # the plan contract refuses to treat that path as the target, so
+        # check must refuse to call it valid. ``registration_state`` stays
+        # truthful about what the inspected file contains; the finding is
+        # what flips ``valid`` and forces a human decision.
+        result.findings.append(
+            "the registration was found only at the legacy "
+            f"'{inspection.location.display_hint}' location, which belongs "
+            f"to the retired product naming; it is read as evidence but is "
+            f"not a current {spec.display_name} registration."
+        )
 
     entry = inspection.existing_entry
     tokens = entry_tokens(entry)

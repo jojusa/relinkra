@@ -17,11 +17,10 @@ relinkra connect generic
 
 Powerful inside, simple outside. Everything below is the "inside".
 
-> **Status.** Claude Code (R4C.1B) and OpenCode (R4C.1C) have a gated write
-> path (`connect apply` / `rollback` / `verify`); every other connector is
-> read-only. No connector has been independently proven against a live host
-> launch — a written config reports `config_applied_host_unverified` until
-> real host evidence is recorded. See [Capability honesty](#capability-honesty).
+> **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), and
+> Devin Desktop (R4C.1E) have gated write paths (`connect apply` / `rollback`
+> / `verify`). Devin Desktop has a real Cascade launch proof; other hosts
+> remain independently assessed. See [Capability honesty](#capability-honesty).
 
 ---
 
@@ -42,10 +41,10 @@ discover → inspect → plan → validate plan → dry-run
 | plan | `connectors.build_plan` | yes | `connect plan` |
 | validate plan | `config_merge.decide_member` | yes | `connect plan` |
 | dry-run | planning *is* the dry run | yes | `connect plan --dry-run` |
-| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode, codex) |
-| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode, codex) |
-| validate result | `config_formats.adapter_for(...).validate` | yes | `connect apply` (claude, opencode, codex) |
-| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode, codex) |
+| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
+| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
+| validate result | `config_formats.adapter_for(...).validate` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
+| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode, codex, devin-desktop) |
 
 The last four rows are wired only for the connectors whose write gate is
 open; every other connector still stops at `plan` — see
@@ -122,7 +121,7 @@ machine — not from documentation.
 | `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | yes (R4C.1B) | **no** |
 | `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | yes (R4C.1C) | **no** |
 | `codex` | experimental | yes | `[mcp_servers.<name>]` TOML tables | yes | yes (R4C.1D) | **no** |
-| `devin-desktop` | experimental | yes (legacy file) | `mcpServers` with `{command, args}` | yes | **no** | **no** |
+| `devin-desktop` | experimental | yes (current Devin file) | `mcpServers` with `{command, args}` | yes | **yes (R4C.1E)** | **yes (Cascade)** |
 | `devin-cloud` | unsupported | no | — | no | no | no |
 
 Codex writes use a **scoped textual TOML editor**: only the byte extent of the
@@ -140,7 +139,25 @@ writing require `tomllib` (Python 3.11+); on older interpreters the
 registration state is reported `unknown` and writes refuse, rather than
 guessing from a regex.
 
-Devin appears so the roadmap is visible. Nothing about it is implemented.
+### Devin Desktop
+
+The primary connector is `devin-desktop`. The compatibility aliases
+`windsurf`, `codeium`, and `windsurf-next` resolve to that same canonical
+connector; they do not create separate proof identities or writable targets.
+Bare `devin` remains ambiguous with the distinct, unsupported `devin-cloud`
+connector. Devin Cloud is outside the scope of R4C.1E.
+
+R4C.1E verified a real Devin Desktop/Cascade launch, the expected nine-tool
+Relinkra roster, six successful tool calls, project binding, handoff retrieval,
+and an explicit null `workspace_id`. The evidence is local-operational and
+does not independently attest the host. Doctor trust may therefore remain
+`PARTIAL`; this proof does not promote the ecosystem to `READY` by itself.
+
+When only a legacy file is discoverable, read-only inspection may display that
+file as the observed evidence location. This is not the writable target:
+planning and apply resolve the first current Devin location instead. The
+distinction is intentional and preserves legacy evidence without enabling a
+legacy write.
 
 ### Verification evidence schema
 
@@ -169,7 +186,7 @@ Nothing is globbed and no directory is walked.
 | `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
 | `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`) — the only apply target, plus `opencode.jsonc` siblings at user and workspace scope and `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` (discoverable and scanned for direct CBM, never the apply target) |
 | `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
-| `devin-desktop` | `~/.codeium/windsurf/mcp_config.json`, `~/.codeium/windsurf-next/mcp_config.json` (legacy; still discovered) |
+| `devin-desktop` | `.devin/mcp_config.local.json` → `.devin/mcp_config.json` → `%APPDATA%/Devin/mcp_config.json` → `~/.config/devin/mcp_config.json`; legacy `~/.codeium/windsurf/mcp_config.json` and `~/.codeium/windsurf-next/mcp_config.json` are discovery/import evidence only and are never preferred write targets |
 
 A host is reported `not_installed` only when **none** of its candidates exist
 **and** its executable is not on `PATH`. One missing conventional file proves

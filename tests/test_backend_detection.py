@@ -519,8 +519,15 @@ class DevinNamingTests(unittest.TestCase):
         self.assertIn("windsurf_next_mcp", ids)
         self.assertEqual(DEVIN_DESKTOP.legacy_location_ids, DEVIN_DESKTOP_LEGACY_LOCATIONS)
 
-    def test_the_current_devin_desktop_format_is_not_claimed_as_verified(self):
-        self.assertIn("NOT been verified", DEVIN_DESKTOP.format_evidence)
+    def test_the_current_devin_desktop_format_evidence_is_the_observed_config(self):
+        # R4C.1E Gate A verified the current product's format against the
+        # installed product itself; the evidence must cite that, not the
+        # legacy file the rename inherited.
+        evidence = DEVIN_DESKTOP.format_evidence
+        self.assertIn("mcpServers", evidence)
+        self.assertIn("devin mcp add", evidence)
+        self.assertIn("%APPDATA%/Devin/mcp_config.json", evidence)
+        self.assertNotIn("NOT been verified", evidence)
 
     def test_the_migration_is_documented_on_both_connectors(self):
         self.assertTrue(DEVIN_DESKTOP.naming_migration.strip())
@@ -607,6 +614,28 @@ class SurveyTests(unittest.TestCase):
         )
         assessment = assess_workspace(self.env(), launch_resolved=True)
         self.assertEqual(assessment.context_route, ROUTE_MIXED)
+        self.assertTrue(assessment.bypass_detected)
+
+    def test_current_devin_scope_does_not_hide_legacy_direct_cbm(self):
+        self.write(
+            ".config",
+            "devin",
+            "mcp_config.json",
+            content={"mcpServers": {"engram": ENGRAM_ENTRY}},
+        )
+        self.write(
+            ".codeium",
+            "windsurf",
+            "mcp_config.json",
+            content={"mcpServers": {"memory-helper": CBM_ENTRY}},
+        )
+        assessment = assess_workspace(self.env(), launch_resolved=True)
+        devin = next(
+            host for host in assessment.hosts if host["connector_id"] == "devin-desktop"
+        )
+        self.assertTrue(
+            any(item["backend"] == BACKEND_CBM for item in devin["detections"])
+        )
         self.assertTrue(assessment.bypass_detected)
 
     def test_a_legacy_windsurf_location_is_reported_as_legacy(self):

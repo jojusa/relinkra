@@ -160,12 +160,14 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(DEVIN_CLOUD.format_verified)
         self.assertEqual(DEVIN_CLOUD.locations, ())
 
-    def test_only_claude_opencode_and_codex_may_write_in_this_phase(self):
+    def test_only_claude_opencode_codex_and_devin_desktop_may_write_in_this_phase(self):
         # R4C.1B opened the write path for Claude Code; R4C.1C extended
         # it to OpenCode; R4C.1D extended it to Codex via a scoped
-        # textual TOML editor. Every other connector keeps the structural
-        # guarantee behind "live host configs unmodified".
-        writable = {"claude", "opencode", "codex"}
+        # textual TOML editor; R4C.1E Gate B extended it to Devin
+        # Desktop after Gate B1 proved the mirror semantics. Every other
+        # connector keeps the structural guarantee behind "live host
+        # configs unmodified".
+        writable = {"claude", "opencode", "codex", "devin-desktop"}
         for spec in CONNECTORS:
             with self.subTest(connector=spec.connector_id):
                 if spec.connector_id in writable:
@@ -658,13 +660,30 @@ class PlanTests(HostFixtureCase):
         )
         self.assertIn("mcp.relinkra", detail)
 
-    def test_devin_desktop_plans_against_the_legacy_file(self):
+    def test_devin_desktop_never_plans_against_a_legacy_file(self):
+        # R4C.1E Gate A declares the current-product locations. A
+        # legacy-only install is read as evidence, but the plan aims at
+        # the first declared current-product candidate — a create path,
+        # the same contract an absent config gets for any other host.
         self.write_config(
             ".codeium", "windsurf", "mcp_config.json", content={"mcpServers": {}}
         )
+        inspection = self.inspect(DEVIN_DESKTOP)
+        self.assertEqual(inspection.location.location_id, "windsurf_user_mcp")
         plan = self.plan(DEVIN_DESKTOP)
         self.assertEqual(plan.status, PLAN_READY)
-        self.assertEqual(plan.target_ref, "devin-desktop:windsurf_user_mcp")
+        self.assertEqual(plan.target_ref, "devin-desktop:devin_workspace_local_mcp")
+        self.assertEqual(self.ops(plan)[0], OP_CREATE_FILE)
+
+    def test_devin_desktop_plans_against_the_first_current_location(self):
+        self.write_config(
+            ".config", "devin", "mcp_config.json", content={"mcpServers": {}}
+        )
+        inspection = self.inspect(DEVIN_DESKTOP)
+        self.assertEqual(inspection.location.location_id, "devin_user_config_mcp")
+        plan = self.plan(DEVIN_DESKTOP)
+        self.assertEqual(plan.status, PLAN_READY)
+        self.assertEqual(plan.target_ref, "devin-desktop:devin_user_config_mcp")
 
     def test_every_operation_declares_conditions_and_rollback(self):
         self.claude_config({"mcpServers": {}})
