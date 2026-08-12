@@ -21,6 +21,7 @@ unrelated tool.
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -1135,6 +1136,20 @@ class RelinkraServices:
     # -- probes -----------------------------------------------------------
 
     def _probe_engram(self) -> _Probe:
+        # HTTP is a read accelerator only. Memory writes and handoffs still
+        # execute through the Engram CLI, so a reachable HTTP endpoint must
+        # not advertise the full capability set when that executable is
+        # absent.
+        if isinstance(self.store, EngramCLIAdapter) and not shutil.which(
+            self.store.engram_bin
+        ):
+            return _Probe(
+                available=False,
+                detail=(
+                    "Engram HTTP is read-only here; the Engram CLI is "
+                    "required for memory writes and handoffs"
+                ),
+            )
         try:
             self.store.search_records(
                 query=ENVELOPE_VERSION, project="rlk_" + "0" * 32, limit=1

@@ -25,6 +25,7 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 from relinkra.app_service import (
     RelinkraServices,
@@ -512,6 +513,28 @@ class CapabilityHonestyTests(HardeningTestCase):
         self.assertFalse(degraded["capabilities"]["memory_write"])
         # Git is independent and must stay advertised.
         self.assertTrue(degraded["capabilities"]["git_intelligence"])
+
+    def test_http_read_endpoint_does_not_hide_missing_engram_cli(self):
+        """HTTP search cannot make write-backed capabilities look healthy."""
+        from relinkra.engram_adapter import EngramCLIAdapter
+
+        store = EngramCLIAdapter(
+            engram_bin="__missing_relinkra_engram__",
+            http_url="http://127.0.0.1:7437",
+        )
+        with mock.patch.object(store, "search_records", return_value=[]), mock.patch(
+            "relinkra.app_service.shutil.which", return_value=None
+        ):
+            services = RelinkraServices(
+                config=ServiceConfig(registry_path=""),
+                store=store,
+            )
+            health = services.health()
+
+        self.assertFalse(health["components"]["engram"]["available"])
+        self.assertFalse(health["capabilities"]["memory_write"])
+        self.assertFalse(health["capabilities"]["handoffs"])
+        self.assertIn("CLI", health["components"]["engram"]["detail"])
 
     def test_advertised_handoff_capability_is_executable(self):
         """If health says handoffs work, creating one must succeed."""

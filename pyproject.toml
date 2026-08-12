@@ -1,0 +1,46 @@
+# Relinkra packaging contract.
+#
+# The version lives in exactly one place: relinkra/__init__.py (__version__).
+# This file reads it dynamically; never duplicate the version string here.
+# tests/test_packaging.py guards that contract.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relinkra"
+dynamic = ["version"]
+description = "Shared code intelligence, persistent memory and optimized context for AI coding agents."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
+
+# Console entry points. Every target is an existing `main() -> int`;
+# no wrappers, no generated launch logic.
+#   relinkra      — the user-facing front door (init/status/doctor/project/version/connect)
+#   relinkra-mcp  — the MCP server endpoint hosts connect to
+#                   (name pre-agreed in relinkra/connectors.py: CONSOLE_SCRIPT)
+[project.scripts]
+relinkra = "relinkra.product_cli:main"
+relinkra-mcp = "relinkra.mcp_cli:main"
+
+[tool.setuptools]
+# Flat layout, declared explicitly: auto-discovery would also see tests/
+# and fail or, worse, silently ship the test suite inside the package.
+packages = ["relinkra"]
+
+[tool.setuptools.dynamic]
+version = { attr = "relinkra.__version__" }

@@ -1,6 +1,6 @@
 # Product CLI (R4A)
 
-The user-facing front door: `init`, `status`, `doctor`, `project`.
+The user-facing front door: `init`, `status`, `doctor`, `project`, `version`.
 
 **Powerful inside, simple outside.** A developer should get from a fresh
 clone to a working Relinkra without knowing what CBM, Engram, a logical
@@ -23,7 +23,9 @@ Memory         AVAILABLE
 Handoffs       AVAILABLE
 ```
 
-Entry point: `python -m relinkra.product_cli`.
+Entry point: the installed `relinkra` console script — see
+[Installation](installation.md). From a source checkout,
+`python -m relinkra.product_cli` is equivalent.
 
 This is distinct from `relinkra.cli`, the R1B admin tool
 (`register` / `list` / `show`), which is unchanged.
@@ -147,6 +149,13 @@ corrupt registry.
 Logical identity for humans and scripts: project id, workspace id,
 display name, repository identity (value/kind/trust), branch, HEAD, and
 detached state. No absolute paths.
+
+## `relinkra version`
+
+Version and compatibility, deliberately path-free: Relinkra version, the
+Python it runs on (with the minimum supported), the MCP contract version,
+and whether it runs from an installed package or a source checkout. Takes
+`--json` but no `--path` — it answers about the tool, not a workspace.
 
 ## `--json`
 

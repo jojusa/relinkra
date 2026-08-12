@@ -1482,6 +1482,34 @@ def cmd_project(args) -> int:
     return EXIT_OK
 
 
+def cmd_version(args) -> int:
+    """Show the Relinkra version and basic compatibility information.
+
+    Deliberately path-free: a version answer must never leak local
+    directories into bug reports or screenshots.
+    """
+    package_parts = Path(__file__).resolve().parts
+    installed = any(
+        part in ("site-packages", "dist-packages") for part in package_parts
+    )
+    payload = {
+        "relinkra_version": __version__,
+        "contract_version": CONTRACT_VERSION,
+        "python_version": platform.python_version(),
+        "min_python_version": ".".join(str(part) for part in MIN_PYTHON),
+        "install_mode": "installed" if installed else "source",
+    }
+    text = (
+        f"relinkra {payload['relinkra_version']}\n"
+        f"python {payload['python_version']} "
+        f"(minimum {payload['min_python_version']}) "
+        f"· contract {payload['contract_version']} "
+        f"· {payload['install_mode']}"
+    )
+    _emit(payload, args.json, text)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1534,6 +1562,15 @@ def build_parser() -> argparse.ArgumentParser:
             "--json", action="store_true", help="emit machine-readable JSON"
         )
         command.set_defaults(func=handler)
+
+    # Version takes no --path: it answers about the tool, not a workspace.
+    version_cmd = sub.add_parser(
+        "version", help="show version and compatibility information"
+    )
+    version_cmd.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    version_cmd.set_defaults(func=cmd_version)
 
     # Imported here, not at module scope: connect_cli imports this
     # module for the exit-code contract and the shared renderers, so a
