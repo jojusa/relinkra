@@ -128,6 +128,13 @@ memories, memory↔code links, CBM facts, git intelligence, pending work,
 and relevant handoffs — then passes through **relevance → budget →
 portable serialization**, preserving the existing ordering invariants.
 
+The existing read tools also return additive R4D explanation fields. Context
+items carry `explain`, packets carry `contradictions` and `explainability`,
+and memory, code, Git, and handoff reads carry compact freshness sidecars.
+No tool name or input schema changed, and clients may ignore these new output
+fields. See [Freshness, contradictions, and explainability](freshness-explainability.md)
+for the exact states, fields, authority boundaries, and privacy guarantees.
+
 Handoffs are *not* special-cased. A handoff is persisted as a
 `handoff`-type memory, so R1E's existing memory selection picks it up
 into the packet's first-class `handoffs` section automatically.

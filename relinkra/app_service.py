@@ -44,6 +44,12 @@ from .context_packet import (
     PACKET_VERSION_V1,
     strip_portable_cbm_labels,
 )
+from .explainability import attach_budget, attach_relevance, explain_record
+from .freshness import (
+    FreshnessContext,
+    RevisionRelation,
+    RevisionRelationState,
+)
 from .engram_adapter import EngramCLIAdapter
 from .git_intelligence import (
     GIT_DEFAULT_COMMITS,
@@ -245,6 +251,42 @@ class RelinkraServices:
             **kwargs,
         )
 
+    def _freshness_context(self, project_id: str) -> tuple[FreshnessContext, Any]:
+        """Bounded current-Git context for read-side R4D tool metadata."""
+        current_revision = None
+        dirty = None
+        root = self.config.workspace_root
+        if root:
+            try:
+                state, _warnings = self.git_service.collect_repository_state(root)
+                if state is not None:
+                    current_revision = state.head_sha
+                    dirty = not state.clean
+            except Exception:
+                # Git is advisory on memory/handoff/code read surfaces.
+                # Unexpected adapter/runtime details are neither evidence nor
+                # safe portable output, so fail closed to UNKNOWN locally.
+                pass
+        context = FreshnessContext(
+            as_of=self._now(),
+            project_id=project_id,
+            current_revision=current_revision,
+            dirty=dirty,
+        )
+        resolver = None
+        if root and hasattr(self.git_service, "collect_revision_relation"):
+            def resolver(evidence, current):
+                try:
+                    return self.git_service.collect_revision_relation(
+                        root, evidence, current
+                    )
+                except Exception:
+                    return RevisionRelation(
+                        RevisionRelationState.UNAVAILABLE,
+                        reason="revision relation resolver failed",
+                    )
+        return context, resolver
+
     def _resolve_project_id(self, project_id: Optional[str]) -> str:
         resolved = (project_id or self.config.default_project_id or "").strip()
         if not resolved:
@@ -408,6 +450,7 @@ class RelinkraServices:
             # The control plane is a cross-agent channel by definition.
             include_agent_private=False,
             include_git=bool(include_git),
+            include_explain=True,
             git_history_limit=self.config.git_history_limit,
         )
 
@@ -446,6 +489,7 @@ class RelinkraServices:
                 )
             except RelevanceError as exc:
                 raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
+            attach_relevance(packet, ranked)
 
         budget_report = None
         if budget is not None or max_tokens is not None:
@@ -460,18 +504,29 @@ class RelinkraServices:
                     "budget_unsatisfiable: the essential packet exceeds "
                     f"max_estimated_tokens={resolved.max_estimated_tokens}",
                 )
+            packet = result.packet
+            if ranked is not None:
+                packet.diagnostics["relevance"] = {
+                    "ranked": True,
+                    "relevance_version": RELEVANCE_VERSION,
+                    "as_of": ranked.as_of,
+                }
+            attach_budget(packet, result.decisions)
+            result.reconcile_final_packet(packet)
+            if not result.satisfied:
+                raise ServiceError(
+                    ERR_INVALID_INPUT,
+                    "budget_unsatisfiable: the final packet metadata exceeds "
+                    f"max_estimated_tokens={resolved.max_estimated_tokens}",
+                )
             budget_report = result.to_portable_dict()
             # The report embeds the bounded packet, which this response
             # already returns under "packet". Shipping both would double
             # the payload — self-defeating on a surface whose entire
             # purpose is respecting a token budget.
             budget_report.pop("packet", None)
-            packet = result.packet
 
-        if ranked is not None:
-            # Annotated AFTER budgeting: apply_budget rebuilds the packet,
-            # so an annotation written before it would be dropped from the
-            # packet actually returned.
+        if ranked is not None and budget_report is None:
             packet.diagnostics["relevance"] = {
                 "ranked": True,
                 "relevance_version": RELEVANCE_VERSION,
@@ -531,11 +586,31 @@ class RelinkraServices:
         except MemoryError as exc:
             raise ServiceError(ERR_UNAVAILABLE, str(exc)) from exc
 
+        freshness_context, relation_resolver = self._freshness_context(project_id)
+        explained_memories = []
+        for memory in result.memories:
+            record = memory.to_dict()
+            record["explain"] = explain_record(
+                "memory",
+                {
+                    "timestamp": record.get("timestamp"),
+                    "commit_sha": record.get("commit_sha"),
+                    "project_id": record.get("project_id"),
+                },
+                context=freshness_context,
+                relation_resolver=relation_resolver,
+            )
+            explained_memories.append(record)
         return {
             "project_id": project_id,
             "count": len(result.memories),
             "skipped_malformed": result.skipped_malformed,
-            "memories": [m.to_dict() for m in result.memories],
+            "memories": explained_memories,
+            "explainability": {
+                "as_of": freshness_context.as_of,
+                "advisory_only": True,
+                "current_revision": freshness_context.current_revision,
+            },
         }
 
     def memory_save(
@@ -624,7 +699,10 @@ class RelinkraServices:
             file=file,
             symbol=symbol,
             include_agent_private=False,
-            include_git=False,
+            # Git facts remain private to this composition pass but let R4D
+            # compare revision-bound CBM/memory evidence to the checkout.
+            include_git=True,
+            include_explain=True,
         )
         try:
             packet = self._builder().build(request)
@@ -660,6 +738,8 @@ class RelinkraServices:
                 item.to_dict() for item in packet.memories
             ],
             "warnings": [w.to_dict() for w in packet.warnings],
+            "contradictions": packet.contradictions,
+            "explainability": packet.explainability,
         })
 
     def git_context(
@@ -680,6 +760,12 @@ class RelinkraServices:
         root = self.config.workspace_root
         warnings: List[ServiceWarning] = []
         if not root:
+            freshness_context = FreshnessContext(
+                as_of=self._now(),
+                project_id=project_id,
+                current_revision=None,
+                dirty=None,
+            )
             return {
                 "project_id": project_id,
                 "available": False,
@@ -689,6 +775,9 @@ class RelinkraServices:
                         "no workspace root is configured",
                     ).to_dict()
                 ],
+                "explain": explain_record(
+                    "git", {}, context=freshness_context
+                ),
             }
 
         limit = history_limit or self.config.git_history_limit
@@ -705,6 +794,14 @@ class RelinkraServices:
             except GitError as exc:
                 warnings.append(ServiceWarning(f"git_{name}_failed", str(exc)))
                 return None
+            except Exception:
+                warnings.append(
+                    ServiceWarning(
+                        f"git_{name}_failed",
+                        "git operation failed unexpectedly",
+                    )
+                )
+                return None
             for gw in git_warnings or ():
                 warnings.append(ServiceWarning(gw.code, gw.message))
             return value
@@ -713,6 +810,15 @@ class RelinkraServices:
         if state is None:
             payload["available"] = False
             payload["warnings"] = [w.to_dict() for w in warnings]
+            freshness_context = FreshnessContext(
+                as_of=self._now(),
+                project_id=project_id,
+                current_revision=None,
+                dirty=None,
+            )
+            payload["explain"] = explain_record(
+                "git", {}, context=freshness_context
+            )
             return payload
         payload["repository_state"] = state.to_dict()
 
@@ -745,6 +851,17 @@ class RelinkraServices:
                 payload["file_history"] = [c.to_dict() for c in history]
 
         payload["warnings"] = [w.to_dict() for w in warnings]
+        freshness_context = FreshnessContext(
+            as_of=self._now(),
+            project_id=project_id,
+            current_revision=state.head_sha,
+            dirty=not state.clean,
+        )
+        payload["explain"] = explain_record(
+            "git",
+            {"head_sha": state.head_sha},
+            context=freshness_context,
+        )
         return payload
 
     def handoff_create(
@@ -853,9 +970,25 @@ class RelinkraServices:
                     raise ServiceError(
                         ERR_NOT_FOUND, f"unknown handoff_id: {handoff_id}"
                     )
+                record = handoff.to_portable_dict()
+                freshness_context, relation_resolver = self._freshness_context(
+                    project_id
+                )
+                record["explain"] = explain_record(
+                    "handoff",
+                    {
+                        "observed_at": record.get("created_at"),
+                        "source_revision": (record.get("git_state") or {}).get(
+                            "head_sha"
+                        ),
+                        "project_id": record.get("project_id"),
+                    },
+                    context=freshness_context,
+                    relation_resolver=relation_resolver,
+                )
                 return {
                     "project_id": project_id,
-                    "handoff": handoff.to_portable_dict(),
+                    "handoff": record,
                 }
             handoffs = self.handoffs.list(
                 project_id=project_id,
@@ -871,10 +1004,27 @@ class RelinkraServices:
         except MemoryError as exc:
             raise ServiceError(ERR_UNAVAILABLE, str(exc)) from exc
 
+        freshness_context, relation_resolver = self._freshness_context(project_id)
+        records = []
+        for handoff in handoffs:
+            record = handoff.to_portable_dict()
+            record["explain"] = explain_record(
+                "handoff",
+                {
+                    "observed_at": record.get("created_at"),
+                    "source_revision": (record.get("git_state") or {}).get(
+                        "head_sha"
+                    ),
+                    "project_id": record.get("project_id"),
+                },
+                context=freshness_context,
+                relation_resolver=relation_resolver,
+            )
+            records.append(record)
         return {
             "project_id": project_id,
             "count": len(handoffs),
-            "handoffs": [h.to_portable_dict() for h in handoffs],
+            "handoffs": records,
         }
 
     def health(self, deep: bool = False) -> dict:

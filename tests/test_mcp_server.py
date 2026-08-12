@@ -19,12 +19,14 @@ from relinkra.app_service import (
     RelinkraServices,
     ServiceConfig,
 )
+from relinkra.context_packet import ContextPacket
+from relinkra.freshness import RevisionRelation, RevisionRelationState
 from relinkra.git_intelligence import (
     GitCapabilities,
     GitRepositoryState,
     GitWarning,
 )
-from relinkra.handoff import contains_absolute_path
+from relinkra.handoff import HANDOFF_VERSION, contains_absolute_path
 from relinkra.mcp_server import (
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -142,6 +144,27 @@ class RecordingGitService:
         if self._guard("collect_cochange"):
             return [], self._warning()
         return [], []
+
+
+class ExplodingGitService(RecordingGitService):
+    """Unexpected adapter fault carrying data that must never reach output."""
+
+    def collect_repository_state(self, path, capabilities=None):
+        self.calls.append("collect_repository_state")
+        raise RuntimeError(
+            "token=private-token at C:\\Users\\alice\\secret-repository"
+        )
+
+
+class HistoricalRelationGitService(RecordingGitService):
+    """Current Git plus a bounded relation for an older handoff revision."""
+
+    def collect_revision_relation(self, path, evidence_revision, current_revision):
+        self.calls.append("collect_revision_relation")
+        return RevisionRelation(
+            RevisionRelationState.ANCESTOR,
+            distance=4,
+        )
 
 
 class BrokenStore:
@@ -472,8 +495,160 @@ class ToolBehaviourTests(MCPTestCase):
             payload["packet"]["diagnostics"]["relevance"]["ranked"]
         )
         self.assertEqual(report["relevance_version"], RELEVANCE_VERSION)
+        final_packet = ContextPacket.from_dict(payload["packet"])
+        self.assertEqual(
+            report["final_usage"]["total_chars"],
+            final_packet.diagnostics["budget"]["final_total_chars"],
+        )
+        self.assertGreaterEqual(
+            report["final_usage"]["total_chars"], len(final_packet.to_json())
+        )
+        self.assertEqual(
+            report["final_usage"]["estimated_tokens"],
+            final_packet.diagnostics["budget"]["final_estimated_tokens"],
+        )
         # The packet is returned once, not embedded twice.
         self.assertNotIn("packet", report)
+
+    def test_r4d_read_surfaces_are_enriched_end_to_end(self):
+        context = self.ok("relinkra_context_get", task="auth work")
+        packet = context["packet"]
+        self.assertTrue(packet["explainability"]["advisory_only"])
+        self.assertTrue(
+            all(
+                "explain" in item
+                for section in (
+                    "memories",
+                    "pending",
+                    "handoffs",
+                    "code_references",
+                    "code_facts",
+                    "git_facts",
+                )
+                for item in packet.get(section, [])
+            )
+        )
+
+        memories = self.ok("relinkra_memory_search", query="auth")
+        self.assertTrue(memories["explainability"]["advisory_only"])
+        self.assertTrue(memories["memories"])
+        self.assertIn("freshness", memories["memories"][0]["explain"])
+
+        code = self.ok("relinkra_code_resolve", file="src/auth.py")
+        self.assertTrue(code["explainability"]["advisory_only"])
+        self.assertTrue(
+            all(
+                "explain" in item
+                for section in ("code_references", "code_facts")
+                for item in code[section]
+            )
+        )
+
+        created = self.ok(
+            "relinkra_handoff_create",
+            source_agent="opencode",
+            task="R4D surface handoff",
+            include_git_state=False,
+        )["handoff"]
+        fetched = self.ok(
+            "relinkra_handoff_get", handoff_id=created["handoff_id"]
+        )["handoff"]
+        self.assertIn("freshness", fetched["explain"])
+
+    def test_targeted_historical_handoff_is_enriched_without_mutating_storage(self):
+        historical_id = "hof_6d1bbdcd2ea6a19f15e412050be67950"
+        historical_revision = "b" * 40
+        body = {
+            "handoff_version": HANDOFF_VERSION,
+            "handoff_id": historical_id,
+            "project_id": self.env.project_id,
+            "workspace_id": None,
+            "source_agent": "opencode",
+            "target_agent": "codex",
+            "task": "Resume the historical R4D work unit",
+            "summary": "Faithful offline fixture for the stored handoff.",
+            "completed_work": ["captured the prior state"],
+            "pending_work": ["verify current code"],
+            "decisions": ["keep history append-only"],
+            "warnings": [],
+            "related_memory_ids": [],
+            "related_code_reference_ids": [],
+            "git_state": {
+                "branch": "historical-r4d",
+                "head_sha": historical_revision,
+                "short_head_sha": historical_revision[:7],
+                "detached": False,
+                "clean": True,
+                "counts": {
+                    "staged": 0,
+                    "unstaged": 0,
+                    "untracked": 0,
+                    "conflicted": 0,
+                },
+            },
+            "context_packet_id": None,
+            "supersedes": None,
+            "provenance": {
+                "producer": "relinkra.handoff",
+                "handoff_version": HANDOFF_VERSION,
+                "scope": "project_shared",
+            },
+        }
+        stored = self.env.save(
+            memory_type="handoff",
+            title="historical R4D handoff fixture",
+            body=json.dumps(body, sort_keys=True),
+            status="superseded",
+            branch="historical-r4d",
+            commit_sha=historical_revision,
+        )
+        before_records = tuple(
+            (record.record_id, record.title, record.content)
+            for record in self.env.store._records
+        )
+        before_writes = tuple(
+            (entry["title"], entry["content"], entry["topic_key"])
+            for entry in self.env.store.saved_args
+        )
+        self.services.config.workspace_root = self.env.ws_dir
+        self.services.git_service = HistoricalRelationGitService()
+
+        fetched = self.ok(
+            "relinkra_handoff_get", handoff_id=historical_id
+        )["handoff"]
+
+        self.assertEqual(fetched["handoff_version"], HANDOFF_VERSION)
+        self.assertEqual(fetched["handoff_id"], historical_id)
+        self.assertEqual(fetched["project_id"], self.env.project_id)
+        self.assertIsNone(fetched["workspace_id"])
+        self.assertEqual(fetched["source_agent"], "opencode")
+        self.assertEqual(fetched["target_agent"], "codex")
+        self.assertEqual(fetched["task"], body["task"])
+        self.assertEqual(fetched["summary"], body["summary"])
+        self.assertEqual(fetched["git_state"], body["git_state"])
+        self.assertEqual(fetched["status"], "superseded")
+        self.assertEqual(fetched["memory_id"], stored.memory_id)
+        freshness = fetched["explain"]["freshness"]
+        self.assertEqual(freshness["state"], "stale")
+        self.assertEqual(freshness["reason_code"], "revision_stale")
+        self.assertEqual(freshness["source_revision"], historical_revision)
+        self.assertEqual(freshness["current_revision"], "a" * 40)
+        self.assertTrue(freshness["recommended_action"])
+        self.assertTrue(fetched["explain"]["trust"]["advisory_only"])
+        self.assertEqual(
+            tuple(
+                (record.record_id, record.title, record.content)
+                for record in self.env.store._records
+            ),
+            before_records,
+        )
+        self.assertEqual(
+            tuple(
+                (entry["title"], entry["content"], entry["topic_key"])
+                for entry in self.env.store.saved_args
+            ),
+            before_writes,
+        )
 
     def test_context_get_rejects_unsatisfiable_budget(self):
         error = self.err("relinkra_context_get", task="auth", max_tokens=1)
@@ -773,6 +948,8 @@ class GitReadOnlyTests(MCPTestCase):
         payload = self.ok("relinkra_git_context")
         self.assertTrue(payload["available"])
         self.assertEqual(payload["repository_state"]["branch"], "main")
+        self.assertEqual(payload["explain"]["freshness"]["state"], "fresh")
+        self.assertTrue(payload["explain"]["trust"]["advisory_only"])
 
 
 class DegradedModeTests(unittest.TestCase):
@@ -856,6 +1033,7 @@ class DegradedModeTests(unittest.TestCase):
         payload = result["structuredContent"]
         self.assertFalse(payload["available"])
         self.assertTrue(payload["warnings"])
+        self.assertEqual(payload["explain"]["freshness"]["state"], "unknown")
 
     def test_git_down_still_creates_a_handoff(self):
         server, _ = self._server(
@@ -876,8 +1054,58 @@ class DegradedModeTests(unittest.TestCase):
         server, _ = self._server(workspace_root=None)
         git = self._call(server, "relinkra_git_context")
         self.assertFalse(git["structuredContent"]["available"])
+        self.assertEqual(
+            git["structuredContent"]["explain"]["freshness"]["state"],
+            "unknown",
+        )
         memory = self._call(server, "relinkra_memory_search")
         self.assertFalse(memory["isError"])
+
+    def test_unexpected_git_fault_degrades_read_surfaces_without_leaking(self):
+        server, env = self._server(
+            git_service=ExplodingGitService(), workspace_root="."
+        )
+        env.save(
+            memory_type="discovery",
+            title="Revision-bound discovery",
+            body="bounded",
+            commit_sha="a" * 40,
+        )
+        created = self._call(
+            server,
+            "relinkra_handoff_create",
+            source_agent="opencode",
+            task="fault isolation",
+            include_git_state=False,
+        )
+        self.assertFalse(created["isError"])
+        handoff_id = created["structuredContent"]["handoff"]["handoff_id"]
+
+        memory = self._call(
+            server, "relinkra_memory_search", query="Revision-bound"
+        )
+        handoff = self._call(
+            server, "relinkra_handoff_get", handoff_id=handoff_id
+        )
+        code = self._call(server, "relinkra_code_resolve", file="src/auth.py")
+        context = self._call(server, "relinkra_context_get", task="auth")
+        git = self._call(server, "relinkra_git_context")
+
+        for result in (memory, handoff, code, context, git):
+            self.assertFalse(result["isError"])
+            rendered = json.dumps(result["structuredContent"], sort_keys=True)
+            self.assertNotIn("private-token", rendered)
+            self.assertNotIn("C:\\\\Users", rendered)
+        explained = memory["structuredContent"]["memories"][0]["explain"]
+        self.assertEqual(explained["freshness"]["state"], "unknown")
+        self.assertEqual(
+            git["structuredContent"]["explain"]["freshness"]["state"],
+            "unknown",
+        )
+        self.assertIn(
+            "git_unavailable",
+            [w["code"] for w in code["structuredContent"]["warnings"]],
+        )
 
     def test_requested_git_state_never_vanishes_silently(self):
         """Asking for git state and getting none must be explained."""

@@ -70,6 +70,7 @@ from .git_intelligence import (
     GIT_DEFAULT_COMMITS,
     GitIntelligenceService,
 )
+from .explainability import annotate_packet
 from .memory import (
     STORE_PAGE_LIMIT,
     MemoryError,
@@ -104,6 +105,7 @@ WARN_WORKSPACE_NOT_REGISTERED = "workspace_not_registered"
 WARN_ITEMS_OMITTED = "items_omitted"
 WARN_CONTENT_TRUNCATED = "content_truncated"
 WARN_GIT_CONFLICTS = "git_conflicts"
+WARN_GIT_UNAVAILABLE = "git_unavailable"
 
 # Git-fact cap priority (quality-first, handoff Phase 18): essential repo
 # state and focused-file/anchored kinds outrank bulk listing kinds when
@@ -166,6 +168,9 @@ class ContextRequest:
     include_git: bool = False
     git_history_limit: Optional[int] = None
     git_include_diff_snippets: bool = False
+    # Additive capability negotiation for legacy direct-builder consumers.
+    # Agent-facing service/CLI entry points enable R4D explicitly.
+    include_explain: bool = False
 
 
 def _type_rank(memory_type: str) -> int:
@@ -278,10 +283,22 @@ class ContextBuilder:
         )
         linked_ids |= focus_linked_ids
 
-        git_items = self._collect_git_facts(
-            request, mode, focus, project_id, workspace_id,
-            warnings, omitted, diagnostics,
-        )
+        try:
+            git_items = self._collect_git_facts(
+                request, mode, focus, project_id, workspace_id,
+                warnings, omitted, diagnostics,
+            )
+        except Exception:
+            # Git is an additive read-side source. Unexpected adapter/runtime
+            # failures must not take down memory, handoff, or code reads, and
+            # exception text may contain machine-local paths or credentials.
+            warnings.append(
+                PacketWarning(
+                    WARN_GIT_UNAVAILABLE,
+                    "git context collection failed unexpectedly",
+                )
+            )
+            git_items = []
 
         matched_tokens = self._task_token_map(mode, task, candidates)
         ordered = _priority_sort(candidates)
@@ -355,9 +372,10 @@ class ContextBuilder:
             }
         )
 
-        return ContextPacket(
+        created_at = self._clock()
+        packet = ContextPacket(
             packet_id=packet_id,
-            created_at=self._clock(),
+            created_at=created_at,
             mode=mode,
             project_id=project_id,
             packet_version=packet_version,
@@ -383,6 +401,23 @@ class ContextBuilder:
             },
             diagnostics=diagnostics,
         )
+        relation_resolver = None
+        if self.workspace_root and hasattr(self.git, "collect_revision_relation"):
+            relation_resolver = (
+                lambda evidence, current: self.git.collect_revision_relation(
+                    self.workspace_root, evidence, current
+                )
+            )
+        # R4D is read-time metadata only. It neither filters evidence nor
+        # mutates Engram/CBM records, and uses the same injected clock value
+        # already captured in ``created_at``.
+        if request.include_explain:
+            return annotate_packet(
+                packet,
+                as_of=created_at,
+                relation_resolver=relation_resolver,
+            )
+        return packet
 
     # -- validation / registry ------------------------------------------
 
@@ -852,6 +887,14 @@ class ContextBuilder:
         snip_stats = {"snippets": 0, "truncated": 0}
         if mode not in ("file", "symbol"):
             return focus, code_ref_items, code_fact_items, linked_ids, snip_stats
+        # Legacy direct-builder callers do not pay for or observe R4D
+        # authority. Agent-facing reads negotiate explainability and receive
+        # one native CBM attestation shared by every code item in this build.
+        cbm_authority = (
+            self.linkage.code_evidence_authority()
+            if request.include_explain
+            else {}
+        )
 
         if mode == "file":
             ref = self._file_ref(request, project_id, workspace_id)
@@ -859,10 +902,12 @@ class ContextBuilder:
             resolution, adapter_failed = self._resolve_focus(ref, warnings)
             if not adapter_failed:
                 self._resolution_warning(resolution, warnings)
-            code_ref_items.append(self._code_ref_item(ref, resolution, mode))
+            code_ref_items.append(
+                self._code_ref_item(ref, resolution, mode, cbm_authority)
+            )
             fact = self._fact_item(
                 resolution.candidate, resolution.state, snip_stats,
-                snippet_ref=None,
+                snippet_ref=None, cbm_authority=cbm_authority,
             )
             if fact is not None:
                 code_fact_items.append(fact)
@@ -885,7 +930,9 @@ class ContextBuilder:
                 resolution, adapter_failed = self._resolve_focus(ref, warnings)
                 if not adapter_failed:
                     self._resolution_warning(resolution, warnings)
-                code_ref_items.append(self._code_ref_item(ref, resolution, mode))
+                code_ref_items.append(
+                    self._code_ref_item(ref, resolution, mode, cbm_authority)
+                )
                 snippet_ref = (
                     ref
                     if (
@@ -897,7 +944,7 @@ class ContextBuilder:
                 )
                 fact = self._fact_item(
                     resolution.candidate, resolution.state, snip_stats,
-                    snippet_ref=snippet_ref,
+                    snippet_ref=snippet_ref, cbm_authority=cbm_authority,
                 )
                 if fact is not None:
                     code_fact_items.append(fact)
@@ -906,7 +953,8 @@ class ContextBuilder:
                     omitted["code_facts"] += 1
                     continue
                 fact = self._fact_item(
-                    candidate.to_dict(), AMBIGUOUS, snip_stats, snippet_ref=None
+                    candidate.to_dict(), AMBIGUOUS, snip_stats,
+                    snippet_ref=None, cbm_authority=cbm_authority,
                 )
                 if fact is not None:
                     code_fact_items.append(fact)
@@ -1073,13 +1121,15 @@ class ContextBuilder:
                 )
 
     @staticmethod
-    def _code_ref_item(ref, resolution, mode) -> PacketItem:
+    def _code_ref_item(ref, resolution, mode, cbm_authority=None) -> PacketItem:
+        data = {
+            "reference": ref.to_dict(),
+            "resolution_state": resolution.state,
+            "note": resolution.note,
+        }
+        data.update(cbm_authority or {})
         return PacketItem(
-            data={
-                "reference": ref.to_dict(),
-                "resolution_state": resolution.state,
-                "note": resolution.note,
-            },
+            data=data,
             provenance=Provenance(
                 source="cbm" if resolution.state != MISSING else "relinkra",
                 why_included=f"focused {ref.reference_kind} (mode={mode})",
@@ -1090,7 +1140,9 @@ class ContextBuilder:
             ),
         )
 
-    def _fact_item(self, candidate, state, snip_stats, snippet_ref):
+    def _fact_item(
+        self, candidate, state, snip_stats, snippet_ref, cbm_authority=None
+    ):
         """Minimal CBM fact; optional bounded snippet for exact symbols."""
         if not candidate:
             return None
@@ -1109,6 +1161,7 @@ class ContextBuilder:
             "end_line": ref.end_line,
             "resolution_state": state,
         }
+        data.update(cbm_authority or {})
         if snippet_ref is not None:
             snippet, truncated = self._read_snippet(snippet_ref)
             if snippet is not None:

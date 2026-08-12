@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from relinkra.memory import redact_text, sanitize_error
 from relinkra.code_reference import normalize_repo_path
+from relinkra.freshness import RevisionRelation, RevisionRelationState
 
 # ---------------------------------------------------------------------------
 # Centralized limits (design §1)
@@ -40,8 +41,8 @@ _SHORT_SHA_LEN = 7
 _HEX_SHA_LEN = 40
 
 # The ONLY git verbs this module may ever spawn (read-only guarantee).
-# rev-list is deliberately excluded: v1 computes no ahead/behind and needs
-# no root-commit listing, so the allowlist stays minimal.
+# R4D revision relation reuses bounded ``log --ancestry-path`` queries, so
+# the original closed verb set remains unchanged.
 READ_ONLY_VERBS = frozenset({"status", "log", "diff", "rev-parse", "show"})
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1081,109 @@ class GitIntelligenceService:
         The module-level convenience API does so automatically.
         """
         self._repo_verified.clear()
+
+    def collect_revision_relation(
+        self,
+        path,
+        evidence_revision: str,
+        current_revision: str,
+        *,
+        max_distance: int = 100,
+    ) -> RevisionRelation:
+        """Relate two commits with bounded, portable, read-only Git calls.
+
+        Shallow history is reported explicitly when ancestry cannot be
+        established. Malformed or unavailable objects degrade to UNAVAILABLE;
+        callers never receive a false SAME/FRESH result.
+        """
+        cwd = str(path)
+        hex_revision = re.compile(r"^[0-9a-fA-F]{4,64}$")
+        if not hex_revision.fullmatch(str(evidence_revision or "")):
+            return RevisionRelation(
+                RevisionRelationState.UNAVAILABLE,
+                reason="evidence revision is malformed",
+            )
+        if not hex_revision.fullmatch(str(current_revision or "")):
+            return RevisionRelation(
+                RevisionRelationState.UNAVAILABLE,
+                reason="current revision is malformed",
+            )
+        shallow = False
+        try:
+            self._ensure_repository(cwd)
+            # Probe this before object resolution: a commit omitted by a
+            # shallow clone makes ``rev-parse --verify`` fail, and callers
+            # still need the shallow limitation to avoid treating that
+            # absence like a complete-history negative result.
+            shallow = (
+                self._runner.run(
+                    cwd, "rev-parse", "--is-shallow-repository"
+                ).strip()
+                == "true"
+            )
+            evidence = self._runner.run(
+                cwd, "rev-parse", "--verify", f"{evidence_revision}^{{commit}}"
+            ).strip()
+            current = self._runner.run(
+                cwd, "rev-parse", "--verify", f"{current_revision}^{{commit}}"
+            ).strip()
+        except GitError as exc:
+            return RevisionRelation(
+                RevisionRelationState.UNAVAILABLE,
+                shallow=shallow,
+                reason=sanitize_error(str(exc)),
+            )
+        if evidence == current:
+            return RevisionRelation(
+                RevisionRelationState.SAME, distance=0, shallow=shallow
+            )
+
+        def bounded_distance(older: str, newer: str) -> tuple[Optional[int], bool]:
+            """Bounded ancestry-path count, or (None, command-completeness)."""
+            cap = max(1, min(int(max_distance), 1000))
+            try:
+                output = self._runner.run(
+                    cwd,
+                    "log",
+                    "--format=%H",
+                    "--ancestry-path",
+                    f"--max-count={cap + 1}",
+                    f"{older}..{newer}",
+                )
+            except GitError:
+                return None, False
+            count = len([line for line in output.splitlines() if line.strip()])
+            return (count, count <= cap) if count else (None, True)
+
+        evidence_distance, evidence_complete = bounded_distance(evidence, current)
+        if evidence_distance is not None:
+            return RevisionRelation(
+                RevisionRelationState.ANCESTOR,
+                distance=evidence_distance,
+                bounded=evidence_complete,
+                shallow=shallow,
+                reason=("distance exceeds bound" if not evidence_complete else ""),
+            )
+        current_distance, current_complete = bounded_distance(current, evidence)
+        if current_distance is not None:
+            return RevisionRelation(
+                RevisionRelationState.DESCENDANT,
+                distance=current_distance,
+                bounded=current_complete,
+                shallow=shallow,
+                reason=("distance exceeds bound" if not current_complete else ""),
+            )
+        if not evidence_complete or not current_complete or shallow:
+            return RevisionRelation(
+                RevisionRelationState.UNAVAILABLE,
+                shallow=shallow,
+                reason=(
+                    "shallow history cannot establish revision relationship"
+                    if shallow
+                    else "revision relationship exceeds the bounded traversal"
+                ),
+            )
+        return RevisionRelation(RevisionRelationState.UNRELATED, shallow=False)
 
     # -- working tree ----------------------------------------------------
 

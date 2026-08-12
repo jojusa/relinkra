@@ -191,15 +191,26 @@ class PacketItem:
 
     data: dict
     provenance: Provenance
+    # R4D additive sidecar. ``None`` preserves the exact legacy wire form
+    # for callers constructing rlkctx1/rlkctx2 packets directly.
+    explain: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {"data": self.data, "provenance": self.provenance.to_dict()}
+        data = {"data": self.data, "provenance": self.provenance.to_dict()}
+        if self.explain is not None:
+            data["explain"] = self.explain
+        return data
 
     @staticmethod
     def from_dict(raw: Mapping) -> "PacketItem":
         return PacketItem(
             data=dict(raw.get("data") or {}),
             provenance=Provenance.from_dict(raw.get("provenance") or {}),
+            explain=(
+                dict(raw.get("explain") or {})
+                if "explain" in raw
+                else None
+            ),
         )
 
 
@@ -251,6 +262,10 @@ class ContextPacket:
     warnings: List[PacketWarning] = field(default_factory=list)
     provenance: dict = field(default_factory=dict)
     diagnostics: dict = field(default_factory=dict)
+    # R4D packet-level metadata is compact and single-copy. Empty defaults
+    # are omitted from serialization for backward compatibility.
+    contradictions: List[dict] = field(default_factory=list)
+    explainability: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         data = {
@@ -278,6 +293,10 @@ class ContextPacket:
         # output never carries the key (byte-compatible git-off behavior).
         if self.packet_version == PACKET_VERSION:
             data["git_facts"] = [item.to_dict() for item in self.git_facts]
+        if self.contradictions:
+            data["contradictions"] = self.contradictions
+        if self.explainability:
+            data["explainability"] = self.explainability
         return data
 
     @staticmethod
@@ -322,6 +341,8 @@ class ContextPacket:
             ],
             provenance=dict(data.get("provenance") or {}),
             diagnostics=dict(data.get("diagnostics") or {}),
+            contradictions=[dict(item) for item in data.get("contradictions") or []],
+            explainability=dict(data.get("explainability") or {}),
         )
 
     def to_json(self, *, pretty: bool = False) -> str:
@@ -506,6 +527,59 @@ class ContextPacket:
         else:
             lines.append("- (none)")
         lines.append("")
+
+        if self.explainability:
+            lines.append("## Freshness and contradictions")
+            lines.append("")
+            states: dict[str, int] = {}
+            for item in (
+                self.memories
+                + self.pending
+                + self.handoffs
+                + self.code_references
+                + self.code_facts
+                + self.git_facts
+            ):
+                freshness = (item.explain or {}).get("freshness") or {}
+                state = str(freshness.get("state") or "unknown")
+                states[state] = states.get(state, 0) + 1
+            if states:
+                lines.append(
+                    "- freshness: "
+                    + ", ".join(
+                        f"{state}={states[state]}" for state in sorted(states)
+                    )
+                )
+            else:
+                lines.append("- freshness: no selected evidence")
+            for notice in self.explainability.get("notices") or []:
+                ref = notice.get("evidence_ref") or "unknown evidence"
+                state = notice.get("state") or "unknown"
+                action = notice.get("recommended_action") or (
+                    "Inspect the referenced source before relying on it."
+                )
+                lines.append(
+                    f"- {ref} is {state}. Recommended action: {action}"
+                )
+            lines.append(f"- contradictions: {len(self.contradictions)}")
+            lines.append("- advisory only: independent inspection remains available")
+            for contradiction in self.contradictions:
+                subject = contradiction.get("subject") or "unknown subject"
+                key = contradiction.get("key") or "unknown fact"
+                sources = ", ".join(
+                    contradiction.get("source_systems") or []
+                )
+                refs = ", ".join(contradiction.get("evidence_refs") or [])
+                action = contradiction.get("recommended_action") or (
+                    "Inspect the referenced sources and resolve the conflict."
+                )
+                lines.append(
+                    f"- [{contradiction.get('type')}] "
+                    f"{subject}.{key} conflicts across sources "
+                    f"{sources or 'unknown'} (evidence: {refs or 'unavailable'}). "
+                    f"Recommended action: {action}"
+                )
+            lines.append("")
 
         lines.append("## Provenance")
         lines.append("")

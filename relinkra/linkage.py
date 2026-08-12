@@ -33,8 +33,9 @@ from a genuinely absent symbol.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Mapping, Optional
 
 from .cbm_adapter import CBMAdapterError
 from .code_reference import (
@@ -57,6 +58,7 @@ AMBIGUOUS = "ambiguous"
 MISSING = "missing"
 STALE = "stale"
 RESOLUTION_STATES = (RESOLVED, AMBIGUOUS, MISSING, STALE)
+_GRAPH_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 @dataclass
@@ -146,12 +148,78 @@ def _adapter_call(operation: str, func, *args, **kwargs):
         ) from exc
 
 
+def _portable_cbm_authority(raw: Any) -> dict:
+    """Allowlist one native CBM graph attestation for packet evidence.
+
+    Adapter responses are infrastructure-owned.  Re-project them even when an
+    injected adapter claims to be portable so roots, project slugs, credentials,
+    host configuration, and trust-stage detail can never enter a packet.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    has_index = "index_status" in raw
+    has_stages = "trust_stages" in raw
+    if not (has_index or has_stages):
+        return {}
+
+    result: dict = {}
+    if has_index:
+        index = raw.get("index_status")
+        git_facts = index.get("git") if isinstance(index, Mapping) else None
+        revision = (
+            git_facts.get("head_sha")
+            if isinstance(git_facts, Mapping)
+            else None
+        )
+        revision = str(revision or "").strip()
+        portable_git = {}
+        if _GRAPH_REVISION_RE.fullmatch(revision):
+            portable_git["head_sha"] = revision
+        result["index_status"] = {"git": portable_git}
+
+    graph_status = "WARN"
+    stages = raw.get("trust_stages")
+    if isinstance(stages, (list, tuple)):
+        graph_statuses = []
+        for stage in stages:
+            if not isinstance(stage, Mapping):
+                continue
+            if str(stage.get("name") or "").strip().lower() != "cbm graph":
+                continue
+            graph_statuses.append(str(stage.get("status") or "").strip().upper())
+        # A single PASS is trustworthy.  Conflicting duplicate attestations
+        # are not: never collapse [PASS, WARN] into synthetic PASS.
+        if graph_statuses and all(status == "PASS" for status in graph_statuses):
+            graph_status = "PASS"
+    result["trust_stages"] = [
+        {"name": "CBM graph", "status": graph_status}
+    ]
+    return result
+
+
 class LinkageService:
     """Resolution and query service over a MemoryService + CBM adapter."""
 
     def __init__(self, memory_service: MemoryService, cbm_adapter: Any = None):
         self.memories = memory_service
         self.cbm = cbm_adapter
+
+    def code_evidence_authority(self) -> dict:
+        """Read the adapter's optional native graph attestation safely.
+
+        Attestation is additive: legacy adapters without the capability keep
+        resolving code exactly as before, while R4D freshness remains UNKNOWN.
+        A failed authority probe never turns a usable symbol lookup into an
+        outage and never borrows trust from copied result metadata.
+        """
+        provider = getattr(self.cbm, "code_evidence_authority", None)
+        if not callable(provider):
+            return {}
+        try:
+            raw = provider()
+        except Exception:
+            return {}
+        return _portable_cbm_authority(raw)
 
     # -- resolution ---------------------------------------------------
 

@@ -82,7 +82,9 @@ Hard rules:
   (section, source_id) pair in packet order. Duplicated or empty source
   ids therefore each get their OWN decision; ``BudgetDecision.source_id``
   keeps its public shape, and the report id hashes
-  section:source_id:occurrence so identical inputs stay byte-identical.
+  section:source_id:occurrence plus the final portable packet bytes so
+  identical inputs stay byte-identical, local paths cannot affect the id,
+  and post-budget metadata cannot leave a stale report identity behind.
 - Typed malformed packets are REJECTED at the boundary: a code_fact
   ``snippet`` that is neither a string nor None raises
   BudgetValidationError naming the section/index and the offending TYPE
@@ -447,6 +449,35 @@ class BudgetedContext:
     satisfied: bool
     report_id: str = ""
     relevance_version: Optional[str] = None
+
+    def reconcile_final_packet(self, packet: ContextPacket) -> None:
+        """Rebind the report to a packet mutated after the budget ladder.
+
+        Additive metadata may be attached only after the ladder has produced
+        its decisions.  Callers must then re-account those exact final bytes;
+        otherwise ``satisfied``, ``final_usage`` and ``report_id`` describe a
+        packet that was never returned.
+        """
+        satisfied = _hard_guarantee(packet, self.budget)
+        budget_diagnostics = packet.diagnostics.get("budget")
+        if isinstance(budget_diagnostics, dict):
+            budget_diagnostics["satisfied"] = satisfied
+            if satisfied and not _hard_guarantee(packet, self.budget):
+                # ``false`` is one byte longer than ``true`` today, but keep
+                # this fail-honest if the representation changes later.
+                satisfied = False
+                budget_diagnostics["satisfied"] = False
+        usage = _usage(packet, self.budget.chars_per_token, self.decisions)
+        self.final_usage = usage
+        self.satisfied = satisfied
+        self.status = STATUS_OK if satisfied else STATUS_UNSATISFIABLE
+        self.packet = packet if satisfied else None
+        self.report_id = _report_id(
+            self.original_packet_id,
+            self.budget,
+            self.decisions,
+            packet,
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -886,7 +917,12 @@ def apply_budget(
             else None
         ),
     )
-    result.report_id = _report_id(packet.packet_id, budget, decisions)
+    result.report_id = _report_id(
+        packet.packet_id,
+        budget,
+        decisions,
+        working,
+    )
     return result
 
 
@@ -1282,12 +1318,9 @@ def _report_id(
     original_packet_id: str,
     budget: ContextBudget,
     decisions: List[BudgetDecision],
+    final_packet: ContextPacket,
 ) -> str:
-    """bgr_ + first 32 hex of sha256(ns + packet id + budget json +
-    section:source_id:occurrence per decision). The occurrence index is
-    the deterministic count of prior decisions with the same
-    (section, source_id), so duplicated ids stay collision-free and
-    identical inputs stay byte-identical."""
+    """Hash policy, decisions and the exact final portable packet bytes."""
     counters: Dict[Tuple[str, str], int] = {}
     parts: List[str] = []
     for decision in decisions:
@@ -1302,5 +1335,7 @@ def _report_id(
         + _compact_json(budget.to_dict()).encode("utf-8")
         + b"\x00"
         + "\n".join(parts).encode("utf-8")
+        + b"\x00"
+        + final_packet.to_portable_json().encode("utf-8")
     )
     return REPORT_ID_PREFIX + hashlib.sha256(payload).hexdigest()[:32]

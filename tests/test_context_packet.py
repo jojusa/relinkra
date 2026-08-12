@@ -37,7 +37,13 @@ from relinkra.context_packet import (
 )
 from relinkra.engram_adapter import EngramCLIAdapter, InMemoryStore
 from relinkra.identity import derive_project_id, normalize_remote_url
-from relinkra.memory import MemoryService, MemoryStoreError
+from relinkra.memory import (
+    ENGRAM_SCOPE,
+    STORAGE_TYPE_MAP,
+    Memory,
+    MemoryService,
+    MemoryStoreError,
+)
 from relinkra.registry import Registry
 
 try:
@@ -1049,6 +1055,76 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["packet_id"], builder_packet.packet_id)
+
+    def test_explain_cli_keeps_legacy_malformed_timestamp_non_temporal(self):
+        """A stored legacy record must not crash packet/CLI construction."""
+        handoff_id = "hof_" + "7" * 32
+
+        def save_legacy(memory_id, timestamp, status, commit_sha=None):
+            memory = Memory(
+                memory_id=memory_id,
+                project_id=self.env.project_id,
+                workspace_id=None,
+                agent_id="legacy-agent",
+                agent_type="legacy",
+                memory_type="handoff",
+                title=f"Legacy chronology {memory_id[-1]}",
+                body=json.dumps(
+                    {"handoff_id": handoff_id, "status": status},
+                    sort_keys=True,
+                ),
+                timestamp=timestamp,
+                repository_identity=REPO,
+                scope="project_shared",
+                commit_sha=commit_sha,
+                scope_channel="shared",
+                topic_key=f"relinkra/v1/{self.env.project_id}/shared/{memory_id}",
+            )
+            self.env.store.save_record(
+                title=memory.title,
+                content=memory.envelope_json(),
+                storage_type=STORAGE_TYPE_MAP[memory.memory_type],
+                project=self.env.project_id,
+                scope=ENGRAM_SCOPE,
+                topic_key=memory.topic_key,
+            )
+
+        save_legacy(
+            "mem_" + "e" * 16,
+            "legacy-not-a-timestamp",
+            "open",
+            r"C:\\private\\legacy-repository",
+        )
+        save_legacy(
+            "mem_" + "f" * 16,
+            "2026-02-01T00:00:00Z",
+            "closed",
+        )
+
+        code, out, err = self.run_cli(
+            [
+                "--project-id", self.env.project_id,
+                "--registry", self.env.registry_path,
+                "--explain",
+            ],
+            store=self.env.store,
+            clock=fixed_clock,
+        )
+
+        self.assertEqual(code, 0, err)
+        document = json.loads(out)
+        contradiction = next(
+            item
+            for item in document["contradictions"]
+            if item["subject"] == handoff_id and item["key"] == "status"
+        )
+        self.assertEqual(contradiction["type"], "status_conflict")
+        self.assertNotIn("newer_evidence_ref", contradiction)
+        self.assertIn("legacy-not-a-timestamp", contradiction["observed_at"])
+        self.assertTrue(
+            any(item["section"] == "handoffs" for item in document["items"])
+        )
+        self.assertNotIn(r"C:\\private\\legacy-repository", out)
 
 
 class PortableCacheDirTests(unittest.TestCase):

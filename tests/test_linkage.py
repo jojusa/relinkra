@@ -793,6 +793,49 @@ class TestCBMCLIAdapter(unittest.TestCase):
             ),
         )
 
+    def test_code_evidence_authority_projects_only_graph_head_and_trust(self):
+        adapter = self.make_adapter()
+        head = "a" * 40
+        raw = {
+            "root_path": r"C:\work\ws-a",
+            "git": {"head_sha": head},
+            "credentials": {"token": "secret"},
+            "host_config": {"host": "private.internal"},
+        }
+        with mock.patch.object(adapter, "index_status", return_value=raw), mock.patch(
+            "relinkra.cbm_adapter.git_head_sha", return_value=head
+        ):
+            authority = adapter.code_evidence_authority()
+        self.assertEqual(
+            authority,
+            {
+                "index_status": {"git": {"head_sha": head}},
+                "trust_stages": [{"name": "CBM graph", "status": "PASS"}],
+            },
+        )
+        rendered = json.dumps(authority, sort_keys=True)
+        self.assertNotIn("root_path", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("private.internal", rendered)
+
+    def test_code_evidence_authority_warns_when_graph_cannot_be_attested(self):
+        adapter = self.make_adapter()
+        head = "a" * 40
+        with mock.patch.object(
+            adapter,
+            "index_status",
+            return_value={
+                "root_path": r"D:\other\repo",
+                "git": {"head_sha": head},
+            },
+        ), mock.patch("relinkra.cbm_adapter.git_head_sha") as git_head:
+            authority = adapter.code_evidence_authority()
+        self.assertEqual(
+            authority["trust_stages"],
+            [{"name": "CBM graph", "status": "WARN"}],
+        )
+        git_head.assert_not_called()
+
     @unittest.skipUnless(os.name == "nt", "Windows normcase semantics")
     def test_windows_drive_casing_relativized(self):
         adapter = self.make_adapter(workspace_root=r"C:\work\ws-a")

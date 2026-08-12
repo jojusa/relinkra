@@ -44,6 +44,12 @@ from .context_builder import (
     _utcnow,
 )
 from .engram_adapter import EngramCLIAdapter
+from .explainability import (
+    attach_budget,
+    attach_relevance,
+    explanation_document,
+    human_summary,
+)
 from .memory import MemoryError, MemoryService, sanitize_error
 from .registry import DEFAULT_REGISTRY_PATH, Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
@@ -94,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="emit a compact explanation instead of raw evidence; JSON is "
+        "machine-readable and --format markdown is operator-friendly; "
+        "when --workspace-root is set, current Git context is included",
+    )
+    parser.add_argument(
         "--budget",
         choices=("small", "medium", "large"),
         default=None,
@@ -135,7 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="max commits for git recent-commit/file-history facts "
-        "(requires --git; service default and clamps apply)",
+        "(requires Git collection via --git or --explain with a workspace "
+        "root; service default and clamps apply)",
     )
     return parser
 
@@ -176,6 +190,7 @@ def main(
     *,
     store=None,
     cbm_adapter=None,
+    git_service=None,
     clock=None,
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -209,6 +224,7 @@ def main(
         cbm_adapter=cbm_adapter,
         registry=registry,
         workspace_root=args.workspace_root,
+        git_service=git_service,
         **builder_kwargs,
     )
     request = ContextRequest(
@@ -219,7 +235,10 @@ def main(
         symbol=args.symbol,
         requesting_agent=args.requesting_agent or "",
         include_agent_private=bool(args.include_agent_private),
-        include_git=bool(args.git),
+        # Explainability needs the current checkout when one is configured;
+        # with no root, retain the historical git-off packet behavior.
+        include_git=bool(args.git or (args.explain and args.workspace_root)),
+        include_explain=bool(args.explain),
         git_history_limit=args.git_history_limit,
     )
     try:
@@ -259,6 +278,7 @@ def main(
             )
         except RelevanceError as exc:
             return _fail(str(exc))
+        attach_relevance(packet, ranked)
         packet.diagnostics["relevance"] = {
             "ranked": True,
             "relevance_version": RELEVANCE_VERSION,
@@ -286,6 +306,10 @@ def main(
             result = apply_budget(packet, budget, relevance=ranked)
         except BudgetValidationError as exc:
             return _fail(str(exc))
+        if result.satisfied:
+            packet = result.packet
+            attach_budget(packet, result.decisions)
+            result.reconcile_final_packet(packet)
         if not result.satisfied:
             error_doc = {
                 "error": "budget_unsatisfiable",
@@ -314,7 +338,19 @@ def main(
     elif args.relevance_report and ranked is not None:
         _emit(ranked.to_dict(), fh=sys.stderr)
 
-    if args.format == "markdown":
+    if args.explain and args.format == "markdown":
+        print(human_summary(packet), end="")
+    elif args.explain:
+        print(
+            json.dumps(
+                explanation_document(packet),
+                indent=2 if args.pretty else None,
+                sort_keys=True,
+                separators=None if args.pretty else (",", ":"),
+                ensure_ascii=False,
+            )
+        )
+    elif args.format == "markdown":
         print(packet.to_markdown())
     else:
         print(packet.to_portable_json(pretty=args.pretty))

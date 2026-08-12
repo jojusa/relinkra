@@ -24,6 +24,7 @@ from relinkra.context_budget import (
     SNIPPET_LADDER_CAP,
     TRUNCATION_MARKER,
     BudgetValidationError,
+    BudgetedContext,
     ContextBudget,
     _usage,
     apply_budget,
@@ -32,6 +33,11 @@ from relinkra.context_budget import (
     estimate_tokens,
     prepare_budgeted_packet,
     resolve_budget,
+)
+from relinkra.explainability import explanation_document
+from relinkra.git_intelligence import (
+    GitCapabilities,
+    GitRepositoryState,
 )
 from relinkra.context_packet import (
     PACKET_VERSION,
@@ -57,6 +63,47 @@ from test_context_packet import (
 )
 
 SLUG = "C-Desarrollos-relinkra-ws"
+
+
+class CLIRecordingGitService:
+    """Minimal healthy Git adapter for CLI boundary tests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def collect_capabilities(self, path):
+        self.calls.append("collect_capabilities")
+        return (
+            GitCapabilities(
+                git_available=True,
+                git_version="2.55.0",
+                repository_detected=True,
+                is_bare=False,
+                head_available=True,
+            ),
+            [],
+        )
+
+    def collect_repository_state(self, path, capabilities=None):
+        self.calls.append("collect_repository_state")
+        return (
+            GitRepositoryState(
+                head_sha="a" * 40,
+                short_head_sha="a" * 7,
+                branch="main",
+                detached=False,
+                clean=True,
+                staged_count=0,
+                unstaged_count=0,
+                untracked_count=0,
+                conflicted_count=0,
+            ),
+            [],
+        )
+
+    def collect_head_facts(self, path, state=None):
+        self.calls.append("collect_head_facts")
+        return None, []
 
 
 def compact(obj):
@@ -975,6 +1022,62 @@ class CLITests(unittest.TestCase):
         # git-off builds keep emitting rlkctx1 (byte-compatible); the
         # PACKET_VERSION constant now denotes the LATEST version (rlkctx2).
         self.assertEqual(packet["packet_version"], PACKET_VERSION_V1)
+
+    def test_explain_implies_git_only_when_workspace_root_exists(self):
+        git = CLIRecordingGitService()
+        code, out, err = self.run_cli(
+            self.base_argv(
+                "--workspace-root", self.env.ws_dir, "--explain"
+            ),
+            git_service=git,
+        )
+        self.assertEqual(code, 0, err)
+        explained = json.loads(out)
+        self.assertIn("collect_repository_state", git.calls)
+        self.assertTrue(
+            any(item["section"] == "git_facts" for item in explained["items"])
+        )
+
+        no_root_git = CLIRecordingGitService()
+        code, out, err = self.run_cli(
+            self.base_argv("--explain"), git_service=no_root_git
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(no_root_git.calls, [])
+        self.assertFalse(
+            any(
+                item["section"] == "git_facts"
+                for item in json.loads(out)["items"]
+            )
+        )
+
+    def test_explain_budget_report_matches_exact_final_packet(self):
+        git = CLIRecordingGitService()
+        code, out, err = self.run_cli(
+            self.base_argv(
+                "--workspace-root",
+                self.env.ws_dir,
+                "--explain",
+                "--max-tokens",
+                "50000",
+                "--budget-report",
+            ),
+            git_service=git,
+        )
+        self.assertEqual(code, 0, err)
+        report = json.loads(err)
+        packet = ContextPacket.from_dict(report["packet"])
+        self.assertEqual(json.loads(out), explanation_document(packet))
+        self.assertEqual(report["final_usage"]["total_chars"], len(packet.to_json()))
+        self.assertEqual(
+            report["final_usage"]["estimated_tokens"],
+            estimate_tokens(packet.to_json(), report["budget"]["chars_per_token"]),
+        )
+        recomputed = BudgetedContext.from_dict(report)
+        report_id = recomputed.report_id
+        recomputed.reconcile_final_packet(packet)
+        self.assertEqual(report_id, recomputed.report_id)
+        self.assertNotIn("local", report["packet"]["diagnostics"])
 
     def test_unsatisfiable_exit_1_with_stderr_json(self):
         code, out, err = self.run_cli(self.base_argv("--max-tokens", "1"))

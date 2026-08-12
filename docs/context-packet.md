@@ -44,6 +44,21 @@ Powerful inside, simple outside:
 - It is NOT a graph walk. Code focus resolves ONE reference and its
   directly linked memories. No recursion, no full-file ingestion.
 
+## Freshness and explainability
+
+Agent-facing packet reads can add an `explain` sidecar to every selected
+item plus packet-level `contradictions` and `explainability` blocks. These
+fields report why evidence was selected, what supports its currency, how
+relevance and budget policy treated it, and which narrowly structured facts
+disagree. They are advisory: they never hide evidence, choose a global winner,
+or restrict an agent from inspecting the underlying source.
+
+Freshness is evidence-specific and revision-aware. In particular, “fresh”
+does not mean “true” or “bug-free,” and missing Git or authority evidence
+becomes `unknown`, not optimistic confidence. See
+[Freshness, contradictions, and explainability](freshness-explainability.md)
+for the state policy, fields, privacy boundary, and examples.
+
 ## Deterministic identity
 
 `packet_id` = `pkt_` + first 32 hex of
@@ -160,7 +175,8 @@ python -m relinkra.context_cli --project-id rlk_... \
     [--engram-project-alias relinkra] \
     [--cbm-bin codebase-memory-mcp] [--cbm-cache-dir D] [--cbm-project-name S] \
     [--workspace-root R] [--requesting-agent opencode] [--include-agent-private] \
-    [--format json|markdown] [--pretty]
+    [--format json|markdown] [--pretty] [--explain] \
+    [--relevance] [--budget small|medium|large] [--max-tokens N]
 ```
 
 JSON (or Markdown) goes to stdout only; errors are redacted JSON on stderr
@@ -179,7 +195,19 @@ python -m relinkra.context_cli --project-id rlk_... --task "fix the parser"
 python -m relinkra.context_cli --project-id rlk_... --symbol src.calc.add \
     --cbm-bin codebase-memory-mcp --cbm-project-name <slug> \
     --workspace-root . --format markdown
+
+# compact machine explanation (not the raw evidence bodies)
+python -m relinkra.context_cli --project-id rlk_... --workspace-root . \
+    --task "fix the parser" --explain --pretty
+
+# concise operator explanation
+python -m relinkra.context_cli --project-id rlk_... --workspace-root . \
+    --task "fix the parser" --explain --format markdown
 ```
+
+With `--workspace-root`, `--explain` enables the read-only Git collection
+needed for revision comparison. Without a workspace root, code currency is
+reported honestly as `unknown` when it cannot be established.
 
 ## Engram project alias
 

@@ -25,6 +25,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -56,6 +57,11 @@ from relinkra.connectors import (
     resolve_launch,
 )
 from relinkra.handoff import contains_absolute_path
+from relinkra.freshness import (
+    FreshnessContext,
+    FreshnessState,
+    evaluate_freshness,
+)
 from relinkra.host_discovery import (
     SYSTEM_LINUX,
     SYSTEM_WINDOWS,
@@ -929,6 +935,166 @@ class CodexVerifyTests(ConnectApplyCodexCase):
         self.assertEqual(verification["status"], STATUS_VALID)
         self.assertTrue(verification["locally_verified"])
         self.assertFalse(verification["independently_attested"])
+
+    def test_r4d_adapts_native_verification_assessments_without_a_second_ttl(self):
+        self.registered_config()
+        self.record_codex_proof()
+        store = self.verification_store()
+        baseline = json.loads(store.read_text(encoding="utf-8"))
+        observed = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        revision = "a" * 40
+        current = "b" * 40
+        baseline.update(
+            {
+                "timestamp": observed.isoformat(),
+                "ttl_seconds": 60,
+                "revision": revision,
+            }
+        )
+        fingerprint = baseline["registration_fingerprint"]
+
+        def assessment(data, *, now, current_revision, current_fingerprint=None):
+            store.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            with mock.patch(
+                "relinkra.connect_verification._utc_now", return_value=now
+            ), mock.patch(
+                "relinkra.connect_verification._revision_for",
+                return_value=current_revision,
+            ):
+                return connect_cli._verification_section(
+                    self.repo,
+                    "codex",
+                    current_fingerprint or fingerprint,
+                )
+
+        def adapt(native, *, as_of=observed, current_revision=revision):
+            return evaluate_freshness(
+                "connector",
+                native,
+                FreshnessContext(
+                    as_of=as_of.isoformat(),
+                    project_id=baseline["project_id"],
+                    current_revision=current_revision,
+                ),
+            )
+
+        def assert_result(native, status, state, reason, **context):
+            self.assertEqual(native["status"], status)
+            result = adapt(native, **context)
+            self.assertIs(result.state, state)
+            self.assertEqual(result.reason_code, reason)
+            return result
+
+        native_valid = assessment(
+            baseline,
+            now=observed + timedelta(seconds=30),
+            current_revision=revision,
+        )
+        # R4D does not create a second TTL authority: even an as_of clock
+        # beyond the record lifetime cannot contradict a native VALID result.
+        valid = assert_result(
+            native_valid,
+            STATUS_VALID,
+            FreshnessState.FRESH,
+            "verification_authority_valid",
+            as_of=observed + timedelta(seconds=120),
+        )
+        self.assertEqual(valid.ttl_seconds, 60)
+        self.assertEqual(valid.age_seconds, 120)
+
+        native_expired = assessment(
+            baseline,
+            now=observed + timedelta(seconds=61),
+            current_revision=revision,
+        )
+        native_fingerprint_mismatch = assessment(
+            baseline,
+            now=observed + timedelta(seconds=30),
+            current_revision=revision,
+            current_fingerprint="0" * 64,
+        )
+        native_revision_mismatch = assessment(
+            baseline,
+            now=observed + timedelta(seconds=30),
+            current_revision=current,
+        )
+        native_cases = (
+            (
+                "expired",
+                native_expired,
+                STATUS_EXPIRED,
+                "verification_expired",
+                {},
+            ),
+            (
+                "fingerprint mismatch",
+                native_fingerprint_mismatch,
+                STATUS_STALE_FINGERPRINT,
+                "verification_stale_fingerprint",
+                {},
+            ),
+            (
+                "revision mismatch",
+                native_revision_mismatch,
+                STATUS_INVALID,
+                "verification_revision_mismatch",
+                {"current_revision": current},
+            ),
+        )
+        for label, native, status, reason, context_override in native_cases:
+            with self.subTest(label=label):
+                assert_result(
+                    native,
+                    status,
+                    FreshnessState.STALE,
+                    reason,
+                    **context_override,
+                )
+        self.assertTrue(
+            any(
+                "different Git revision" in reason
+                for reason in native_revision_mismatch["reasons"]
+            )
+        )
+
+        failed_record = dict(baseline)
+        failed_record.update(
+            {
+                "stages": {
+                    stage: False for stage in baseline["stages"]
+                },
+                "tools_visible": [],
+                "tools_invoked": [],
+                "handoff_ok": False,
+            }
+        )
+        native_failed_stage = assessment(
+            failed_record,
+            now=observed + timedelta(seconds=30),
+            current_revision=revision,
+        )
+        assert_result(
+            native_failed_stage,
+            STATUS_VALID,
+            FreshnessState.UNKNOWN,
+            "verification_stage_unproven",
+        )
+        self.assertFalse(native_failed_stage["locally_verified"])
+
+        store.unlink()
+        with mock.patch(
+            "relinkra.connect_verification._utc_now",
+            return_value=observed + timedelta(seconds=30),
+        ):
+            native_unavailable = connect_cli._verification_section(
+                self.repo, "codex", fingerprint
+            )
+        assert_result(
+            native_unavailable,
+            STATUS_ABSENT,
+            FreshnessState.UNKNOWN,
+            "verification_unavailable",
+        )
 
     def test_a_forged_record_naming_another_host_is_rejected(self):
         self.registered_config()

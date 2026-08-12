@@ -28,6 +28,11 @@ Entry point: `python -m relinkra.product_cli`.
 This is distinct from `relinkra.cli`, the R1B admin tool
 (`register` / `list` / `show`), which is unchanged.
 
+For evidence-level questions such as “why was this selected?” or “is it
+current?”, use `python -m relinkra.context_cli --explain`. It has compact
+machine JSON and an operator-friendly Markdown view; see
+[Freshness, contradictions, and explainability](freshness-explainability.md).
+
 ## Architecture
 
 The CLI owns **presentation and nothing else**:

@@ -33,6 +33,7 @@ import subprocess
 from typing import List, Optional
 
 from .code_reference import CodeReference, derive_language
+from .identity import GitError, git_head_sha
 from .memory import sanitize_error
 
 DEFAULT_CBM_TIMEOUT = 30.0
@@ -46,6 +47,7 @@ MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 # CBM placeholder paths that are not repo files (project root node,
 # external/stdlib symbols like <python-builtins>).
 _NON_REPO_PATHS = frozenset({"{}", ""})
+_GRAPH_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 class CBMAdapterError(Exception):
@@ -401,6 +403,60 @@ class CBMCLIAdapter:
         if "error" in payload:
             raise CBMAdapterError("cbm index_status returned an error payload")
         return payload
+
+    def code_evidence_authority(self) -> dict:
+        """Return the portable graph attestation used by read-side evidence.
+
+        ``index_status`` owns the graph revision and workspace binding, but its
+        raw payload also contains the absolute indexed root.  Compare that root
+        locally, then project only the graph HEAD and the native graph verdict.
+        No cache path, project slug, host configuration, or raw status payload
+        crosses this boundary.
+        """
+        status = self.index_status()
+        git_facts = status.get("git")
+        graph_head = (
+            git_facts.get("head_sha")
+            if isinstance(git_facts, dict)
+            else None
+        )
+        graph_head = str(graph_head).strip() if graph_head else None
+        if graph_head and not _GRAPH_REVISION_RE.fullmatch(graph_head):
+            graph_head = None
+
+        trusted = False
+        raw_root = status.get("root_path")
+        if (
+            isinstance(raw_root, str)
+            and raw_root.strip()
+            and self.workspace_root
+            and graph_head
+        ):
+            status_root = os.path.normcase(
+                os.path.normpath(os.path.abspath(raw_root.strip()))
+            )
+            workspace_root = os.path.normcase(
+                os.path.normpath(os.path.abspath(self.workspace_root))
+            )
+            if status_root == workspace_root:
+                try:
+                    current_head = git_head_sha(self.workspace_root)
+                except (GitError, ValueError):
+                    current_head = None
+                trusted = bool(current_head and graph_head == current_head)
+
+        portable_index = {"git": {}}
+        if graph_head:
+            portable_index["git"]["head_sha"] = graph_head
+        return {
+            "index_status": portable_index,
+            "trust_stages": [
+                {
+                    "name": "CBM graph",
+                    "status": "PASS" if trusted else "WARN",
+                }
+            ],
+        }
 
     # -- normalization --------------------------------------------------
 
