@@ -8,8 +8,10 @@ with sanitized environments. Proves the package stands on its own: no
 reliance on the source tree, no reads or writes of the developer's real
 home or host configs, honest degradation, and idempotent init.
 
-Offline-tolerant: any infrastructure failure (no git, venv creation,
-wheel build, pip install) skips with the reason instead of failing.
+Offline-tolerant locally: any infrastructure failure (no git, venv creation,
+wheel build, pip install) skips with the reason when
+``RELINKRA_E2E_ARTIFACT`` is absent. Packaging CI treats those failures as
+errors when the variable is set.
 
 Test methods are named test_step_* so alphabetical execution matches the
 documented install sequence; later steps skip with a pointer to the step
@@ -37,6 +39,10 @@ except ImportError:  # pragma: no cover - discover vs module invocation
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT = 300
 IS_NT = os.name == "nt"
+
+#: When set to an existing artifact path, the suites install THAT artifact
+#: instead of building one (CI reuses a certified build across cells).
+ENV_ARTIFACT = "RELINKRA_E2E_ARTIFACT"
 
 # Variables the sandbox environment keeps from the real one so git and the
 # interpreter still resolve; everything home- or config-related is replaced.
@@ -72,6 +78,13 @@ def _tail(text: str, limit: int = 400) -> str:
     return text.strip()[-limit:]
 
 
+def _raise_infrastructure_failure(reason: str) -> None:
+    """Skip offline-only failures locally; fail strict artifact runs."""
+    if os.environ.get(ENV_ARTIFACT):
+        raise RuntimeError("strict artifact E2E failure: " + reason)
+    raise unittest.SkipTest(reason)
+
+
 class CleanInstallTests(unittest.TestCase):
     #: Path to the distribution artifact (wheel or sdist) pip installs.
     artifact = None
@@ -99,21 +112,35 @@ class CleanInstallTests(unittest.TestCase):
             cwd=str(cls.base),
         )
         if result.returncode != 0:
-            raise unittest.SkipTest(
+            _raise_infrastructure_failure(
                 f"wheel build failed (network needed for build "
                 f"dependencies?): {_tail(result.stderr)}"
             )
         wheels = list(artifact_dir.glob("relinkra-*.whl"))
         if not wheels:
-            raise unittest.SkipTest(
+            _raise_infrastructure_failure(
                 f"wheel build produced no relinkra wheel in {artifact_dir}"
             )
         return wheels[0]
 
     @classmethod
+    def resolve_artifact(cls, artifact_dir: Path) -> Path:
+        """The artifact under test: RELINKRA_E2E_ARTIFACT when set to an
+        existing file, otherwise a fresh build."""
+        provided = os.environ.get(ENV_ARTIFACT)
+        if provided:
+            path = Path(provided)
+            if path.is_file():
+                return path
+            _raise_infrastructure_failure(
+                f"configured artifact does not exist: {path}"
+            )
+        return cls.build_artifact(artifact_dir)
+
+    @classmethod
     def setUpClass(cls):
         if shutil.which("git") is None:
-            raise unittest.SkipTest("git binary not available")
+            _raise_infrastructure_failure("git binary not available")
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.base = Path(cls.tmp.name)
@@ -122,7 +149,7 @@ class CleanInstallTests(unittest.TestCase):
 
         artifact_dir = cls.base / "artifact"
         artifact_dir.mkdir()
-        cls.artifact = cls.build_artifact(artifact_dir)
+        cls.artifact = cls.resolve_artifact(artifact_dir)
 
     # -- shared helpers ----------------------------------------------------
 
@@ -171,9 +198,11 @@ class CleanInstallTests(unittest.TestCase):
         """Skip unless the venv exists and the artifact is installed."""
         cls = type(self)
         if cls.venv_python is None:
-            self.skipTest("venv unavailable (see test_step_a_create_venv)")
+            _raise_infrastructure_failure(
+                "venv unavailable (see test_step_a_create_venv)"
+            )
         if cls.install_error is not None:
-            self.skipTest(
+            _raise_infrastructure_failure(
                 f"artifact not installed (see test_step_b_install_artifact): "
                 f"{cls.install_error}"
             )
@@ -210,19 +239,23 @@ class CleanInstallTests(unittest.TestCase):
             timeout=TIMEOUT,
         )
         if result.returncode != 0:
-            self.skipTest(f"venv creation failed: {_tail(result.stderr)}")
+            _raise_infrastructure_failure(
+                f"venv creation failed: {_tail(result.stderr)}"
+            )
         python = venv_dir / ("Scripts" if IS_NT else "bin") / (
             "python.exe" if IS_NT else "python"
         )
         if not python.exists():
-            self.skipTest(f"venv python not found at {python}")
+            _raise_infrastructure_failure(f"venv python not found at {python}")
         cls.venv_dir = venv_dir
         cls.venv_python = python
 
     def test_step_b_install_artifact(self):
         cls = type(self)
         if cls.venv_python is None:
-            self.skipTest("venv unavailable (see test_step_a_create_venv)")
+            _raise_infrastructure_failure(
+                "venv unavailable (see test_step_a_create_venv)"
+            )
         result = subprocess.run(
             [
                 str(cls.venv_python),
@@ -240,7 +273,9 @@ class CleanInstallTests(unittest.TestCase):
         )
         if result.returncode != 0:
             cls.install_error = _tail(result.stderr)
-            self.skipTest(f"pip install failed (offline?): {cls.install_error}")
+            _raise_infrastructure_failure(
+                f"pip install failed (offline?): {cls.install_error}"
+            )
         for name in ("relinkra", "relinkra-mcp"):
             script = cls._script(name)
             self.assertTrue(script.exists(), f"missing console script {script}")
@@ -520,6 +555,55 @@ class CleanInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         response = json.loads(result.stdout)
         self.assertEqual(response["result"]["serverInfo"]["name"], "relinkra")
+
+
+class ArtifactResolutionTests(unittest.TestCase):
+    """Hermetic proof of the RELINKRA_E2E_ARTIFACT resolution contract."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.dir = Path(self._temp.name)
+        self._saved_env = os.environ.pop(ENV_ARTIFACT, None)
+        self.addCleanup(self._restore_env)
+        self._saved_build = CleanInstallTests.__dict__["build_artifact"]
+        self.addCleanup(
+            setattr, CleanInstallTests, "build_artifact", self._saved_build
+        )
+
+    def _restore_env(self):
+        if self._saved_env is None:
+            os.environ.pop(ENV_ARTIFACT, None)
+        else:
+            os.environ[ENV_ARTIFACT] = self._saved_env
+
+    def _stub_build(self, marker: Path):
+        @classmethod
+        def fake_build(cls, artifact_dir):
+            return marker
+
+        CleanInstallTests.build_artifact = fake_build
+
+    def test_env_provided_artifact_wins(self):
+        provided = self.dir / "provided.whl"
+        provided.write_bytes(b"fake")
+        built = self.dir / "built.whl"
+        self._stub_build(built)
+        os.environ[ENV_ARTIFACT] = str(provided)
+        self.assertEqual(
+            CleanInstallTests.resolve_artifact(self.dir), provided
+        )
+
+    def test_built_artifact_is_used_otherwise(self):
+        built = self.dir / "built.whl"
+        self._stub_build(built)
+        # Env var absent.
+        self.assertEqual(CleanInstallTests.resolve_artifact(self.dir), built)
+        # A configured but missing artifact is a strict CI infrastructure
+        # failure, not an invitation to rebuild a different artifact.
+        os.environ[ENV_ARTIFACT] = str(self.dir / "missing.whl")
+        with self.assertRaisesRegex(RuntimeError, "strict artifact E2E failure"):
+            CleanInstallTests.resolve_artifact(self.dir)
 
 
 if __name__ == "__main__":

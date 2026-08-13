@@ -365,6 +365,11 @@ class GitError(Exception):
     pass
 
 
+#: Bound on any single git subprocess. Identity probes are local and fast,
+#: but a hung git child must never hang the caller (R5B.18).
+GIT_TIMEOUT = 30.0
+
+
 def _git(path: str, *args: str) -> str:
     try:
         r = subprocess.run(
@@ -372,9 +377,12 @@ def _git(path: str, *args: str) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=GIT_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise GitError("git executable not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args)} timed out") from exc
     if r.returncode != 0:
         raise GitError(r.stderr.strip() or f"git {' '.join(args)} failed")
     return r.stdout.strip()

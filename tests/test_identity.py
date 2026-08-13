@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 from relinkra.cbm import workspace_cbm_record
+from relinkra import identity as identity_module
 from relinkra.identity import (
     AmbiguousIdentityError,
     RepositoryIdentity,
@@ -23,6 +24,34 @@ from relinkra.identity import (
     redact_url,
 )
 from relinkra.registry import Registry, RegistryError
+from unittest import mock
+
+
+class GitSubprocessBoundTests(unittest.TestCase):
+    """identity._git must bound every git subprocess (R5B.18): a hung git
+    child degrades to GitError instead of hanging the caller."""
+
+    def test_timeout_is_passed_to_subprocess(self):
+        with mock.patch.object(
+            identity_module.subprocess, "run"
+        ) as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["git"], returncode=0, stdout="ok\n", stderr=""
+            )
+            identity_module._git("repo", "rev-parse", "HEAD")
+        _, kwargs = run_mock.call_args
+        self.assertEqual(kwargs.get("timeout"), identity_module.GIT_TIMEOUT)
+
+    def test_timeout_expired_becomes_git_error(self):
+        with mock.patch.object(
+            identity_module.subprocess, "run"
+        ) as run_mock:
+            run_mock.side_effect = subprocess.TimeoutExpired(
+                cmd=["git"], timeout=identity_module.GIT_TIMEOUT
+            )
+            with self.assertRaises(identity_module.GitError) as ctx:
+                identity_module._git("repo", "rev-parse", "HEAD")
+        self.assertIn("timed out", str(ctx.exception))
 
 
 def _git(path, *args):

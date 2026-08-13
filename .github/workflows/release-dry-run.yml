@@ -1,0 +1,73 @@
+# R5B.24 - release candidate dry run. Manual trigger only: this workflow
+# never uploads anything outside CI artifacts and never tags; everything
+# it produces stays attached to the workflow run.
+#
+# Same trust model as ci.yml: minimal permissions, pinned actions, no
+# secrets (enforced by tests/test_ci_hygiene.py).
+name: Release Candidate Dry Run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    name: rc-dry-run / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      # fetch-depth: 0 - full history so the git-proof tests see the real
+      # pinned commit (RC realism).
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install the build frontend
+        run: python -m pip install --upgrade build
+      # The dry run NEVER asserts --require public: LEGAL BLOCKED (no
+      # LICENSE) and CI PARTIAL (remote runs pending) are EXPECTED in the
+      # report today. release_check exits 0 when the report was computed,
+      # even with PARTIAL/BLOCKED gates. --run-regression runs the full
+      # suite in-process; --run-packaging builds wheel+sdist into a temp
+      # dir and enforces the artifact content contract.
+      - name: Compute the RC gate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/release_check.py --run-regression --run-packaging --json > rc-report.json
+          cat rc-report.json
+      # The artifacts are also built into dist/ and inspected explicitly,
+      # so the uploaded artifact set is reviewable as an RC candidate.
+      - name: Build the wheel and the sdist
+        run: python -m build
+      - name: Inspect artifacts
+        shell: bash
+        run: python tools/artifact_checks.py dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rc-dry-run-${{ matrix.os }}
+          path: |
+            dist/
+            rc-report.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Append the RC gate summary
+        shell: bash
+        run: |
+          {
+            echo "## RC dry-run gate summary (${{ matrix.os }})"
+            echo '```text'
+            python tools/release_check.py
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

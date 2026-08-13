@@ -10,6 +10,7 @@ tests/test_install_e2e.py.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
 import io
@@ -160,6 +161,116 @@ class VersionCommandTests(unittest.TestCase):
         self.assertEqual(
             out.getvalue().strip(), f"relinkra {relinkra.__version__}"
         )
+
+
+class TestPythonFloorContract(unittest.TestCase):
+    """The Python 3.9 production floor: no construct in relinkra/ may
+    require a newer interpreter at import or runtime.
+
+    - no match statements (3.10+ syntax);
+    - tomllib (3.11+) only ever imported inside try/except ImportError;
+    - PEP 604 unions (``X | Y``, 3.10+) never evaluated at runtime on
+      3.9: allowed in annotations ONLY when the module has
+      ``from __future__ import annotations`` (making them lazy strings)
+      or the annotation is itself a string literal.
+    """
+
+    MODULES = sorted((REPO_ROOT / "relinkra").glob("*.py"))
+
+    def _trees(self):
+        return {
+            path.name: ast.parse(path.read_text(encoding="utf-8"))
+            for path in self.MODULES
+        }
+
+    @staticmethod
+    def _has_future_annotations(tree) -> bool:
+        for node in tree.body:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names)
+            ):
+                return True
+        return False
+
+    def test_no_match_statements(self):
+        for name, tree in self._trees().items():
+            offenders = [
+                type(node).__name__
+                for node in ast.walk(tree)
+                if type(node).__name__.startswith("Match")
+            ]
+            self.assertEqual(offenders, [], f"{name}: {offenders}")
+
+    def test_tomllib_imports_are_guarded(self):
+        for name, tree in self._trees().items():
+            parents = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[child] = node
+            for node in ast.walk(tree):
+                imports_tomllib = (
+                    isinstance(node, ast.Import)
+                    and any(a.name == "tomllib" for a in node.names)
+                ) or (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "tomllib"
+                )
+                if not imports_tomllib:
+                    continue
+                guarded = False
+                cursor = node
+                while cursor in parents:
+                    cursor = parents[cursor]
+                    if isinstance(cursor, ast.Try) and any(
+                        _handler_catches_import_error(handler)
+                        for handler in cursor.handlers
+                    ):
+                        guarded = True
+                        break
+                self.assertTrue(
+                    guarded,
+                    f"{name}:line {node.lineno} imports tomllib unguarded",
+                )
+
+    def test_no_runtime_pep604_unions(self):
+        for name, tree in self._trees().items():
+            if self._has_future_annotations(tree):
+                continue
+            annotations = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AnnAssign) and node.annotation:
+                    annotations.append(node.annotation)
+                elif isinstance(node, ast.arg) and node.annotation:
+                    annotations.append(node.annotation)
+                elif isinstance(node, ast.FunctionDef) and node.returns:
+                    annotations.append(node.returns)
+                elif isinstance(node, ast.AsyncFunctionDef) and node.returns:
+                    annotations.append(node.returns)
+            for annotation in annotations:
+                for inner in ast.walk(annotation):
+                    if isinstance(inner, ast.Constant):
+                        continue  # string annotation: never evaluated
+                    if isinstance(inner, ast.BinOp) and isinstance(
+                        inner.op, ast.BitOr
+                    ):
+                        self.fail(
+                            f"{name}:line {inner.lineno} evaluates a PEP 604 "
+                            f"union without 'from __future__ import annotations'"
+                        )
+
+
+def _handler_catches_import_error(handler) -> bool:
+    target = handler.type
+    if target is None:
+        return True  # bare except
+    names = []
+    if isinstance(target, ast.Name):
+        names = [target.id]
+    elif isinstance(target, ast.Tuple):
+        names = [elt.id for elt in target.elts if isinstance(elt, ast.Name)]
+    return "ImportError" in names or "Exception" in names
 
 
 if __name__ == "__main__":

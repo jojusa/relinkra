@@ -7,10 +7,11 @@ consumer actually takes, so the isolation guarantees (no source-tree
 fallback, sandboxed home, idempotent init, bounded doctor, MCP handshake)
 must hold for it independently.
 
-The sdist build is best-effort and offline-tolerant: it tries, in order,
-the ``build`` frontend, setuptools' PEP 517 hook directly, and an
-ephemeral build venv (needs network); if none works the whole class skips
-with the reason instead of failing.
+The sdist build is best-effort and offline-tolerant locally: it tries, in
+order, the ``build`` frontend, setuptools' PEP 517 hook directly, and an
+ephemeral build venv (needs network); if none works the class skips with the
+reason only when ``RELINKRA_E2E_ARTIFACT`` is absent. Packaging CI treats
+that infrastructure failure as an error.
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ class SdistInstallTests(_e2e.CleanInstallTests):
 
         sdists = list(artifact_dir.glob("relinkra-*.tar.gz"))
         if not sdists:
-            raise unittest.SkipTest(
+            _e2e._raise_infrastructure_failure(
                 "sdist build unavailable: " + "; ".join(errors)
             )
         return sdists[0]

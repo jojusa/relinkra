@@ -62,6 +62,11 @@ relinkra version
 supported Python, and whether it is running from an installed package or
 a source checkout.
 
+Maintainers verifying a source checkout for release (rather than a
+normal install) can additionally run the bounded release check —
+`python tools/release_check.py --json` from the repository root — and
+read the gate semantics in [Release verification](release.md).
+
 ## First run
 
 Run this sequence inside your project's git repository:
@@ -106,7 +111,9 @@ explanation.
   a workspace-managed `.codebase-memory/bin/` directory, then `PATH`.
 - **Platform note:** the certified binary currently ships for
   windows-amd64 only. On macOS and Linux this is a known limitation —
-  `doctor` explains the state and everything else remains usable.
+  `doctor` explains the state and everything else remains usable. See
+  [Release verification](release.md) for what "certified" means and how
+  CI and platform status are tracked.
 
 ### Engram
 
