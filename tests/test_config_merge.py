@@ -73,6 +73,18 @@ class ParseTests(unittest.TestCase):
         with self.assertRaises(MalformedConfigError):
             parse_json_document(payload)
 
+    def test_depth_verdict_is_deterministic_not_parser_stack_dependent(self):
+        # R5C: the parser's recursion ceiling varies by platform (C stack
+        # size), so a document the local parser SURVIVES must still get
+        # the same "too deep" verdict everywhere. The explicit guard, not
+        # RecursionError, decides.
+        too_deep = '{"mcpServers":' + "[" * 200 + "]" * 200 + "}"
+        with self.assertRaises(MalformedConfigError):
+            parse_json_document(too_deep)
+        # Real host configs nest a handful of levels and must keep parsing.
+        shallow = '{"mcpServers": {"x": {"command": ["a", "b"], "env": {"K": "V"}}}}'
+        self.assertIn("mcpServers", parse_json_document(shallow))
+
     def test_utf8_content_round_trips(self):
         document = parse_json_document('{"name": "café ⚙"}')
         rendered = serialize_json_document(document)

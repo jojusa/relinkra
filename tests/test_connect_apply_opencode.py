@@ -1348,6 +1348,13 @@ class OpenCodeShadowAndScopeAlignmentTests(ConnectApplyOpenCodeCase):
 
     # -- W-1: the %APPDATA% user config is MCP-authoritative -------------
 
+    @unittest.skipUnless(
+        os.name == "nt",
+        "simulates a Windows host (%APPDATA%) with real filesystem IO; on "
+        "POSIX the Windows-flavour paths are foreign and the write "
+        "containment guard (R5C) refuses them before the direct-CBM gate "
+        "is even reached — the scenario is only meaningful on Windows",
+    )
     def test_direct_cbm_in_the_appdata_config_blocks_the_apply(self):
         self.opencode_config({"mcp": {}})
         appdata = self.home / "AppData" / "Roaming"

@@ -185,6 +185,24 @@ def detect_newline(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _require_host_absolute(target: Path) -> None:
+    """Fail closed when a write target is not absolute on THIS host.
+
+    A candidate built with foreign-platform semantics — a Windows-flavour
+    ``\\tmp\\...`` string on POSIX, or a drive-less ``/tmp/...`` path on
+    Windows — converts to a RELATIVE host path, which resolves against
+    the process working directory: the write lands wherever the process
+    happens to stand (R5C: a Windows-flavour fixture path was written
+    into the repository working tree on a Linux runner). Relinkra only
+    ever writes declared, absolute host targets.
+    """
+    if not target.is_absolute():
+        raise UnsafeTargetError(
+            "write target is not an absolute host path; refusing to "
+            "resolve a write against the process working directory"
+        )
+
+
 def assert_writable_target(path) -> None:
     """Refuse anything that is not an absent file or a plain file.
 
@@ -194,6 +212,7 @@ def assert_writable_target(path) -> None:
     fails in a way that is hard to unwind.
     """
     target = Path(path)
+    _require_host_absolute(target)
     if target.is_symlink():
         raise UnsafeTargetError(
             "refusing to write through a symlink or reparse point"
@@ -289,6 +308,7 @@ def atomic_write_text(path, text: str, *, mode: Optional[int] = None) -> None:
     turn a deliberate ``\\r\\n`` into ``\\r\\r\\n``.
     """
     target = Path(path)
+    _require_host_absolute(target)
     directory = target.parent
     directory.mkdir(parents=True, exist_ok=True)
     handle, temp_name = tempfile.mkstemp(

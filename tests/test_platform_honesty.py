@@ -180,5 +180,21 @@ class TomllibHonestyTests(unittest.TestCase):
         self.assertIn("toml_parser_unavailable", codes)
 
 
+class TomlDepthHonestyTests(unittest.TestCase):
+    """The too-deep verdict is deterministic, not parser-stack luck (R5C)."""
+
+    def test_deeply_nested_toml_is_malformed_on_every_platform(self):
+        try:
+            import tomllib  # noqa: F401
+        except ImportError:
+            self.skipTest("tomllib unavailable on this interpreter")
+        # 200 nested tables: a parser with a generous C stack may SURVIVE
+        # this (the Linux/macOS runners did for JSON); the verdict must be
+        # MalformedConfigError everywhere via the explicit depth guard.
+        payload = "".join(f"[{'a.' * i}a]\n" for i in range(1, 201))
+        with self.assertRaises(toml_edit.MalformedConfigError):
+            toml_edit.parse_toml_document(payload)
+
+
 if __name__ == "__main__":
     unittest.main()

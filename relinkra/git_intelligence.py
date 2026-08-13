@@ -1034,6 +1034,12 @@ class GitIntelligenceService:
                 root = self._runner.run(cwd, "rev-parse", "--absolute-git-dir").strip()
             else:
                 root = self._runner.run(cwd, "rev-parse", "--show-toplevel").strip()
+            # Canonical local form: git reports the toplevel in its own
+            # string form, which may differ from the caller's by an OS
+            # alias (Windows 8.3 short path, symlinked prefix). The same
+            # directory must compare equal however it was reached (R5C).
+            if root:
+                root = os.path.realpath(root)
         except GitError as exc:
             warnings.append(_degrade_warning(exc))
         head_available = False

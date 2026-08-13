@@ -245,6 +245,24 @@ class AbsolutePathDetectionTests(unittest.TestCase):
         # Relative Windows fragments are not absolute.
         self.assertFalse(contains_absolute_path("src\\relinkra\\mcp_server.py"))
         self.assertFalse(contains_absolute_path("the ratio is 3 /4"))
+        # Dot-relative and URLs are not absolute either.
+        self.assertFalse(contains_absolute_path("./rel/path"))
+        self.assertFalse(contains_absolute_path("see http://host/a/b"))
+
+    def test_quoted_posix_paths_are_scrubbed(self):
+        # R5C privacy defect: OSError messages embed QUOTED paths
+        # ("Is a directory: '/tmp/x'") and the old lookbehind excluded
+        # any path following a non-space, so quoted POSIX paths leaked.
+        for raw in (
+            "[Errno 21] Is a directory: '/tmp/abc/repo/.relinkra/registry.json'",
+            'cannot open "/home/me/repo/config.json"',
+        ):
+            scrubbed = scrub_absolute_paths(raw)
+            self.assertFalse(
+                contains_absolute_path(scrubbed),
+                f"{raw!r} survived scrubbing as {scrubbed!r}",
+            )
+            self.assertIn("<path>", scrubbed)
 
     def test_every_absolute_shape_round_trips_through_the_scrubber(self):
         for raw in (

@@ -206,7 +206,22 @@ def config_path(root: Path) -> Path:
 
 
 def registry_path(root: Path) -> Path:
-    return config_dir(root) / REGISTRY_FILE
+    """The workspace registry file, under the CANONICAL local root.
+
+    ``os.path.realpath`` collapses OS alias forms of the same directory —
+    a Windows 8.3 short path (``RUNNER~1``) or a symlinked prefix — so the
+    SAME logical registry yields ONE stable string. The launch contract
+    serializes this path (``--registry``); an alias-variant string would
+    make a healthy registration look out of date (R5C, reproduced on
+    windows-latest where TEMP is an 8.3 alias). realpath preserves the
+    filesystem's own casing, so canonical paths are unchanged byte-for-byte.
+    Relative roots stay verbatim joins — callers resolving a real
+    repository always pass an absolute root.
+    """
+    base = Path(root)
+    if base.is_absolute():
+        base = Path(os.path.realpath(str(base)))
+    return config_dir(base) / REGISTRY_FILE
 
 
 # ---------------------------------------------------------------------------

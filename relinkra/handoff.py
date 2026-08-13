@@ -80,9 +80,14 @@ _ABS_PATH_RES = (
     # lookbehind excludes UNC (already consumed) and relative fragments
     # like "src\mod\file.py"; 2+ segments keeps stray escapes out.
     re.compile(r"(?<![\\A-Za-z0-9_])\\[A-Za-z0-9_.\-]+(?:\\[A-Za-z0-9_.\-]*)+"),
-    # POSIX absolute. Must not follow a non-space (so "http://h/p" and
-    # "a/b" are excluded) and needs 2+ segments (so "3 /4" is excluded).
-    re.compile(r"(?<!\S)/[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]*)+"),
+    # POSIX absolute. Matches at the start of the text, after whitespace,
+    # or after an opening quote/bracket — OSError messages embed QUOTED
+    # paths ("Is a directory: '/tmp/x'"), and leaving those unscrubbed
+    # leaks the local layout (R5C). Everything else is excluded by
+    # construction: "a/b", "./rel", "~/.config/x", "%APPDATA%/x" and
+    # "http://h/p" all have a non-boundary character before the slash.
+    # Needs 2+ segments so "3 /4" is not mistaken for a path.
+    re.compile(r"(?:^|(?<=[\s'\"(<]))/[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]*)+"),
 )
 _PATH_PLACEHOLDER = "<path>"
 

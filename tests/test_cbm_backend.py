@@ -32,6 +32,7 @@ from relinkra.cbm_adapter import (
     CBMAdapterError,
     CBMCLIAdapter,
     MAX_CHILD_OUTPUT_BYTES,
+    _normalize_workspace_root,
     parse_cli_json,
     strip_project_slug,
 )
@@ -72,6 +73,44 @@ def _adapter(**overrides):
     )
     defaults.update(overrides)
     return CBMCLIAdapter(**defaults)
+
+
+class TestWorkspaceRootIdentity(unittest.TestCase):
+    """R5C: foreign-absolute workspace roots keep their identity verbatim.
+
+    Passing a foreign-syntax absolute path through host-native
+    ``os.path.abspath()`` prepends the cwd and FABRICATES a host-local
+    path that never existed (on POSIX: ``abspath("C:/w")`` →
+    ``"<cwd>/C:/w"``). The workspace root is a portable identity used for
+    string-prefix relativization and safe.directory binding — never a
+    host-local IO path.
+    """
+
+    def test_windows_drive_root_is_verbatim_on_any_host(self):
+        self.assertEqual(
+            _normalize_workspace_root("C:\\Desarrollos\\relinkra"),
+            "C:/Desarrollos/relinkra",
+        )
+
+    def test_posix_root_is_verbatim_on_any_host(self):
+        self.assertEqual(
+            _normalize_workspace_root("/home/u/repo"), "/home/u/repo"
+        )
+
+    def test_unc_root_is_verbatim_on_any_host(self):
+        self.assertEqual(
+            _normalize_workspace_root("\\\\server\\share\\repo"),
+            "//server/share/repo",
+        )
+
+    def test_relative_root_resolves_against_cwd(self):
+        resolved = _normalize_workspace_root("rel/ws")
+        self.assertTrue(resolved.endswith("/rel/ws"))
+        self.assertNotIn("\\", resolved)
+
+    def test_constructor_preserves_foreign_root_identity(self):
+        adapter = _adapter(workspace_root="C:\\Desarrollos\\relinkra")
+        self.assertEqual(adapter.workspace_root, "C:/Desarrollos/relinkra")
 
 
 class TestHistoricalContract(unittest.TestCase):
@@ -896,7 +935,13 @@ class TestConfiguredCBMTrust(unittest.TestCase):
                     self.assertIn(expected_detail, services._cbm_config_error)
                     adapter_type.assert_called_once_with(
                         cbm_bin=str(binary),
-                        cache_dir=str(root / ".codebase-memory" / "cache"),
+                        # absolutize_against_root canonicalizes through
+                        # realpath as a containment property; under an
+                        # aliased TEMP (8.3 short path, /var symlink) the
+                        # raw join and the canonical path differ.
+                        cache_dir=os.path.realpath(
+                            str(root / ".codebase-memory" / "cache")
+                        ),
                         cbm_project_name=SLUG,
                         workspace_root=str(root),
                         timeout=10.0,

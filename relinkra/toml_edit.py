@@ -36,7 +36,12 @@ import math
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .config_merge import MalformedConfigError, MergeError, apply_member
+from .config_merge import (
+    MalformedConfigError,
+    MergeError,
+    apply_member,
+    exceeds_config_depth,
+)
 from .safe_write import detect_newline
 
 __all__ = [
@@ -112,6 +117,12 @@ def parse_toml_document(text: str) -> Dict[str, Any]:
         ) from exc
     if not isinstance(document, dict):
         raise MalformedConfigError("configuration root must be a TOML table")
+    if exceeds_config_depth(document):
+        # tomllib's own recursion ceiling is platform-dependent; the
+        # verdict must be deterministic on every OS (R5C).
+        raise MalformedConfigError(
+            "configuration is nested too deeply to parse safely"
+        )
     return document
 
 

@@ -101,6 +101,48 @@ def _is_absolute(path: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:/", path)) or path.startswith("/")
 
 
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+def _is_absolute_any_syntax(path: str) -> bool:
+    """Absolute under EITHER platform syntax: POSIX root, drive-letter, UNC.
+
+    A path that is absolute only under FOREIGN platform semantics must
+    keep its identity verbatim: passing it through host-native
+    ``os.path.abspath()`` prepends the current working directory and
+    FABRICATES a host-local path that never existed (R5C: on POSIX,
+    ``abspath("C:/work/ws-a")`` yields ``"<cwd>/C:/work/ws-a"``).
+    """
+    return bool(_WINDOWS_DRIVE_RE.match(path)) or path.startswith(("/", "\\\\"))
+
+
+def _normalize_workspace_root(raw: str) -> str:
+    """Portable workspace-root identity: forward slashes, no trailing slash.
+
+    Host-relative paths resolve against the cwd (callers pass absolute
+    roots; the relative case exists for tests). Foreign-absolute paths are
+    preserved VERBATIM — this value is a portable workspace IDENTITY used
+    for string-prefix relativization and safe.directory binding, never a
+    host-local IO path.
+    """
+    text = str(raw).strip().replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    if _is_absolute_any_syntax(text):
+        return text
+    return os.path.abspath(text).replace("\\", "/").rstrip("/")
+
+
+def _root_comparison_key(path: str) -> str:
+    """Case/separator-insensitive root key WITHOUT host re-absolutization.
+
+    ``os.path.normcase`` lowercases on Windows (case-insensitive FS) and
+    is the identity on POSIX (case-sensitive FS), so comparison follows
+    platform semantics for both operands symmetrically.
+    """
+    return os.path.normcase(str(path).strip().replace("\\", "/").rstrip("/"))
+
+
 def _casefold_path(path: str) -> str:
     """Case/separator-insensitive comparison key for absolute paths.
 
@@ -139,7 +181,7 @@ class CBMCLIAdapter:
             str(cbm_project_name).strip() if cbm_project_name else None
         )
         self.workspace_root = (
-            os.path.abspath(str(workspace_root)).replace("\\", "/").rstrip("/")
+            _normalize_workspace_root(str(workspace_root)) or None
             if workspace_root
             else None
         )
@@ -432,12 +474,8 @@ class CBMCLIAdapter:
             and self.workspace_root
             and graph_head
         ):
-            status_root = os.path.normcase(
-                os.path.normpath(os.path.abspath(raw_root.strip()))
-            )
-            workspace_root = os.path.normcase(
-                os.path.normpath(os.path.abspath(self.workspace_root))
-            )
+            status_root = _root_comparison_key(_normalize_workspace_root(raw_root))
+            workspace_root = _root_comparison_key(self.workspace_root)
             if status_root == workspace_root:
                 try:
                     current_head = git_head_sha(self.workspace_root)

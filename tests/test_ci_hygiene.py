@@ -376,6 +376,34 @@ class WorkflowContractAudit(unittest.TestCase):
         for runner in ("ubuntu-latest", "windows-latest", "macos-latest"):
             self.assertIn(runner, ci)
 
+    def test_core_smoke_bootstraps_a_committed_repo(self):
+        # `relinkra init` FAILs HONESTLY on a repository with zero commits
+        # (no resolvable project identity). The core smoke must therefore
+        # create a deterministic initial commit — with a disposable local
+        # Git identity, never the runner's global config — BEFORE invoking
+        # `relinkra init`, or every core matrix cell fails before the core
+        # suite ever runs (R5C remote evidence, run 31719355467).
+        ci = self.texts["ci.yml"]
+        match = re.search(
+            r"(?ms)^      - name: Installed CLI smoke\n(?P<body>.*?)(?=^      - name: |\Z)",
+            ci,
+        )
+        self.assertIsNotNone(match, "ci.yml missing the Installed CLI smoke step")
+        body = match.group("body")
+        for token, after in (
+            ("git config user.email", None),
+            ("git config user.name", None),
+            ("git commit", "git config user.name"),
+            ("relinkra init --json", "git commit"),
+        ):
+            self.assertIn(token, body, f"smoke step missing {token!r}")
+            if after is not None:
+                self.assertLess(
+                    body.index(after),
+                    body.index(token),
+                    f"smoke step: {token!r} must come after {after!r}",
+                )
+
     def test_packaging_contract(self):
         packaging = self.texts["packaging.yml"]
         for job_id in ("build", "wheel-install", "sdist-install"):

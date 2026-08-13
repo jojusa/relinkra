@@ -98,6 +98,29 @@ class MergeDecision:
 # Parsing and serialization
 # ---------------------------------------------------------------------------
 
+#: Bound on container nesting in a host configuration. Real host configs
+#: nest a handful of levels; 64 is generous headroom. The JSON/TOML
+#: parser's own recursion ceiling is PLATFORM-DEPENDENT (C stack size),
+#: so "too deep" must be an explicit, deterministic verdict rather than
+#: whatever the local parser happens to survive (R5C: a 20000-deep
+#: document parsed successfully on the Linux/macOS runners while the
+#: Windows interpreter raised RecursionError for the same bytes).
+MAX_CONFIG_DEPTH = 64
+
+
+def exceeds_config_depth(value, limit: int = MAX_CONFIG_DEPTH) -> bool:
+    """Iterative nesting-depth check — no recursion, parser-independent."""
+    stack = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend((item, depth + 1) for item in current)
+    return False
+
 
 def parse_json_document(text: str) -> Dict[str, Any]:
     """Parse a host config, insisting on a JSON object at the root.
@@ -131,6 +154,10 @@ def parse_json_document(text: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise UnsupportedShapeError(
             f"configuration root must be an object, found {type(data).__name__}"
+        )
+    if exceeds_config_depth(data):
+        raise MalformedConfigError(
+            "configuration is nested too deeply to parse safely"
         )
     return data
 

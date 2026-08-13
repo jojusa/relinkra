@@ -57,8 +57,11 @@ class CapabilitiesTests(unittest.TestCase):
         self.assertIsNotNone(caps.git_version)
         self.assertRegex(caps.git_version, r"^\d+\.\d+")
         self.assertTrue(caps.repository_detected)
+        # Canonical comparison: the service reports the canonical local
+        # form; the fixture path may be an OS alias (8.3 short path when
+        # TEMP is aliased, symlinked prefix on macOS runners).
         self.assertEqual(
-            os.path.normpath(caps.repository_root), os.path.normpath(repo)
+            os.path.realpath(caps.repository_root), os.path.realpath(repo)
         )
         self.assertFalse(caps.is_bare)
         self.assertTrue(caps.head_available)
@@ -119,7 +122,7 @@ class CapabilitiesTests(unittest.TestCase):
         caps, _ = self.service.collect_capabilities(nested)
         self.assertTrue(caps.repository_detected)
         self.assertEqual(
-            os.path.normpath(caps.repository_root), os.path.normpath(repo)
+            os.path.realpath(caps.repository_root), os.path.realpath(repo)
         )
 
     def test_repository_root_never_serialized(self):

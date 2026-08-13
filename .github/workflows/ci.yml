@@ -97,6 +97,13 @@ jobs:
           git init -q smoke-repo && cd smoke-repo
           git config user.email ci@example.invalid
           git config user.name CI
+          # `relinkra init` requires a resolvable project identity, and a
+          # repository with zero commits honestly cannot provide one
+          # (FAIL_HONEST by design). The smoke must therefore bootstrap a
+          # deterministic initial commit — the scenario under test is a
+          # REAL repository, not a commit-less one. tests/test_ci_hygiene.py
+          # pins this ordering.
+          git commit --allow-empty -qm "smoke bootstrap"
           relinkra init --json
           relinkra doctor --json > doctor-report.json
           test -s doctor-report.json

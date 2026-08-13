@@ -28,6 +28,7 @@ from relinkra.safe_write import (
     PreconditionError,
     SafeWriteError,
     UnsafeTargetError,
+    assert_writable_target,
     atomic_write_text,
     create_backup,
     detect_newline,
@@ -189,6 +190,35 @@ class UnsafeTargetTests(TempCase):
         # The link is intact and still points at unchanged content.
         self.assertTrue(link.is_symlink())
         self.assertEqual(json.loads(real.read_text(encoding="utf-8")), {"real": True})
+
+    def test_relative_target_is_refused_and_writes_nothing(self):
+        # R5C write containment: a relative target would resolve against
+        # the process working directory. Fail closed, write nothing.
+        relative = Path("relinkra-r5c-must-never-exist.json")
+        with self.assertRaises(UnsafeTargetError):
+            atomic_write_text(relative, "{}")
+        self.assertFalse(relative.exists())
+        with self.assertRaises(UnsafeTargetError):
+            assert_writable_target(relative)
+
+    def test_backslash_rooted_target_is_refused_everywhere(self):
+        # The exact R5C Linux worktree-contamination shape: "\tmp\..." is
+        # a RELATIVE filename on POSIX and a drive-relative path on
+        # Windows — absolute on NEITHER host. It must never become a
+        # write target.
+        foreign = "\\tmp\\relinkra-r5c-leak\\opencode.json"
+        with self.assertRaises(UnsafeTargetError):
+            atomic_write_text(foreign, "{}")
+        self.assertFalse(Path(foreign).exists())
+
+    @unittest.skipUnless(
+        _POSIX, "a Windows drive string is only a relative name on POSIX"
+    )
+    def test_windows_drive_string_is_refused_on_posix(self):
+        # str(PureWindowsPath(...)) on POSIX is a backslash-laden RELATIVE
+        # name; previously it could be written into the process cwd.
+        with self.assertRaises(UnsafeTargetError):
+            atomic_write_text("C:\\relinkra-r5c-leak\\x.json", "{}")
 
 
 class SafeReplaceTests(TempCase):
