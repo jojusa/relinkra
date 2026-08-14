@@ -11,7 +11,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from relinkra.connector import (
     PATH_MACHINE_LOCAL,
@@ -50,9 +50,9 @@ def windows_env(**kwargs) -> DiscoveryEnvironment:
 def posix_env(**kwargs) -> DiscoveryEnvironment:
     defaults = dict(
         system=SYSTEM_LINUX,
-        home=Path("/home/dev"),
+        home=PurePosixPath("/home/dev"),
         env={},
-        workspace_root=Path("/srv/code/repo"),
+        workspace_root=PurePosixPath("/srv/code/repo"),
         which=lambda name: None,
     )
     defaults.update(kwargs)
