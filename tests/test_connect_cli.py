@@ -395,8 +395,17 @@ class GenericTests(ConnectCLICase):
         self.assertEqual(code, EXIT_OK)
         machine = payload["machine_local"]
         self.assertEqual(payload["classification"], "machine_local")
+        # The revealed command must be exactly the launch contract this
+        # machine resolves right now. The contract is mode-dependent: an
+        # installed Relinkra launches through its console script, while a
+        # source checkout launches ``-m relinkra.mcp_cli`` with PYTHONPATH
+        # pinned. Both shapes are runnable; neither is hard-coded here.
+        expected = resolve_launch(
+            self.repo, registry_path(self.repo)
+        ).to_machine_dict()
+        self.assertEqual(machine, expected)
         self.assertTrue(machine["command"])
-        self.assertIn(SERVER_MODULE, machine["args"])
+        self.assertEqual(machine["module"], SERVER_MODULE)
         index = machine["args"].index("--workspace-root")
         self.assertEqual(
             Path(machine["args"][index + 1]).resolve(), self.repo.resolve()

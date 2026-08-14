@@ -86,6 +86,20 @@ _SECRET = "sk-live-CODEX-DO-NOT-LEAK-0123456789"
 _ENGRAM_TABLE = '[mcp_servers.engram]\ncommand = "engram"\nargs = ["mcp"]\n'
 
 
+def setUpModule():
+    """Codex TOML I/O is fail-closed without tomllib (Python 3.11+).
+
+    Every test in this module drives the real apply/rollback/check path,
+    which honestly REFUSES on a tomllib-less interpreter — including the
+    tests that mock parser absence, since their fixtures still apply for
+    real first. On 3.9/3.10 the suite would only re-prove the refusal
+    contract that ``tests.test_platform_honesty`` already covers, so skip
+    the module instead of repeating it.
+    """
+    if not toml_edit.toml_parser_available():
+        raise unittest.SkipTest("codex TOML I/O requires tomllib (Python 3.11+)")
+
+
 class ConnectApplyCodexCase(unittest.TestCase):
     """A fake repository plus a fixture home, discovery monkeypatched."""
 

@@ -10,7 +10,6 @@ import os
 import shutil
 import tempfile
 import unittest
-from datetime import datetime
 
 try:  # discovery (`-s tests`) puts tests/ on sys.path; package form does not
     from tests import git_fixtures as gf
@@ -224,12 +223,12 @@ class GitFixturesTests(unittest.TestCase):
         )
         # git may render UTC as "+00:00" or "Z"; compare instants, not text.
         self.assertEqual(
-            datetime.fromisoformat(gf.git(self.repo, "log", "-1", "--pretty=%aI")),
-            datetime.fromisoformat(gf.FIXED_AUTHOR_DATE),
+            gf.parse_instant(gf.git(self.repo, "log", "-1", "--pretty=%aI")),
+            gf.parse_instant(gf.FIXED_AUTHOR_DATE),
         )
         self.assertEqual(
-            datetime.fromisoformat(gf.git(self.repo, "log", "-1", "--pretty=%cI")),
-            datetime.fromisoformat(gf.FIXED_COMMITTER_DATE),
+            gf.parse_instant(gf.git(self.repo, "log", "-1", "--pretty=%cI")),
+            gf.parse_instant(gf.FIXED_COMMITTER_DATE),
         )
 
     def test_scenario_abcd_commit_shape(self):

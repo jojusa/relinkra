@@ -83,6 +83,9 @@ from relinkra.connectors import (
 from relinkra.handoff import contains_absolute_path
 from relinkra.host_discovery import SYSTEM_LINUX, SYSTEM_WINDOWS, DiscoveryEnvironment
 from relinkra.safe_write import MAX_CONFIG_BYTES
+from relinkra.toml_edit import toml_parser_available
+
+_REQUIRES_TOMLLIB = "codex TOML parsing requires tomllib (Python 3.11+)"
 
 WORKSPACE = "/srv/code/repo" if os.name != "nt" else r"D:\code\repo"
 
@@ -469,6 +472,7 @@ class DiscoveryStateTests(HostFixtureCase):
         self.assertEqual(inspection.discovery_status, DISCOVERY_CONFIG_MALFORMED)
         self.assertTrue(any(w.code == "config_malformed" for w in inspection.warnings))
 
+    @unittest.skipUnless(toml_parser_available(), _REQUIRES_TOMLLIB)
     def test_deep_toml_recursion_is_reported_malformed_without_raising(self):
         nested = "value = " + ("{a = " * 500) + "0" + ("}" * 500) + "\n"
         self.write_config(".codex", "config.toml", content=nested)
@@ -638,6 +642,7 @@ class PlanTests(HostFixtureCase):
         self.assertEqual(plan.status, PLAN_UNAVAILABLE)
         self.assertIn("no local configuration file", plan.unavailable_reason)
 
+    @unittest.skipUnless(toml_parser_available(), _REQUIRES_TOMLLIB)
     def test_codex_plans_against_its_toml_container(self):
         # R4C.1D opened the Codex write path: planning a TOML host goes
         # through the same format-agnostic decision as JSON hosts.

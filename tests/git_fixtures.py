@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import unittest
+from datetime import datetime
 from typing import Dict
 
 GIT_BIN = shutil.which("git")
@@ -20,6 +21,21 @@ GIT_TEST_USER_NAME = "Relinkra Test"
 GIT_TEST_USER_EMAIL = "relinkra-test@example.invalid"
 FIXED_AUTHOR_DATE = "2024-01-01T00:00:00+00:00"
 FIXED_COMMITTER_DATE = "2024-01-01T00:00:00+00:00"
+
+
+def parse_instant(text: str) -> datetime:
+    """Parse an ISO 8601 instant, accepting git's ``Z``-suffixed UTC form.
+
+    Git may render UTC as ``+00:00`` or ``Z`` depending on version and
+    platform, and ``datetime.fromisoformat`` only accepts ``Z`` from
+    Python 3.11. Normalizing here — the same rule as
+    ``relinkra.freshness._parse_time`` — lets tests compare instants on
+    every supported interpreter.
+    """
+    value = text.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
 
 
 def git(

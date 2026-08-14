@@ -14,7 +14,6 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime
 from unittest import mock
 
 import relinkra.git_intelligence as gi
@@ -306,8 +305,8 @@ class HeadFactsTests(unittest.TestCase):
         self.assertEqual(head.branch, "main")
         self.assertFalse(head.detached)
         self.assertEqual(
-            datetime.fromisoformat(head.committed_at),
-            datetime.fromisoformat(gf.FIXED_COMMITTER_DATE),
+            gf.parse_instant(head.committed_at),
+            gf.parse_instant(gf.FIXED_COMMITTER_DATE),
         )
         self.assertEqual(head.author_name, gf.GIT_TEST_USER_NAME)
         self.assertEqual(head.subject, "add alpha")
