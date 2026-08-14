@@ -250,5 +250,73 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(direct, via_json)
 
 
+class ComposedRunEvidenceTests(unittest.TestCase):
+    """R5C: composed run-scoped evidence flowing through the gate model.
+
+    The composed regression mapping carries the AGGREGATE execution count
+    (sum across matrix cells) with per-cell canonical counts under
+    ``cells``; the gate reads only the aggregate, so these tests pin the
+    contract that the aggregate shape keeps TECHNICAL_CORE honest.
+    """
+
+    def _composed_evidence(self):
+        evidence = full_positive_evidence()
+        evidence["regression"] = {
+            "passed": True,
+            "tests": 6183,  # aggregate: 2061 executions x 3 cells
+            "failures": 0,
+            "errors": 0,
+            "resource_warnings": 0,
+            "where": "CI full-regression matrix",
+            "cells": {
+                platform: {
+                    "tests": 2061,
+                    "failures": 0,
+                    "errors": 0,
+                    "resource_warnings": 0,
+                    "where": f"ci full-regression {platform}-latest",
+                }
+                for platform in ("linux", "macos", "windows")
+            },
+        }
+        evidence["meta"] = {"sha": "d818b8c20d38557ab6624a9a3e4fe66a11532261",
+                            "run_id": "31760708465",
+                            "source": "github-actions"}
+        return evidence
+
+    def test_remote_runs_passed_true_allows_ci_pass(self):
+        report = release_gates.evaluate_gates(self._composed_evidence())
+        self.assertIs(report._by_name(CI).status, GateStatus.PASS)
+        self.assertIs(
+            report._by_name(TECHNICAL_CORE).status, GateStatus.PASS
+        )
+
+    def test_remote_runs_passed_false_blocks_ci(self):
+        evidence = self._composed_evidence()
+        evidence["ci"] = {"workflows_present": True,
+                          "remote_runs_passed": False}
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(CI).status, GateStatus.BLOCKED)
+        self.assertFalse(report.safe_to_merge)
+
+    def test_remote_runs_passed_absent_keeps_ci_partial(self):
+        evidence = self._composed_evidence()
+        evidence["ci"] = {"workflows_present": True}
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(CI).status, GateStatus.PARTIAL)
+        self.assertTrue(report.safe_to_merge)
+        self.assertFalse(report.safe_to_tag_rc)
+
+    def test_full_composed_evidence_with_legal_blocked(self):
+        evidence = self._composed_evidence()
+        evidence["legal"] = {"license_present": False,
+                             "notice_complete": None}
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(LEGAL).status, GateStatus.BLOCKED)
+        self.assertFalse(report.safe_for_public_release)
+        self.assertTrue(report.safe_to_tag_rc)
+        self.assertTrue(report.safe_to_merge)
+
+
 if __name__ == "__main__":
     unittest.main()

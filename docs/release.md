@@ -51,8 +51,57 @@ no `pull_request_target`, no secrets, every action pinned to a major tag
 |---|---|---|---|
 | `fast` | ubuntu / 3.14 | Byte-compiles package + tools; runs the five audit suites (`test_packaging`, `test_tools_core_runner`, `test_release_gates`, `test_platform_honesty`, `test_ci_hygiene`), one run step each so a failure points at its suite. | Runtime behavior on real interpreters/OSes. |
 | `core` (matrix) | ubuntu × py3.9–3.14; windows × py3.9 + 3.14; macos × py3.11 + 3.14 | Installs the package (`pip install .`), smokes the installed console scripts from a throwaway directory (`relinkra init`, `relinkra doctor --json`), runs the core suite via `tools/run_core_tests.py`. | The two slow venv E2E suites (packaging workflow covers them); host/CBM certification. |
-| `full-regression` (matrix) | ubuntu, windows, macos × py3.14 | Full suite: `python -W error::ResourceWarning -m unittest discover -s tests -q` — 0 failures, 0 errors, 0 ResourceWarnings required. | Anything beyond 3.14; artifact installability. |
-| `release-readiness` | ubuntu / 3.14 (after the above) | Computes the gate report (`tools/release_check.py --json`), uploads `release-report.json`, appends a human summary. Asserts no `--require` level. | That any release safety actually holds — it reports, it does not gate. |
+| `full-regression` (matrix) | ubuntu, windows, macos × py3.14 | Full suite via `tools/emit_run_evidence.py --run-regression` (ResourceWarning promoted to error in-process, mirroring `release_check.run_regression`) — 0 failures, 0 errors, 0 ResourceWarnings required; each cell emits a SHA-bound evidence fragment (`run-evidence-<platform>.json`, uploaded with `if: always()`, `retention-days: 1`). | Anything beyond 3.14; artifact installability. |
+| `release-readiness` | ubuntu / 3.14 (`if: always()` after the above) | Downloads the run-evidence fragments unmerged, composes them with `tools/compose_run_evidence.py` (bound to `github.sha`/`github.run_id` + upstream job results), computes the gate report with `release_check.py --evidence composed-evidence.json --require-sha <sha> --run-packaging`, uploads `release-report.json` (`if: always()`), appends a human summary. Asserts no `--require` level. | That any release safety actually holds — it reports, it does not gate. |
+
+### Run-scoped remote evidence (R5C)
+
+Remote evidence is **generated per CI run**, never committed, and never
+maintainer-attested:
+
+1. **Emit** — each `full-regression` matrix cell runs
+   `tools/emit_run_evidence.py --run-regression`, which executes the full
+   suite in-process and writes `run-evidence-<platform>.json`:
+   `{"meta": {sha, run_id, job, os}, "platform", "regression": {passed,
+   tests, failures, errors, resource_warnings, where}}`. The fragment is
+   byte-deterministic (sorted keys, LF endings, no timestamps) and is
+   uploaded as an ephemeral artifact (`retention-days: 1`).
+2. **Compose** — `release-readiness` downloads every `run-evidence-*`
+   artifact **unmerged** (duplicate platform fragments stay detectable)
+   and runs `tools/compose_run_evidence.py`, which fails closed (exit 2)
+   on malformed fragments, stale/cross-commit sha, cross-run `run_id`,
+   duplicate or unexpected platforms, unknown upstream results, or a
+   fragment missing although its cell succeeded.
+3. **Bind** — `release_check.py --evidence composed-evidence.json
+   --require-sha "$GITHUB_SHA"` re-validates `meta.sha` **before**
+   evaluating any gate; a mismatch exits 2. The sha is never compared
+   against the local git HEAD — the caller supplies the trusted reference
+   (`GITHUB_SHA`), so installed-package / off-checkout execution cannot
+   fail falsely.
+
+**Aggregate semantics (fixed decision):** the composed
+`regression.tests` is the *aggregate* number of test executions across
+all matrix cells (2061 × 3 = 6183 when every cell runs the full suite);
+`failures`/`errors`/`resource_warnings` are likewise sums. Per-cell
+canonical counts live in `regression.cells`. `regression.passed`
+requires at least one cell, every present cell passed, and no degraded
+(missing) cell.
+
+**Degraded-report behavior:** if a platform fragment is missing *and*
+its upstream did not succeed (failure/cancelled), the composer omits that
+platform key — the gate model honestly yields PARTIAL for it — and sets
+`ci.remote_runs_passed=false`. A fragment with `passed=false` maps the
+platform to `"fail"`. Any cancelled/failure/skipped upstream result also
+forces `remote_runs_passed=false`. Nothing unexpected is ever converted
+into PASS.
+
+**Honesty notes.** This evidence chain cannot certify CBM on Linux/macOS
+(there is no certified binary) and says nothing about real-HOST
+certification — those gates keep their own evidence requirements. The
+LEGAL gate stays independent: while the LICENSE file is absent it remains
+BLOCKED regardless of remote CI evidence. Remote generation has not
+happened yet — the first green remote run is still pending evidence, not
+proof.
 
 ### `packaging.yml` — Packaging
 
@@ -133,7 +182,10 @@ possibly apply is NOT_APPLICABLE, never PASS.
 no git mutation), evaluates the gates, and prints a text summary or JSON
 (`--json`). Exit codes: **0** when the report was computed — even with
 PARTIAL/BLOCKED gates; **1** when `--require` fails; **2** when a
-collector crashes. The opt-in `--run-packaging` path may acquire build
+collector crashes or `--require-sha` validation fails. `--require-sha
+SHA` binds `--evidence` to a commit: the external evidence must carry
+`meta.sha` equal to `SHA` (non-empty), validated before any gate runs;
+without `--evidence` it exits 2. The opt-in `--run-packaging` path may acquire build
 dependencies, separately from runtime/offline behavior. An exit 0 therefore means "reported", not "releasable"
 — use `--require` to assert a safety.
 

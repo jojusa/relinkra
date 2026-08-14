@@ -120,38 +120,103 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Each cell carries a canonical platform label used to name the
+      # run-scoped evidence fragment it emits (R5C).
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, platform: linux }
+          - { os: windows-latest, platform: windows }
+          - { os: macos-latest, platform: macos }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       # Canonical full regression per R5B.10: 0 failures, 0 errors, 0
-      # ResourceWarnings. The E2E suites inside build real artifacts
-      # (with network) when RELINKRA_E2E_ARTIFACT is not set.
-      - name: Full test suite
-        run: python -W error::ResourceWarning -m unittest discover -s tests -q
+      # ResourceWarnings — the emitter promotes ResourceWarning to error
+      # in-process, mirroring release_check.run_regression. The E2E suites
+      # inside build real artifacts (with network) when
+      # RELINKRA_E2E_ARTIFACT is not set.
+      # R5C: each cell emits a run-scoped evidence fragment bound to
+      # github.sha + github.run_id and exits non-zero on suite failure.
+      - name: Full test suite (emits run-scoped evidence)
+        run: >-
+          python tools/emit_run_evidence.py --run-regression
+          --platform ${{ matrix.platform }}
+          --job full-regression
+          --sha ${{ github.sha }}
+          --run-id ${{ github.run_id }}
+          --runner-os ${{ matrix.os }}
+          --out run-evidence-${{ matrix.platform }}.json
+      # Uploaded even when the suite failed: a passed=false fragment is
+      # evidence, not noise. Ephemeral on purpose — run-scoped evidence
+      # is never committed and expires with the run.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: run-evidence-${{ matrix.platform }}
+          path: run-evidence-${{ matrix.platform }}.json
+          retention-days: 1
+          if-no-files-found: error
 
   release-readiness:
     name: release-readiness
     needs: [fast, core, full-regression]
+    # always(): the readiness report must also be computed — honestly
+    # degraded — when an upstream job failed or was cancelled.
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-      # The report distinguishes LOCAL_VERIFIED from REMOTE_CI_PENDING:
-      # the CI gate inside reads workflow presence, and remote runs remain
-      # maintainer-attested evidence until branch protection exists.
-      # release_check exits 0 when the report was computed, even with
-      # PARTIAL/BLOCKED gates; no --require is asserted here.
+      # R5C run-scoped evidence: full-regression cells upload SHA-bound
+      # fragments (github.sha + github.run_id, retention-days: 1, never
+      # committed). They are downloaded unmerged so duplicate-platform
+      # fragments stay detectable, then composed into one evidence map.
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: run-evidence-*
+          path: run-evidence/
+      - name: Compose run-scoped evidence
+        shell: bash
+        env:
+          FAST_RESULT: ${{ needs.fast.result }}
+          CORE_RESULT: ${{ needs.core.result }}
+          FULL_REGRESSION_RESULT: ${{ needs.full-regression.result }}
+        # Exit 2 (malformed/stale/cross-run/duplicate/anomalous fragment)
+        # fails the job honestly. A fragment missing because its cell did
+        # not succeed composes a DEGRADED report instead: the platform key
+        # is omitted (gate PARTIAL) and remote_runs_passed is false.
+        run: |
+          set -euo pipefail
+          python tools/compose_run_evidence.py \
+            --evidence-dir run-evidence \
+            --require-sha "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --upstream "fast=${FAST_RESULT}" \
+            --upstream "core=${CORE_RESULT}" \
+            --upstream "full-regression=${FULL_REGRESSION_RESULT}" \
+            --out composed-evidence.json
+      # release_check --run-packaging builds the sdist through the PEP
+      # 517 setuptools hook, which needs setuptools/build importable on
+      # a bare setup-python interpreter.
+      - name: Install packaging prerequisites
+        run: python -m pip install build setuptools
+      # The report is bound to THIS run's commit: --require-sha rejects
+      # evidence that does not carry meta.sha == github.sha before any
+      # gate is evaluated. release_check exits 0 when the report was
+      # computed, even with PARTIAL/BLOCKED gates; no --require is
+      # asserted here.
       - name: Compute the release gate report
         shell: bash
         run: |
           set -euo pipefail
-          python tools/release_check.py --json > release-report.json
+          python tools/release_check.py \
+            --evidence composed-evidence.json \
+            --require-sha "${{ github.sha }}" \
+            --run-packaging --json > release-report.json
           cat release-report.json
       - name: Append the human gate summary
         shell: bash
@@ -159,10 +224,15 @@ jobs:
           {
             echo "## Release gate summary"
             echo '```text'
-            python tools/release_check.py
+            python tools/release_check.py \
+              --evidence composed-evidence.json \
+              --require-sha "${{ github.sha }}" --run-packaging
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      # if: always(): the report artifact must exist even on degraded
+      # runs so the gate evidence stays inspectable after failures.
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: release-report
           path: release-report.json

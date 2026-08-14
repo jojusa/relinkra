@@ -363,10 +363,11 @@ class WorkflowContractAudit(unittest.TestCase):
         ci = self.texts["ci.yml"]
         for job_id in ("fast", "core", "full-regression", "release-readiness"):
             self.assertIn(f"\n  {job_id}:\n", ci, f"ci.yml missing job {job_id}")
-        self.assertIn(
-            "python -W error::ResourceWarning -m unittest discover -s tests -q",
-            ci,
-        )
+        # R5C: the full-regression job runs the canonical suite through
+        # the run-scoped evidence emitter, which promotes ResourceWarning
+        # to error in-process (mirroring release_check.run_regression);
+        # the raw `unittest discover` command no longer lives in ci.yml.
+        self.assertIn("tools/emit_run_evidence.py --run-regression", ci)
         self.assertIn("tools/run_core_tests.py", ci)
 
     def test_ci_matrix_covers_floor_to_current(self):
@@ -475,7 +476,85 @@ class WorkflowContractAudit(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# (f) Core runner coverage
+# (f) Run-scoped remote evidence contract (R5C)
+# ---------------------------------------------------------------------------
+
+
+class RunScopedEvidenceAudit(unittest.TestCase):
+    """The ci.yml wiring for SHA-bound, ephemeral, run-scoped evidence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ci = _read(WORKFLOWS_DIR / "ci.yml")
+
+    def _job_body(self, job_id):
+        match = re.search(
+            rf"(?ms)^  {re.escape(job_id)}:\n(?P<body>.*?)(?=^  \S|\Z)",
+            self.ci,
+        )
+        self.assertIsNotNone(match, f"ci.yml missing job {job_id}")
+        return match.group("body")
+
+    def test_release_readiness_runs_always(self):
+        body = self._job_body("release-readiness")
+        self.assertIn("if: always()", body)
+
+    def test_run_evidence_fragments_downloaded_unmerged(self):
+        body = self._job_body("release-readiness")
+        self.assertIn("actions/download-artifact@v7", body)
+        self.assertIn("pattern: run-evidence-*", body)
+        # No merge-multiple: duplicate platform fragments must stay
+        # detectable by the composer.
+        self.assertNotIn("merge-multiple: true", body)
+
+    def test_report_is_bound_to_the_run_commit(self):
+        body = self._job_body("release-readiness")
+        self.assertIn("--require-sha", body)
+        self.assertIn("github.sha", body)
+        self.assertIn("--run-id", body)
+        self.assertIn("github.run_id", body)
+
+    def test_composer_receives_all_upstream_results(self):
+        body = self._job_body("release-readiness")
+        for token in ("needs.fast.result", "needs.core.result",
+                      "needs.full-regression.result"):
+            self.assertIn(token, body, f"compose step missing {token}")
+
+    def test_run_evidence_artifacts_are_ephemeral(self):
+        body = self._job_body("full-regression")
+        match = re.search(
+            r"(?ms)^      - uses: actions/upload-artifact@v7\n"
+            r"(?P<body>.*?)(?=^      - |\Z)",
+            body,
+        )
+        self.assertIsNotNone(
+            match, "full-regression missing the evidence upload step"
+        )
+        upload = match.group("body")
+        self.assertIn("retention-days: 1", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertIn("if: always()", upload)
+
+    def test_release_report_upload_runs_always(self):
+        body = self._job_body("release-readiness")
+        match = re.search(
+            r"(?ms)^      - uses: actions/upload-artifact@v7\n"
+            r"(?P<body>.*?)(?=^      - |\Z|\Z)",
+            body,
+        )
+        self.assertIsNotNone(
+            match, "release-readiness missing the report upload step"
+        )
+        self.assertIn("if: always()", match.group("body"))
+        self.assertIn("name: release-report", match.group("body"))
+
+    def test_no_untrusted_triggers_or_continue_on_error(self):
+        self.assertNotIn("pull_request_target", self.ci)
+        self.assertNotIn("continue-on-error", self.ci)
+
+
+# ---------------------------------------------------------------------------
+# (g) Core runner coverage
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +583,7 @@ class CoreRunnerCoverage(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# (g) Workflow python floor
+# (h) Workflow python floor
 # ---------------------------------------------------------------------------
 
 _OLDER_THAN_FLOOR = re.compile(r"(?<![\d.])3\.[0-8](?![\d.])")

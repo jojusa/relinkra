@@ -1,4 +1,4 @@
-"""Bounded release-check CLI (R5B.22).
+"""Bounded release-check CLI (R5B.22, R5C).
 
 Runs LOCAL evidence collectors without service calls or git mutation,
 evaluates the release gates from tools/release_gates.py, and prints a text
@@ -6,6 +6,7 @@ summary or a JSON report. The opt-in packaging collector may acquire build
 dependencies; every such subprocess is explicitly time-bounded.
 
     python tools/release_check.py [--json] [--evidence file.json]
+                                  [--require-sha SHA]
                                   [--run-regression] [--run-packaging]
                                   [--require {merge,rc,public}]
 
@@ -14,8 +15,19 @@ ResourceWarning promoted to error; TIMEBOX: this runs ~2000 tests and
 takes minutes. --run-packaging builds the wheel and sdist into a temp
 dir and enforces the artifact content contract.
 
+--require-sha (R5C) binds external evidence to a caller-supplied commit:
+when both --evidence and --require-sha are given, the external evidence
+MUST carry a ``meta.sha`` (non-empty string) equal to the required value;
+missing meta, missing/empty sha, or a mismatch exits 2 BEFORE any gate is
+evaluated. --require-sha without --evidence exits 2 (there is nothing to
+bind). The sha is NEVER compared against the local git HEAD — the caller
+supplies the trusted reference (GITHUB_SHA in CI), so installed-package /
+off-checkout execution cannot fail falsely. Without --require-sha the
+behavior is byte-identical to before.
+
 Exit codes: 0 when the report was computed (even with PARTIAL/BLOCKED
-gates), 1 when --require fails, 2 when a collector crashes.
+gates), 1 when --require fails, 2 when a collector crashes or
+--require-sha validation fails.
 """
 
 from __future__ import annotations
@@ -392,6 +404,31 @@ def collect_local_evidence(
     return evidence
 
 
+def validate_evidence_sha(external_path: str, require_sha: str) -> None:
+    """Bind external evidence to a caller-supplied commit sha (R5C).
+
+    Raises ValueError unless the evidence is a JSON object carrying a
+    non-empty ``meta.sha`` equal to ``require_sha``. Never compares
+    against the local git HEAD — the trusted reference comes from the
+    caller (GITHUB_SHA in CI).
+    """
+    with open(external_path, "r", encoding="utf-8") as handle:
+        external = json.load(handle)
+    if not isinstance(external, dict):
+        raise ValueError("external evidence must be a JSON object")
+    meta = external.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError("external evidence has no meta object")
+    sha = meta.get("sha")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError("external evidence meta.sha is missing or empty")
+    if sha != require_sha:
+        raise ValueError(
+            f"external evidence sha {sha} does not match the required "
+            f"{require_sha} (stale or cross-commit evidence)"
+        )
+
+
 def merge_evidence(
     local: Dict[str, Any], external_path: Optional[str]
 ) -> Dict[str, Any]:
@@ -434,6 +471,13 @@ def main(argv=None) -> int:
                         help="print the ReleaseReport as JSON")
     parser.add_argument("--evidence", metavar="FILE.json",
                         help="external evidence mapping (wins per key)")
+    parser.add_argument(
+        "--require-sha", metavar="SHA",
+        help="commit the external evidence must be bound to; requires "
+        "--evidence: the evidence must carry meta.sha equal to SHA, "
+        "otherwise exit 2 before any gate is evaluated (never compared "
+        "against the local git HEAD)",
+    )
     parser.add_argument("--run-regression", action="store_true",
                         help="run the full test suite in-process (minutes)")
     parser.add_argument("--run-packaging", action="store_true",
@@ -442,10 +486,25 @@ def main(argv=None) -> int:
                         help="exit 1 unless the given safety holds")
     args = parser.parse_args(argv)
 
+    if args.require_sha and not args.evidence:
+        print(
+            "evidence sha validation failed: --require-sha requires "
+            "--evidence (nothing to bind the sha against)",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         evidence = collect_local_evidence(
             regression=args.run_regression, packaging=args.run_packaging
         )
+        if args.require_sha:
+            try:
+                validate_evidence_sha(args.evidence, args.require_sha)
+            except (OSError, ValueError) as exc:
+                print(f"evidence sha validation failed: {exc}",
+                      file=sys.stderr)
+                return 2
         evidence = merge_evidence(evidence, args.evidence)
     except Exception as exc:
         print(f"release_check collector error: {exc}", file=sys.stderr)
