@@ -5,6 +5,10 @@ lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
 ## 0.1.0 — upcoming
 
+**Current release candidate: `0.1.0rc1`.** The notes below describe the
+upcoming 0.1.0 release; the candidate ships the same content for
+pre-release verification.
+
 ### Added
 
 - MCP stdio server (`relinkra-mcp`) that agent hosts connect to.

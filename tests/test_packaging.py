@@ -31,7 +31,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 GITIGNORE = REPO_ROOT / ".gitignore"
 
-VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+# Project version policy: final releases are X.Y.Z; release candidates
+# are X.Y.ZrcN with N >= 1 (rc0 is deliberately not a valid candidate).
+# Rejected forms include 0.1.0-rc1, 0.1.0RC1, 0.1.rc1, 0.1.0rc, 0.1.0rc0.
+VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(rc[1-9]\d*)?$")
 
 
 def load_pyproject() -> dict:
@@ -77,6 +80,35 @@ class PyprojectTests(unittest.TestCase):
         dynamic = self.data["tool"]["setuptools"]["dynamic"]["version"]
         self.assertEqual(dynamic, {"attr": "relinkra.__version__"})
         self.assertRegex(relinkra.__version__, VERSION_PATTERN)
+
+    def test_version_pattern_policy_table(self):
+        # Executable form of the version policy comment: finals are X.Y.Z,
+        # candidates are X.Y.ZrcN with N >= 1, canonical spellings only.
+        accepted = (
+            "0.1.0",
+            "0.1.0rc1",
+            "0.1.0rc2",
+            "0.1.0rc10",
+            "10.20.30rc15",
+        )
+        rejected = (
+            "0.1.0-rc1",   # PEP 440 would normalize; policy is canonical-only
+            "0.1.0RC1",    # uppercase segment
+            "0.1.rc1",     # missing patch component
+            "0.1.0rc",     # missing candidate number
+            "0.1.0rc0",    # candidates start at 1
+            "0.1.0rc01",   # non-canonical leading zero
+        )
+        for version in accepted:
+            self.assertIsNotNone(
+                VERSION_PATTERN.fullmatch(version),
+                f"policy must accept {version!r}",
+            )
+        for version in rejected:
+            self.assertIsNone(
+                VERSION_PATTERN.fullmatch(version),
+                f"policy must reject {version!r}",
+            )
 
     def test_project_table_never_hardcodes_version(self):
         # Mutation guard: the version must stay dynamic, read from
