@@ -796,23 +796,26 @@ class TestCBMCLIAdapter(unittest.TestCase):
     def test_code_evidence_authority_projects_only_graph_head_and_trust(self):
         adapter = self.make_adapter()
         head = "a" * 40
-        raw = {
-            "root_path": r"C:\work\ws-a",
-            "git": {"head_sha": head},
-            "credentials": {"token": "secret"},
-            "host_config": {"host": "private.internal"},
-        }
-        with mock.patch.object(adapter, "index_status", return_value=raw), mock.patch(
-            "relinkra.cbm_adapter.git_head_sha", return_value=head
-        ):
-            authority = adapter.code_evidence_authority()
-        self.assertEqual(
-            authority,
-            {
-                "index_status": {"git": {"head_sha": head}},
-                "trust_stages": [{"name": "CBM graph", "status": "PASS"}],
+        with mock.patch.object(
+            adapter,
+            "index_status",
+            return_value={
+                "root_path": r"C:\work\ws-a",
+                "git": {"head_sha": head},
+                "credentials": {"token": "secret"},
+                "host_config": {"host": "private.internal"},
             },
-        )
+        ), mock.patch.object(
+            adapter, "graph_index_head", return_value=head
+        ), mock.patch.object(
+            adapter,
+            "detect_changes",
+            return_value={"changed_count": 0, "changed_files": []},
+        ), mock.patch("relinkra.cbm_adapter.git_head_sha", return_value=head):
+            authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["index_status"], {"git": {"head_sha": head}})
+        self.assertEqual(authority["trust_stages"][0]["name"], "CBM graph")
+        self.assertEqual(authority["trust_stages"][0]["status"], "PASS")
         rendered = json.dumps(authority, sort_keys=True)
         self.assertNotIn("root_path", rendered)
         self.assertNotIn("secret", rendered)
@@ -828,12 +831,15 @@ class TestCBMCLIAdapter(unittest.TestCase):
                 "root_path": r"D:\other\repo",
                 "git": {"head_sha": head},
             },
-        ), mock.patch("relinkra.cbm_adapter.git_head_sha") as git_head:
+        ), mock.patch.object(adapter, "graph_index_head") as stored, mock.patch(
+            "relinkra.cbm_adapter.git_head_sha"
+        ) as git_head:
             authority = adapter.code_evidence_authority()
         self.assertEqual(
             authority["trust_stages"],
-            [{"name": "CBM graph", "status": "WARN"}],
+            [{"name": "CBM graph", "status": "WARN", "detail": "the indexed graph belongs to a different workspace root"}],
         )
+        stored.assert_not_called()
         git_head.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows normcase semantics")

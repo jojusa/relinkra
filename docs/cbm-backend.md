@@ -68,9 +68,14 @@ Binary resolution order at runtime: `RELINKRA_CBM_BIN` → managed
   above), re-run `index_repository` if the on-disk index format changed,
   and confirm `doctor` returns to all-PASS on the CBM ladder. Relinkra
   state (registry, config, memories) is unaffected by a CBM swap.
-- **Stale artifacts**: doctor flags a graph whose `head_sha` differs from
-  the workspace HEAD (stale index), an index missing for the recorded
-  project, and a binary failing the provenance hash.
+- **Stale artifacts**: doctor flags a stale graph by comparing the
+  graph's STORED index-time Branch head (via `cli query_graph`) with
+  the workspace HEAD (committed drift), plus `cli detect_changes` for
+  uncommitted worktree drift; also an index missing for the recorded
+  project, and a binary failing the provenance hash. Relinkra
+  determines freshness from these real signals only — `index_status`
+  `git.head_sha` is live-derived from the repository at query time and
+  alone is NOT freshness evidence.
 
 ## Compatibility fixture strategy
 
@@ -101,6 +106,24 @@ channels and exit codes) are encoded as tests in `tests/test_cbm_backend.py`:
 - A missing/unindexed project in `search_graph` exits 1 with a JSON error
   on stderr; the adapter raises and the context pipeline degrades with a
   `cbm_unavailable` warning (honest degradation, not a silent empty).
+  The same `{"error":"project not found or not indexed",...}` envelope
+  from `query_graph`/`detect_changes` is classified as an honest
+  missing index (`CBMProjectNotIndexedError`), never an outage and
+  never fresh.
+- Freshness signals (0.9.0): `cli query_graph` `MATCH (n:Branch) RETURN
+  n.head_sha` returns the graph's STORED index-time head — the
+  authoritative anchor. `index_status` `git.head_sha` is LIVE-DERIVED
+  from the repository HEAD at query time and is not freshness
+  evidence. `cli detect_changes` reports UNCOMMITTED worktree drift
+  only (a clean worktree after commits reports clean) and may emit
+  duplicate `changed_files` entries; the adapter dedupes them, while
+  `changed_count` stays CBM's raw count (duplicates included) — so the
+  two values can legitimately differ.
+- Re-index quirk (0.9.0): `index_repository` over an existing database
+  refreshes the stored Branch head only when NEW files appeared since
+  the last index; a modify-only change keeps the old stored head, so
+  the freshness check honestly stays stale until a clean-cache
+  re-index (delete the project db, then re-index).
 - Doctor's ladder verifies provenance (SHA-256) BEFORE executing the
   binary; a mismatch stops the ladder. A backend that cannot answer is
   reported "index/graph state unknown — backend not reachable", never

@@ -29,7 +29,11 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Tuple
 
 from .cbm import cbm_db_path
-from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
+from .cbm_adapter import (
+    CBMAdapterError,
+    CBMCLIAdapter,
+    CBMProjectNotIndexedError,
+)
 from .identity import GitError, git_head_sha
 from .memory import sanitize_error
 
@@ -503,6 +507,9 @@ def evaluate_cbm_trust(
             )
         )
         return stages
+    # Structural validation only: this head is LIVE-derived by CBM and
+    # is never freshness evidence; freshness compares the STORED Branch
+    # head below plus change detection for worktree drift (R5E.2A).
     git_facts = status.get("git")
     if not isinstance(git_facts, dict):
         stages.append(
@@ -539,19 +546,109 @@ def evaluate_cbm_trust(
             )
         )
         return stages
-    if graph_head != workspace_head:
+    # Committed drift: the STORED index-time Branch head vs the current
+    # workspace HEAD (index_status head_sha is live-derived and would
+    # always match a clean worktree — the R5E.1 false-fresh bug).
+    try:
+        stored_head = adapter.graph_index_head()
+    except CBMProjectNotIndexedError:
         stages.append(
             TrustStage(
                 "CBM graph",
                 STAGE_WARN,
-                f"stale index: graph at {str(graph_head)[:8]}, workspace at "
-                f"{workspace_head[:8]}",
-                "Re-index to refresh the graph for the current HEAD.",
+                "index missing for the recorded project",
+                "Index this workspace with 'codebase-memory-mcp cli "
+                "index_repository' into the Relinkra-managed cache.",
             )
         )
         return stages
-    else:
-        stages.append(TrustStage("CBM graph", STAGE_PASS, "graph matches this workspace and HEAD"))
+    except CBMAdapterError as exc:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                f"graph state unknown — backend not reachable: "
+                f"{sanitize_error(str(exc))}",
+            )
+        )
+        return stages
+    if not stored_head:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                "graph state is missing a stored index HEAD",
+                "Re-index to record this workspace HEAD.",
+            )
+        )
+        return stages
+    if stored_head != workspace_head:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                f"stale index: graph at {stored_head[:8]}, workspace at "
+                f"{workspace_head[:8]}",
+                "Re-index to refresh the graph for the current HEAD. "
+                "(if the WARN persists after re-indexing, delete the "
+                "project .db in the managed cache and re-index — CBM "
+                "0.9.0 keeps the stored HEAD for modify-only "
+                "re-indexes)",
+            )
+        )
+        return stages
+    # Uncommitted drift: detect_changes reports worktree changes the
+    # stored graph cannot know about even when HEADs match.
+    try:
+        changes = adapter.detect_changes()
+    except CBMProjectNotIndexedError:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                "index missing for the recorded project",
+                "Index this workspace with 'codebase-memory-mcp cli "
+                "index_repository' into the Relinkra-managed cache.",
+            )
+        )
+        return stages
+    except CBMAdapterError as exc:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                f"graph state unknown — backend not reachable: "
+                f"{sanitize_error(str(exc))}",
+            )
+        )
+        return stages
+    changed_count = changes.get("changed_count")
+    if (
+        isinstance(changed_count, bool)
+        or not isinstance(changed_count, int)
+        or changed_count < 0
+    ):
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                "graph state is missing valid change detection",
+                "Re-index to refresh the graph for this workspace.",
+            )
+        )
+        return stages
+    if changed_count > 0:
+        stages.append(
+            TrustStage(
+                "CBM graph",
+                STAGE_WARN,
+                f"worktree has {changed_count} changed file(s) since the "
+                "graph was indexed",
+                "Re-index to refresh the graph for the current worktree.",
+            )
+        )
+        return stages
+    stages.append(TrustStage("CBM graph", STAGE_PASS, "graph matches this workspace and HEAD"))
 
     # -- real query ---------------------------------------------------------------
     try:
@@ -574,6 +671,29 @@ _REQUIRED_TRUST_STAGES = frozenset(
     {"CBM binary", "CBM provenance", "CBM cache", "CBM version", "CBM index", "CBM graph", "CBM query"}
 )
 
+# Staleness-drift WARN details (R5E.2A): committed drift (stored index
+# head vs workspace HEAD) and uncommitted worktree drift. Matched by
+# stable prefix + shape, never full f-string equality. Policy
+# (docs/freshness-explainability.md): stale graph evidence is SERVED
+# marked stale, so these two WARNs — and only these — do not fail
+# adapter certification; every structural graph WARN (different
+# workspace root, missing stored index HEAD, unreachable backend,
+# missing index) still fails.
+_STALE_INDEX_DETAIL_RE = re.compile(r"^stale index: graph at ")
+_WORKTREE_DRIFT_DETAIL_RE = re.compile(
+    r"^worktree has \d+ changed file\(s\) since the graph was indexed"
+)
+
+
+def _is_staleness_warn(stage: TrustStage) -> bool:
+    """True only when a stage WARN is pure freshness drift (R5E.2A)."""
+    if stage.name != "CBM graph" or stage.status != STAGE_WARN:
+        return False
+    return bool(
+        _STALE_INDEX_DETAIL_RE.match(stage.detail)
+        or _WORKTREE_DRIFT_DETAIL_RE.match(stage.detail)
+    )
+
 
 def certify_configured_adapter(
     root: str,
@@ -584,9 +704,16 @@ def certify_configured_adapter(
 ):
     """Return an adapter only after the complete CBM trust ladder passes.
 
-    Configuration-created adapters must never get a weaker path than doctor.
-    Explicitly injected adapters remain a test seam and deliberately bypass
-    this constructor.
+    Configuration-created adapters must never get a weaker path than
+    doctor. Explicitly injected adapters remain a test seam and
+    deliberately bypass this constructor.
+
+    R5E.2A policy exception: freshness drift is NOT a structural
+    failure. A dirty worktree or commits-since-index is a normal dev
+    state, the per-packet ``code_evidence_authority`` marks the evidence
+    stale, and doctor still shows the WARN — so the two staleness-drift
+    graph WARNs are tolerated here instead of silently disabling the
+    adapter. Structural WARNs still raise.
     """
     if not isinstance(root, str) or not root.strip():
         raise CBMAdapterError("workspace root is required for CBM trust verification")
@@ -606,8 +733,24 @@ def certify_configured_adapter(
         adapter_factory=capture_adapter,
     )
     by_name = {stage.name: stage for stage in stages}
-    if _REQUIRED_TRUST_STAGES.issubset(by_name) and all(
-        by_name[name].status == STAGE_PASS for name in _REQUIRED_TRUST_STAGES
+    deficient = {
+        name
+        for name in _REQUIRED_TRUST_STAGES
+        if name not in by_name or by_name[name].status != STAGE_PASS
+    }
+    if not deficient:
+        return constructed[-1]
+    # The stale-graph drift WARN honestly stops the ladder before the
+    # query probe (doctor never queries a distrusted graph), so the
+    # drift path can only be deficient in "CBM graph" plus the
+    # "CBM query" stage it skipped — nothing else.
+    graph = by_name.get("CBM graph")
+    query = by_name.get("CBM query")
+    if (
+        graph is not None
+        and _is_staleness_warn(graph)
+        and deficient <= {"CBM graph", "CBM query"}
+        and (query is None or query.status == STAGE_PASS)
     ):
         return constructed[-1]
 

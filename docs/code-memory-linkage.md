@@ -130,6 +130,16 @@ stable external symbol fields (`label`, `name`, `qualified_name`,
 SQLite, no Cypher reimplementation. Source contents returned by
 `get_code_snippet` are discarded and never persisted.
 
+**Graph attestation (freshness semantics).** `code_evidence_authority()`
+attests `index_status.git.head_sha` = the graph's STORED index-time head
+(from `cli query_graph`'s Branch node) and a `CBM graph` trust verdict.
+The verdict is PASS only when that stored head equals the workspace git
+HEAD AND `cli detect_changes` reports a clean worktree; committed drift
+(`stale index: graph at …, workspace at …`) and uncommitted worktree
+drift (`worktree has N changed file(s) since the graph was indexed`)
+both WARN. `index_status`'s own `git.head_sha` is live-derived by CBM
+and is never used as freshness evidence.
+
 ## Security
 
 Refs cannot persist credentialed repo URLs (userinfo rejected at both

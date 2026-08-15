@@ -54,6 +54,30 @@ class CBMAdapterError(Exception):
     """Raised when the CBM CLI fails or returns an unusable payload."""
 
 
+class CBMProjectNotIndexedError(CBMAdapterError):
+    """Raised when a WORKING CBM backend reports the project as absent.
+
+    Distinguishable from outages so callers can classify INDEX_MISSING
+    (an honest missing state) instead of UNAVAILABLE. Following the
+    anchored "symbol not found" precedent: only the exact CBM error
+    phrase maps here; any other failure stays an outage-class
+    ``CBMAdapterError``.
+    """
+
+
+# CBM's stable error phrase for an absent/unindexed project, embedded in
+# a JSON error envelope on stderr (exit 1) or a structured payload. The
+# stderr match is ANCHORED: _run shapes failures as "cbm <tool> failed:
+# <sanitized stderr>" and the envelope is the whole leading stderr when
+# CBM emits it, so the envelope must start the failure detail — an
+# outage whose stderr merely embeds the phrase mid-text stays
+# outage-class (mirroring the "symbol not found" precedent).
+_PROJECT_NOT_INDEXED_RE = re.compile(
+    r'^cbm [a-z_]+ failed: \{"error"\s*:\s*"project not found or not indexed"',
+    re.IGNORECASE,
+)
+
+
 def strip_project_slug(qualified_name: str, cbm_project_name: str) -> str:
     """Remove the path-derived CBM project slug prefix from a qn.
 
@@ -437,61 +461,211 @@ class CBMCLIAdapter:
         return projects
 
     def index_status(self, project: Optional[str] = None) -> dict:
-        """Index freshness/root facts for one project (``cli index_status``)."""
+        """Index freshness/root facts for one project (``cli index_status``).
+
+        Contract note (certified CBM 0.9.0): ``git.head_sha`` here is
+        LIVE-DERIVED from the repository HEAD at query time, NOT the
+        index-time head — it is never freshness evidence. Use it for
+        ready/missing state, stats, and the live-accurate ``root_path``
+        binding; use ``graph_index_head()`` for freshness. Raises
+        ``CBMProjectNotIndexedError`` for the not-indexed error envelope
+        and ``CBMAdapterError`` for outages and malformed payloads.
+        """
         slug = self._project(project)
-        payload = self._run("index_status", ["--project", slug])
+        payload = self._run_or_classify("index_status", ["--project", slug])
         if not isinstance(payload, dict):
             raise CBMAdapterError("cbm index_status returned a non-object payload")
-        if "error" in payload:
-            raise CBMAdapterError("cbm index_status returned an error payload")
         return payload
+
+    def _classify_structured_error(self, tool: str, payload: object) -> None:
+        """Raise for an error envelope, mapping the not-indexed phrase."""
+        if isinstance(payload, dict) and "error" in payload:
+            error = str(payload.get("error") or "").strip()
+            if error.lower() == "project not found or not indexed":
+                raise CBMProjectNotIndexedError(
+                    f"cbm {tool} reported the project as not indexed"
+                )
+            raise CBMAdapterError(f"cbm {tool} returned an error payload")
+
+    def _run_or_classify(self, tool: str, flags: List[str]) -> object:
+        """``_run`` with the not-indexed error envelope classified."""
+        try:
+            payload = self._run(tool, flags)
+        except CBMAdapterError as exc:
+            # _run shapes failures as "cbm <tool> failed: <sanitized
+            # stderr>"; the not-indexed JSON envelope is the only phrase
+            # mapped to a miss-class error, mirroring the anchored
+            # "symbol not found" precedent in get_snippet.
+            if _PROJECT_NOT_INDEXED_RE.search(str(exc)):
+                raise CBMProjectNotIndexedError(
+                    f"cbm {tool} reported the project as not indexed"
+                ) from exc
+            raise
+        self._classify_structured_error(tool, payload)
+        return payload
+
+    def graph_index_head(self, project: Optional[str] = None) -> Optional[str]:
+        """Return the STORED index-time Branch head sha (``cli query_graph``).
+
+        This is the authoritative stored freshness anchor: the graph's
+        Branch node keeps the head captured at index time, unlike
+        ``index_status`` whose head is re-derived live. Returns None
+        when the indexed graph has no Branch node. Raises
+        ``CBMProjectNotIndexedError`` for the not-indexed error envelope
+        and ``CBMAdapterError`` for outages, malformed payloads, or a
+        stored head that is not a 7-64 hex sha.
+        """
+        slug = self._project(project)
+        payload = self._run_or_classify(
+            "query_graph",
+            [
+                "--project",
+                slug,
+                "--query",
+                "MATCH (n:Branch) RETURN n.head_sha AS h LIMIT 1",
+            ],
+        )
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm query_graph returned a non-object payload")
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise CBMAdapterError("cbm query_graph returned malformed rows")
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, list) or not row:
+            raise CBMAdapterError("cbm query_graph returned a malformed row")
+        head = row[0]
+        if head is None:
+            return None
+        head = str(head).strip()
+        if not head:
+            raise CBMAdapterError("cbm query_graph returned an empty head sha")
+        if not _GRAPH_REVISION_RE.fullmatch(head):
+            raise CBMAdapterError("cbm query_graph returned a non-hex head sha")
+        return head
+
+    def detect_changes(self, project: Optional[str] = None) -> dict:
+        """Uncommitted worktree drift vs the indexed graph (``cli detect_changes``).
+
+        Returns ``{"changed_count": int, "changed_files": [unique
+        sorted POSIX paths]}`` — CBM may emit duplicate paths, which are
+        deduped here; non-string entries are dropped, never stringified.
+        ``changed_count`` is CBM's raw count (it counts duplicates);
+        committed changes with a clean worktree report clean. Raises
+        ``CBMProjectNotIndexedError`` for the not-indexed error envelope
+        and ``CBMAdapterError`` for outages and malformed payloads.
+        """
+        slug = self._project(project)
+        payload = self._run_or_classify(
+            "detect_changes", ["--project", slug]
+        )
+        if not isinstance(payload, dict):
+            raise CBMAdapterError("cbm detect_changes returned a non-object payload")
+        count = payload.get("changed_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise CBMAdapterError(
+                "cbm detect_changes returned a malformed changed_count"
+            )
+        raw_files = payload.get("changed_files")
+        if not isinstance(raw_files, list):
+            raise CBMAdapterError("cbm detect_changes returned malformed changed_files")
+        files = sorted(
+            {
+                path.strip().replace("\\", "/")
+                for path in raw_files
+                if isinstance(path, str) and path.strip()
+            }
+        )
+        return {"changed_count": count, "changed_files": files}
 
     def code_evidence_authority(self) -> dict:
         """Return the portable graph attestation used by read-side evidence.
 
-        ``index_status`` owns the graph revision and workspace binding, but its
-        raw payload also contains the absolute indexed root.  Compare that root
-        locally, then project only the graph HEAD and the native graph verdict.
-        No cache path, project slug, host configuration, or raw status payload
-        crosses this boundary.
-        """
-        status = self.index_status()
-        git_facts = status.get("git")
-        graph_head = (
-            git_facts.get("head_sha")
-            if isinstance(git_facts, dict)
-            else None
-        )
-        graph_head = str(graph_head).strip() if graph_head else None
-        if graph_head and not _GRAPH_REVISION_RE.fullmatch(graph_head):
-            graph_head = None
+        Freshness (R5E.2A) is computed from REAL stored signals only:
 
-        trusted = False
+        - the graph's STORED index-time Branch head (``graph_index_head``),
+          compared against the workspace git HEAD — committed drift;
+        - ``detect_changes`` — uncommitted worktree drift.
+
+        ``index_status`` contributes only the live-accurate workspace
+        root binding (and ready/missing state); its ``git.head_sha`` is
+        live-derived and is NEVER freshness evidence. No cache path,
+        project slug, host configuration, or raw status payload crosses
+        this boundary. Stage detail strings are diagnostic surface
+        only — portable packets strip them via
+        ``linkage._portable_cbm_authority``.
+        """
+        portable_index = {"git": {}}
+
+        def warn(detail: str) -> dict:
+            return {
+                "index_status": portable_index,
+                "trust_stages": [
+                    {"name": "CBM graph", "status": "WARN", "detail": detail}
+                ],
+            }
+
+        try:
+            status = self.index_status()
+        except CBMProjectNotIndexedError:
+            return warn("index missing for the recorded project")
         raw_root = status.get("root_path")
-        if (
+        if not (
             isinstance(raw_root, str)
             and raw_root.strip()
             and self.workspace_root
-            and graph_head
         ):
-            status_root = _root_comparison_key(_normalize_workspace_root(raw_root))
-            workspace_root = _root_comparison_key(self.workspace_root)
-            if status_root == workspace_root:
-                try:
-                    current_head = git_head_sha(self.workspace_root)
-                except (GitError, ValueError):
-                    current_head = None
-                trusted = bool(current_head and graph_head == current_head)
+            return warn("graph state is missing a valid workspace root")
+        status_root = _root_comparison_key(_normalize_workspace_root(raw_root))
+        workspace_root = _root_comparison_key(self.workspace_root)
+        if status_root != workspace_root:
+            return warn("the indexed graph belongs to a different workspace root")
 
-        portable_index = {"git": {}}
-        if graph_head:
-            portable_index["git"]["head_sha"] = graph_head
+        try:
+            stored_head = self.graph_index_head()
+        except CBMProjectNotIndexedError:
+            return warn("index missing for the recorded project")
+        if not stored_head:
+            return warn("graph state is missing a stored index HEAD")
+        portable_index["git"]["head_sha"] = stored_head
+
+        try:
+            current_head = git_head_sha(self.workspace_root)
+        except (GitError, ValueError):
+            current_head = None
+        if not (isinstance(current_head, str) and current_head.strip()):
+            return warn("workspace HEAD could not be verified")
+        if stored_head != current_head:
+            return warn(
+                f"stale index: graph at {stored_head[:8]}, workspace at "
+                f"{current_head[:8]}"
+            )
+
+        try:
+            changes = self.detect_changes()
+        except CBMProjectNotIndexedError:
+            return warn("index missing for the recorded project")
+        changed_count = changes.get("changed_count")
+        if (
+            isinstance(changed_count, bool)
+            or not isinstance(changed_count, int)
+            or changed_count < 0
+        ):
+            return warn("graph state is missing valid change detection")
+        if changed_count > 0:
+            return warn(
+                f"worktree has {changed_count} changed file(s) since the "
+                "graph was indexed"
+            )
+
         return {
             "index_status": portable_index,
             "trust_stages": [
                 {
                     "name": "CBM graph",
-                    "status": "PASS" if trusted else "WARN",
+                    "status": "PASS",
+                    "detail": "graph matches this workspace and HEAD",
                 }
             ],
         }

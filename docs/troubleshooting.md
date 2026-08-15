@@ -64,6 +64,24 @@ put it on `PATH`, point `RELINKRA_CBM_BIN` at the binary, or use the
 workspace-managed `.codebase-memory/bin/` location. On macOS/Linux, note
 that the certified binary currently ships for windows-amd64 only.
 
+## CBM graph is stale
+
+**Symptom:** `doctor` WARNs on the CBM graph stage with `stale index:
+graph at …` or `worktree has N changed file(s)…`; packets still carry
+CBM code evidence, marked stale.
+
+**Cause:** normal development drifted the indexed graph. `stale index`
+means commits landed after the last index (the stored graph HEAD no
+longer matches the workspace HEAD); `worktree has N changed file(s)`
+means uncommitted edits exist. Evidence is served degraded-but-usable,
+never silently dropped.
+
+**Fix:** re-index the workspace into the managed cache
+(`codebase-memory-mcp cli index_repository`). If the WARN persists,
+CBM 0.9.0 keeps the stored HEAD for modify-only re-indexes — delete the
+project `.db` under `.codebase-memory/cache/` and re-index. Details:
+[CBM backend](cbm-backend.md).
+
 ## Engram missing
 
 **Symptom:** `doctor` or `status` show Engram as unavailable; memory

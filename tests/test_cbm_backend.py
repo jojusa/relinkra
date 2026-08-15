@@ -31,6 +31,7 @@ from relinkra.backend_policy import (
 from relinkra.cbm_adapter import (
     CBMAdapterError,
     CBMCLIAdapter,
+    CBMProjectNotIndexedError,
     MAX_CHILD_OUTPUT_BYTES,
     _normalize_workspace_root,
     parse_cli_json,
@@ -214,6 +215,8 @@ class TestHistoricalContract(unittest.TestCase):
                 _adapter().get_snippet(f"{SLUG}.relinkra.x.Nope")
             with self.assertRaises(CBMAdapterError):
                 _adapter().list_projects()
+            with self.assertRaises(CBMAdapterError):
+                _adapter().index_status()
 
 
 class TestCertifiedContract090(unittest.TestCase):
@@ -265,6 +268,42 @@ class TestCertifiedContract090(unittest.TestCase):
         ):
             with self.assertRaises(CBMAdapterError):
                 _adapter().get_snippet(f"{SLUG}.relinkra.x.Nope")
+
+    def test_index_status_not_indexed_envelope_is_missing_class(self):
+        # W1: index_status classifies the not-indexed error envelope
+        # (rc=1, JSON on stderr) as the missing-index subclass.
+        stderr = '{"error": "project not found or not indexed", "count": 0}'
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(rc=1, stderr=stderr),
+        ):
+            with self.assertRaises(CBMProjectNotIndexedError):
+                _adapter().index_status()
+
+    def test_wrapped_outage_with_not_indexed_envelope_still_raises(self):
+        # W2 anchor: an outage whose stderr embeds the not-indexed
+        # envelope MID-TEXT is outage-class for every classifying tool,
+        # never a silent missing-index miss.
+        stderr = (
+            "fatal: worker crashed after upstream echoed "
+            '{"error":"project not found or not indexed"} in its log'
+        )
+        probes = {
+            "graph_index_head": lambda adapter: adapter.graph_index_head(),
+            "detect_changes": lambda adapter: adapter.detect_changes(),
+            "index_status": lambda adapter: adapter.index_status(),
+        }
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(rc=1, stderr=stderr),
+        ):
+            for name, probe in probes.items():
+                with self.subTest(probe=name):
+                    with self.assertRaises(CBMAdapterError) as ctx:
+                        probe(_adapter())
+                    self.assertNotIsInstance(
+                        ctx.exception, CBMProjectNotIndexedError
+                    )
 
     def test_other_snippet_failures_raise(self):
         with mock.patch(
@@ -332,6 +371,336 @@ class TestCertifiedContract090(unittest.TestCase):
             adapter = _adapter()
             self.assertEqual(adapter.list_projects()[0]["name"], SLUG)
             self.assertEqual(adapter.index_status()["status"], "ready")
+
+
+class TestStoredFreshnessSignals(unittest.TestCase):
+    """R5E.2A — graph_index_head / detect_changes adapter contracts."""
+
+    HEAD = "a003547" + "1" * 33
+
+    def _query_payload(self, rows, columns=("h",)):
+        return json.dumps({"columns": list(columns), "rows": rows, "total": len(rows)})
+
+    def _detect_payload(self, files, count=None):
+        return json.dumps(
+            {
+                "changed_files": list(files),
+                "changed_count": len(files) if count is None else count,
+                "impacted_symbols": [],
+                "depth": 2,
+            }
+        )
+
+    # -- graph_index_head --------------------------------------------------
+
+    def test_graph_index_head_returns_stored_branch_head_with_flags_syntax(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=self._query_payload([[self.HEAD]])),
+        ) as run:
+            head = _adapter().graph_index_head()
+        self.assertEqual(head, self.HEAD)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["cbm.exe", "cli", "query_graph"])
+        self.assertIn("--project", argv)
+        self.assertIn("MATCH (n:Branch) RETURN n.head_sha AS h LIMIT 1", argv)
+
+    def test_graph_index_head_none_when_graph_has_no_branch_node(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=self._query_payload([])),
+        ):
+            self.assertIsNone(_adapter().graph_index_head())
+
+    def test_graph_index_head_rejects_malformed_payloads(self):
+        for stdout in (
+            "[1, 2]",  # non-object
+            '{"columns": ["h"], "total": 0}',  # rows missing
+            '{"columns": ["h"], "rows": "nope", "total": 0}',  # rows not a list
+            '{"columns": ["h"], "rows": ["nope"], "total": 1}',  # row not a list
+            '{"columns": ["h"], "rows": [[]], "total": 1}',  # empty row
+            self._query_payload([[""]]),  # empty-string head
+            self._query_payload([["not-a-sha"]]),  # non-hex head
+            self._query_payload([["zz" * 20]]),  # non-hex chars
+        ):
+            with self.subTest(stdout=stdout):
+                with mock.patch(
+                    "relinkra.cbm_adapter.subprocess.run",
+                    return_value=_completed(stdout=stdout),
+                ):
+                    with self.assertRaises(CBMAdapterError):
+                        _adapter().graph_index_head()
+
+    def test_graph_index_head_short_sha_shape_is_accepted(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=self._query_payload([["a003547"]])),
+        ):
+            self.assertEqual(_adapter().graph_index_head(), "a003547")
+
+    def test_graph_index_head_not_indexed_stderr_envelope_is_missing(self):
+        stderr = (
+            '{"error":"project not found or not indexed","hint":"Use '
+            'list_projects","available_projects":[],"count":0}'
+        )
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(rc=1, stderr=stderr),
+        ):
+            with self.assertRaises(CBMProjectNotIndexedError):
+                _adapter().graph_index_head()
+
+    def test_graph_index_head_not_indexed_structured_payload_is_missing(self):
+        stdout = '{"error": "project not found or not indexed", "count": 0}'
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=stdout),
+        ):
+            with self.assertRaises(CBMProjectNotIndexedError):
+                _adapter().graph_index_head()
+
+    def test_graph_index_head_other_error_envelopes_raise_outage(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout='{"error": "backend offline"}'),
+        ):
+            with self.assertRaises(CBMAdapterError) as ctx:
+                _adapter().graph_index_head()
+        self.assertNotIsInstance(ctx.exception, CBMProjectNotIndexedError)
+
+    def test_graph_index_head_timeout_raises(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="cbm", timeout=1),
+        ):
+            with self.assertRaisesRegex(CBMAdapterError, "timed out"):
+                _adapter().graph_index_head()
+
+    # -- detect_changes ----------------------------------------------------
+
+    def test_detect_changes_clean(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=self._detect_payload([])),
+        ) as run:
+            result = _adapter().detect_changes()
+        self.assertEqual(result, {"changed_count": 0, "changed_files": []})
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["cbm.exe", "cli", "detect_changes"])
+        self.assertIn("--project", argv)
+
+    def test_detect_changes_dedupes_and_sorts_posix_paths(self):
+        payload = self._detect_payload(
+            ["pkg/calc.py", "other.py", "pkg\\calc.py", "pkg/calc.py"], count=4
+        )
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=payload),
+        ):
+            result = _adapter().detect_changes()
+        self.assertEqual(result["changed_files"], ["other.py", "pkg/calc.py"])
+        self.assertEqual(result["changed_count"], 4)
+
+    def test_detect_changes_filters_non_string_entries(self):
+        # W5: non-string entries are dropped, never stringified into
+        # paths like "None" or "7".
+        payload = self._detect_payload(
+            ["pkg/calc.py", "", None, 7, ["pkg/other.py"], "pkg\\other.py"],
+            count=6,
+        )
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(stdout=payload),
+        ):
+            result = _adapter().detect_changes()
+        self.assertEqual(result["changed_files"], ["pkg/calc.py", "pkg/other.py"])
+        self.assertEqual(result["changed_count"], 6)
+
+    def test_detect_changes_rejects_malformed_payloads(self):
+        for stdout in (
+            "[1, 2]",  # non-object
+            '{"changed_files": []}',  # changed_count missing
+            '{"changed_files": [], "changed_count": "2"}',  # non-int
+            '{"changed_files": [], "changed_count": true}',  # bool
+            '{"changed_files": [], "changed_count": -1}',  # negative
+            '{"changed_count": 0}',  # changed_files missing
+            '{"changed_count": 0, "changed_files": "nope"}',  # files not a list
+        ):
+            with self.subTest(stdout=stdout):
+                with mock.patch(
+                    "relinkra.cbm_adapter.subprocess.run",
+                    return_value=_completed(stdout=stdout),
+                ):
+                    with self.assertRaises(CBMAdapterError):
+                        _adapter().detect_changes()
+
+    def test_detect_changes_not_indexed_is_missing_not_outage(self):
+        stderr = '{"error":"project not found or not indexed","count":0}'
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(rc=1, stderr=stderr),
+        ):
+            with self.assertRaises(CBMProjectNotIndexedError):
+                _adapter().detect_changes()
+
+    def test_detect_changes_other_failure_raises_outage(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(rc=1, stderr="fatal: worker crashed"),
+        ):
+            with self.assertRaises(CBMAdapterError) as ctx:
+                _adapter().detect_changes()
+        self.assertNotIsInstance(ctx.exception, CBMProjectNotIndexedError)
+
+    def test_detect_changes_timeout_raises(self):
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="cbm", timeout=1),
+        ):
+            with self.assertRaisesRegex(CBMAdapterError, "timed out"):
+                _adapter().detect_changes()
+
+
+class TestAuthorityFreshnessModel(unittest.TestCase):
+    """R5E.2A — code_evidence_authority computes freshness from stored signals."""
+
+    HEAD = "a" * 40
+    OLD = "0" * 40
+
+    def _authority(
+        self,
+        *,
+        live_head,
+        stored,
+        changes=None,
+        root="C:/Desarrollos/relinkra",
+        git_head=None,
+    ):
+        adapter = _adapter()
+        status = {
+            "root_path": root,
+            "git": {"head_sha": live_head},
+            "credentials": {"token": "secret"},
+            "cache_dir": r"C:\Users\dev\.cache\cbm",
+        }
+        changes = changes if changes is not None else {
+            "changed_count": 0,
+            "changed_files": [],
+        }
+        with mock.patch.object(
+            adapter, "index_status", return_value=status
+        ), mock.patch.object(
+            adapter, "graph_index_head", return_value=stored
+        ), mock.patch.object(
+            adapter, "detect_changes", return_value=changes
+        ), mock.patch(
+            "relinkra.cbm_adapter.git_head_sha",
+            return_value=git_head if git_head is not None else self.HEAD,
+        ):
+            return adapter.code_evidence_authority()
+
+    def test_fresh_when_stored_head_matches_and_worktree_clean(self):
+        authority = self._authority(live_head=self.HEAD, stored=self.HEAD)
+        self.assertEqual(authority["trust_stages"][0]["status"], "PASS")
+        # head_sha attested in the portable projection is the STORED head
+        self.assertEqual(
+            authority["index_status"]["git"]["head_sha"], self.HEAD
+        )
+
+    def test_live_head_equal_but_stored_old_is_stale(self):
+        # Case 8 / R5E.1 regression: the live index_status head equals
+        # the workspace HEAD, but the graph's STORED head is old. The
+        # attested head is the stored one and the verdict is WARN.
+        authority = self._authority(live_head=self.HEAD, stored=self.OLD)
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertIn("stale index: graph at 00000000", authority["trust_stages"][0]["detail"])
+        self.assertIn("workspace at aaaaaaaa", authority["trust_stages"][0]["detail"])
+        self.assertEqual(authority["index_status"]["git"]["head_sha"], self.OLD)
+
+    def test_worktree_drift_is_stale_even_when_heads_match(self):
+        authority = self._authority(
+            live_head=self.HEAD,
+            stored=self.HEAD,
+            changes={"changed_count": 3, "changed_files": ["pkg/calc.py"]},
+        )
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertIn("3 changed file(s)", authority["trust_stages"][0]["detail"])
+
+    def test_bool_changed_count_is_not_valid_change_detection(self):
+        # W4 parity with the adapter's strict check: bool is an int
+        # subclass, and True/False must not count as 1/0 here either
+        # (False used to false-PASS as a clean worktree).
+        for count in (True, False):
+            with self.subTest(count=count):
+                authority = self._authority(
+                    live_head=self.HEAD,
+                    stored=self.HEAD,
+                    changes={"changed_count": count, "changed_files": []},
+                )
+                self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+                self.assertIn(
+                    "missing valid change detection",
+                    authority["trust_stages"][0]["detail"],
+                )
+
+    def test_missing_stored_head_never_fresh(self):
+        authority = self._authority(live_head=self.HEAD, stored=None)
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertNotIn("head_sha", authority["index_status"]["git"])
+
+    def test_root_mismatch_warns_without_touching_stored_signals(self):
+        adapter = _adapter()
+        with mock.patch.object(
+            adapter,
+            "index_status",
+            return_value={"root_path": "D:/elsewhere", "git": {"head_sha": self.HEAD}},
+        ), mock.patch.object(adapter, "graph_index_head") as stored, mock.patch.object(
+            adapter, "detect_changes"
+        ) as detect:
+            authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        stored.assert_not_called()
+        detect.assert_not_called()
+
+    def test_project_missing_is_warn_not_fresh(self):
+        # The REAL raise path (W1): index_status is routed through
+        # _run_or_classify, so CBM's rc=1 not-indexed JSON envelope on
+        # stderr classifies as CBMProjectNotIndexedError and the
+        # authority degrades to an honest missing-index WARN.
+        adapter = _adapter()
+        with mock.patch(
+            "relinkra.cbm_adapter.subprocess.run",
+            return_value=_completed(
+                rc=1, stderr='{"error": "project not found or not indexed"}'
+            ),
+        ):
+            authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertIn("index missing", authority["trust_stages"][0]["detail"])
+
+    def test_backend_outage_propagates_never_fresh(self):
+        adapter = _adapter()
+        with mock.patch.object(
+            adapter,
+            "index_status",
+            return_value={
+                "root_path": "C:/Desarrollos/relinkra",
+                "git": {"head_sha": self.HEAD},
+            },
+        ), mock.patch.object(
+            adapter,
+            "graph_index_head",
+            side_effect=CBMAdapterError("cbm query_graph timed out"),
+        ):
+            with self.assertRaises(CBMAdapterError):
+                adapter.code_evidence_authority()
+
+    def test_no_cache_paths_or_slug_leak_in_authority(self):
+        authority = self._authority(live_head=self.HEAD, stored=self.HEAD)
+        rendered = json.dumps(authority, sort_keys=True)
+        self.assertNotIn("cache", rendered.lower())
+        self.assertNotIn(SLUG, rendered)
+        self.assertNotIn("secret", rendered)
 
 
 class TestPinPolicy(unittest.TestCase):
@@ -422,6 +791,8 @@ class _FakeAdapter:
     version = "codebase-memory-mcp 0.9.0"
     projects = None
     status = None
+    stored_head = "h" * 40
+    changes = {"changed_count": 0, "changed_files": []}
     search_error = None
     version_error = None
 
@@ -438,6 +809,12 @@ class _FakeAdapter:
 
     def index_status(self, project=None):
         return dict(self.status or {})
+
+    def graph_index_head(self, project=None):
+        return self.stored_head
+
+    def detect_changes(self, project=None):
+        return dict(self.changes)
 
     def search_symbols(self, **kwargs):
         if self.search_error:
@@ -701,6 +1078,8 @@ class TestDoctorTrustLadder(unittest.TestCase):
             self.assertNotIn("CBM query", checks)
 
     def test_stale_index_warns(self):
+        # Committed drift: the STORED Branch head is older than the
+        # workspace HEAD (mocked to "h"*40 by _ladder).
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_workspace(tmp)
             binary = self._fake_binary(root)
@@ -710,12 +1089,136 @@ class TestDoctorTrustLadder(unittest.TestCase):
                 projects = [{"name": SLUG}]
                 status = {
                     "root_path": str(root).replace("\\", "/"),
-                    "git": {"head_sha": "0" * 40},
+                    "git": {"head_sha": "h" * 40},
                 }
+                stored_head = "0" * 40
 
             checks = _ladder(root, Fake, binary=binary)
             self.assertEqual(checks["CBM graph"].status, "WARN")
             self.assertIn("stale", checks["CBM graph"].detail)
+
+    def test_live_index_status_head_equal_but_stored_head_old_is_stale(self):
+        # THE R5E.1 regression (case 8): index_status head_sha is
+        # LIVE-DERIVED so it equals the workspace HEAD even after a
+        # commit the graph never saw. Only the STORED Branch head
+        # exposes the drift — this must stay STALE, never PASS.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            binary = self._fake_binary(root)
+            self._make_index(root)
+
+            class Fake(_FakeAdapter):
+                projects = [{"name": SLUG}]
+                status = {
+                    "root_path": str(root).replace("\\", "/"),
+                    "git": {"head_sha": "h" * 40},
+                }
+                stored_head = "0" * 40
+
+            checks = _ladder(root, Fake, binary=binary)
+            self.assertEqual(checks["CBM graph"].status, "WARN")
+            self.assertIn("stale index: graph at 00000000", checks["CBM graph"].detail)
+            self.assertIn("workspace at hhhhhhhh", checks["CBM graph"].detail)
+            # W7: committed-drift remediation is self-escalating for the
+            # CBM 0.9.0 modify-only re-index quirk.
+            self.assertIn(
+                "CBM 0.9.0 keeps the stored HEAD", checks["CBM graph"].action
+            )
+            self.assertNotIn("CBM query", checks)
+
+    def test_worktree_drift_warns_even_when_heads_match(self):
+        # Stored head == workspace HEAD, but detect_changes reports
+        # uncommitted worktree drift: STALE, never PASS.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            binary = self._fake_binary(root)
+            self._make_index(root)
+
+            class Fake(_FakeAdapter):
+                projects = [{"name": SLUG}]
+                status = {
+                    "root_path": str(root).replace("\\", "/"),
+                    "git": {"head_sha": "h" * 40},
+                }
+                stored_head = "h" * 40
+                changes = {"changed_count": 2, "changed_files": ["pkg/calc.py"]}
+
+            checks = _ladder(root, Fake, binary=binary)
+            self.assertEqual(checks["CBM graph"].status, "WARN")
+            self.assertIn("2 changed file(s)", checks["CBM graph"].detail)
+            self.assertNotIn("CBM query", checks)
+
+    def test_bool_changed_count_is_not_valid_change_detection(self):
+        # W4 parity with the adapter's strict check: bool is an int
+        # subclass; True/False must not reach the drift branches (False
+        # used to false-PASS as a clean worktree).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            binary = self._fake_binary(root)
+            self._make_index(root)
+
+            for count in (True, False):
+                with self.subTest(count=count):
+                    class Fake(_FakeAdapter):
+                        projects = [{"name": SLUG}]
+                        status = {
+                            "root_path": str(root).replace("\\", "/"),
+                            "git": {"head_sha": "h" * 40},
+                        }
+                        stored_head = "h" * 40
+                        changes = {"changed_count": count, "changed_files": []}
+
+                    checks = _ladder(root, Fake, binary=binary)
+                    self.assertEqual(checks["CBM graph"].status, "WARN")
+                    self.assertIn(
+                        "missing valid change detection",
+                        checks["CBM graph"].detail,
+                    )
+                    self.assertNotIn("CBM query", checks)
+
+    def test_unreachable_graph_probe_reports_unknown_never_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            binary = self._fake_binary(root)
+            self._make_index(root)
+
+            class Fake(_FakeAdapter):
+                projects = [{"name": SLUG}]
+                status = {
+                    "root_path": str(root).replace("\\", "/"),
+                    "git": {"head_sha": "h" * 40},
+                }
+
+                def graph_index_head(self, project=None):
+                    raise CBMAdapterError("cbm query_graph timed out")
+
+            checks = _ladder(root, Fake, binary=binary)
+            self.assertEqual(checks["CBM graph"].status, "WARN")
+            self.assertIn("unknown", checks["CBM graph"].detail)
+            self.assertNotIn("CBM query", checks)
+
+    def test_missing_project_graph_probe_is_missing_not_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            binary = self._fake_binary(root)
+            self._make_index(root)
+
+            class Fake(_FakeAdapter):
+                projects = [{"name": SLUG}]
+                status = {
+                    "root_path": str(root).replace("\\", "/"),
+                    "git": {"head_sha": "h" * 40},
+                }
+
+                def graph_index_head(self, project=None):
+                    raise CBMProjectNotIndexedError(
+                        "cbm query_graph reported the project as not indexed"
+                    )
+
+            checks = _ladder(root, Fake, binary=binary)
+            self.assertEqual(checks["CBM graph"].status, "WARN")
+            self.assertIn("index missing", checks["CBM graph"].detail)
+            self.assertNotIn("CBM query", checks)
 
     def test_wrong_workspace_graph_warns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -993,6 +1496,140 @@ class TestConfiguredCBMTrust(unittest.TestCase):
         certify.assert_called_once()
 
 
+class TestCertifyStalenessTolerance(unittest.TestCase):
+    """R5E.2A C1: freshness drift WARNs must not fail certification.
+
+    Policy (docs/freshness-explainability.md): stale graph evidence is
+    SERVED marked stale; WARN means degraded but usable. A dirty
+    worktree or commits-since-index is a normal dev state — certifying
+    must return the adapter (RelinkraServices keeps it, context_cli
+    exits 0) instead of silently disabling CBM. Structural graph WARNs
+    still fail certification, and doctor still shows every WARN.
+    """
+
+    def _workspace(self, tmp):
+        root = _make_workspace(tmp)
+        cache = root / ".codebase-memory" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"{SLUG}.db").write_text("db", encoding="utf-8")
+        binary = root / "cbm.exe"
+        binary.write_bytes(b"certified-cbm")
+        return root, binary
+
+    def _certify(self, root, binary, fake):
+        record = {"project_name": SLUG, "cache_dir": ".codebase-memory/cache"}
+        sha = hashlib.sha256(b"certified-cbm").hexdigest()
+        with mock.patch.object(
+            cbm_support, "platform_tag", return_value="windows-amd64"
+        ), mock.patch.object(
+            cbm_support,
+            "CERTIFIED_CBM_BINARIES",
+            {"windows-amd64": {"sha256": sha}},
+        ), mock.patch(
+            "relinkra.cbm_support.git_head_sha", return_value="h" * 40
+        ):
+            return cbm_support.certify_configured_adapter(
+                str(root), record, str(binary), adapter_factory=fake
+            )
+
+    def _fake(self, root, **overrides):
+        class Fake(_FakeAdapter):
+            projects = [{"name": SLUG}]
+            status = {
+                "root_path": str(root).replace("\\", "/"),
+                "git": {"head_sha": "h" * 40},
+            }
+
+        for key, value in overrides.items():
+            setattr(Fake, key, value)
+        return Fake
+
+    @staticmethod
+    def _raiser(exc):
+        def _raise(self, project=None):
+            raise exc
+
+        return _raise
+
+    def test_certify_succeeds_with_committed_drift_warn(self):
+        # Stored Branch head older than the workspace HEAD: the ladder
+        # WARNs stale and stops before the query probe; certification
+        # returns the constructed adapter anyway.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, binary = self._workspace(tmp)
+            fake = self._fake(root, stored_head="0" * 40)
+            adapter = self._certify(root, binary, fake)
+            self.assertIsInstance(adapter, fake)
+
+    def test_certify_succeeds_with_worktree_drift_warn(self):
+        # Uncommitted worktree drift with matching HEADs: same policy.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, binary = self._workspace(tmp)
+            fake = self._fake(
+                root,
+                stored_head="h" * 40,
+                changes={"changed_count": 2, "changed_files": ["pkg/calc.py"]},
+            )
+            adapter = self._certify(root, binary, fake)
+            self.assertIsInstance(adapter, fake)
+
+    def test_certify_still_fails_for_structural_graph_warns(self):
+        cases = {
+            "wrong workspace root": {
+                "status": {"root_path": "D:/elsewhere/repo", "git": {}}
+            },
+            "missing stored head": {"stored_head": None},
+            "backend unreachable": {
+                "graph_index_head": self._raiser(
+                    CBMAdapterError("cbm query_graph timed out")
+                )
+            },
+            "index missing": {
+                "graph_index_head": self._raiser(
+                    CBMProjectNotIndexedError(
+                        "cbm query_graph reported the project as not indexed"
+                    )
+                )
+            },
+        }
+        for label, attrs in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                root, binary = self._workspace(tmp)
+                fake = self._fake(root, **attrs)
+                with self.assertRaises(CBMAdapterError):
+                    self._certify(root, binary, fake)
+
+    def test_app_service_startup_keeps_drifted_adapter(self):
+        # The app_service seam: a drifted-but-structural-OK adapter is
+        # attached instead of silently disabled (cbm_adapter stays set,
+        # no config error is recorded).
+        with tempfile.TemporaryDirectory() as tmp:
+            root, binary = self._workspace(tmp)
+            fake = self._fake(root, stored_head="0" * 40)
+            sha = hashlib.sha256(b"certified-cbm").hexdigest()
+            with mock.patch.object(
+                cbm_support, "platform_tag", return_value="windows-amd64"
+            ), mock.patch.object(
+                cbm_support,
+                "CERTIFIED_CBM_BINARIES",
+                {"windows-amd64": {"sha256": sha}},
+            ), mock.patch(
+                "relinkra.cbm_support.git_head_sha", return_value="h" * 40
+            ), mock.patch(
+                "relinkra.app_service.CBMCLIAdapter", fake
+            ):
+                config = ServiceConfig(
+                    workspace_root=str(root),
+                    registry_path=str(root / ".relinkra" / "registry.json"),
+                    cbm_bin=str(binary),
+                    cbm_cache_dir=".codebase-memory/cache",
+                    cbm_project_name=SLUG,
+                )
+                services = RelinkraServices(config=config)
+            self.assertIsInstance(services.cbm_adapter, fake)
+            self.assertEqual(services._cbm_config_error, "")
+
+
 class TestDeepHealth(unittest.TestCase):
     def _identity_adapter(self, root):
         binary = root / "cbm.exe"
@@ -1193,6 +1830,156 @@ class TestRealCertifiedBinary(unittest.TestCase):
         self.assertEqual(status.get("status"), "ready")
         root = str(status.get("root_path") or "").replace("\\", "/").rstrip("/")
         self.assertEqual(root.lower(), str(REPO_ROOT).replace("\\", "/").lower())
+
+
+@unittest.skipUnless(_real_cbm_bin(), "no real CBM binary resolvable")
+class TestRealBinaryFreshnessCycle(unittest.TestCase):
+    """R5E.2A real-binary proof: FRESH → STALE(uncommitted) →
+    STALE(committed) → FRESH(reindex), driven through the ACTUAL adapter
+    methods on a throwaway git fixture with an isolated temp cache."""
+
+    TIMEOUT = 180.0
+
+    def setUp(self):
+        import shutil
+
+        if shutil.which("git") is None:
+            self.skipTest("git is not available")
+
+    def _git(self, repo, *args):
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+
+    def _git_out(self, repo, *args):
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        return result.stdout.strip()
+
+    def _index(self, repo, cache):
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "SystemRoot": os.environ.get("SystemRoot", ""),
+            "CBM_CACHE_DIR": str(cache),
+        }
+        result = subprocess.run(
+            [
+                _real_cbm_bin(),
+                "cli",
+                "index_repository",
+                "--repo-path",
+                str(repo),
+                "--mode",
+                "fast",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=self.TIMEOUT,
+            env=env,
+            shell=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-500:])
+        payload = parse_cli_json(result.stdout or "")
+        self.assertIsInstance(payload, dict)
+        slug = payload.get("project")
+        self.assertIsInstance(slug, str)
+        self.assertTrue(slug)
+        return slug
+
+    def test_fresh_stale_uncommitted_stale_committed_fresh(self):
+        import shutil
+
+        work = Path(tempfile.mkdtemp(prefix="rlk-r5e2a-real-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        repo = work / "repo"
+        repo.mkdir()
+        cache = work / "cache"
+        cache.mkdir()
+
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@t")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-qm", "init")
+        head1 = self._git_out(repo, "rev-parse", "HEAD")
+
+        slug = self._index(repo, cache)
+        adapter = CBMCLIAdapter(
+            cbm_bin=_real_cbm_bin(),
+            cache_dir=str(cache),
+            cbm_project_name=slug,
+            workspace_root=str(repo),
+        )
+
+        # FRESH: stored Branch head == workspace HEAD, worktree clean.
+        self.assertEqual(adapter.graph_index_head(), head1)
+        self.assertEqual(
+            adapter.detect_changes(), {"changed_count": 0, "changed_files": []}
+        )
+        authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "PASS")
+        self.assertEqual(authority["index_status"]["git"]["head_sha"], head1)
+
+        # STALE (uncommitted): worktree drift via detect_changes; the
+        # stored head still matches HEAD.
+        with open(repo / "calc.py", "a", encoding="utf-8") as handle:
+            handle.write("def sub(a, b):\n    return a - b\n")
+        changes = adapter.detect_changes()
+        self.assertGreater(changes["changed_count"], 0)
+        self.assertEqual(changes["changed_files"], ["calc.py"])
+        authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertIn("changed file(s)", authority["trust_stages"][0]["detail"])
+
+        # STALE (committed): worktree clean again — only the STORED head
+        # exposes the drift; the live index_status head would match.
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-qm", "second")
+        head2 = self._git_out(repo, "rev-parse", "HEAD")
+        self.assertNotEqual(head1, head2)
+        self.assertEqual(
+            adapter.detect_changes(), {"changed_count": 0, "changed_files": []}
+        )
+        self.assertEqual(adapter.index_status()["git"]["head_sha"], head2)
+        self.assertEqual(adapter.graph_index_head(), head1)
+        authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "WARN")
+        self.assertIn("stale index", authority["trust_stages"][0]["detail"])
+        self.assertIn(head1[:8], authority["trust_stages"][0]["detail"])
+
+        # FRESH again after a full re-index. NOTE: CBM 0.9.0's
+        # incremental re-index refreshes the stored Branch head only
+        # when NEW files appeared; a modify-only change keeps the old
+        # stored head (see docs/cbm-backend.md). A clean-cache re-index
+        # is the deterministic refresh path, so the proof uses it.
+        import shutil as _shutil
+
+        _shutil.rmtree(cache, ignore_errors=True)
+        cache.mkdir()
+        self._index(repo, cache)
+        self.assertEqual(adapter.graph_index_head(), head2)
+        authority = adapter.code_evidence_authority()
+        self.assertEqual(authority["trust_stages"][0]["status"], "PASS")
+        self.assertEqual(authority["index_status"]["git"]["head_sha"], head2)
 
 
 if __name__ == "__main__":
