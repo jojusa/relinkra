@@ -3,12 +3,17 @@
 How a maintainer verifies that Relinkra 0.1.0 is releasable: what the CI
 workflows prove, what they do not, how the eleven release gates read
 evidence, and what remains open before a public release. This document
-describes the verification work delivered in work unit R5B.
+describes the verification work delivered in work units R5B, R5C, and
+R5D.
 
-> **Status: READY_TO_RUN, not green.** The CI workflows below exist,
-> pass local audits, and have never executed remotely. Until the first
-> remote run is green, every CI claim in this document is pending
-> evidence, not proof.
+> **Status: CI-VERIFIED.** The CI workflows below have executed remotely
+> and are green (remote full regression, packaging, and installed-MCP
+> evidence: PASS). Checkable proof: CI run
+> [31815886965](https://github.com/jojusa/relinkra/actions/runs/31815886965)
+> and Packaging run
+> [31815886882](https://github.com/jojusa/relinkra/actions/runs/31815886882),
+> both bound to commit `60062ec0`. What remains open is tracked in
+> [Remaining evidence debt](#remaining-evidence-debt).
 
 ## Scope
 
@@ -28,7 +33,7 @@ Every claim about "works on X" carries exactly one of these levels:
 | Level | Meaning |
 |---|---|
 | **IMPLEMENTED** | The code exists and local tests exercise it (fixtures, sandboxes, fakes). |
-| **CI-VERIFIED** | A remote GitHub Actions run proves it on a real runner, per OS and Python version. Nothing is CI-VERIFIED yet — the first remote run is pending. |
+| **CI-VERIFIED** | A remote GitHub Actions run proves it on a real runner, per OS and Python version. |
 | **REAL-HOST-CERTIFIED** | A real machine ran the real integration end-to-end and the result was recorded as evidence. |
 
 **The fixture rule:** a CI fixture or sandbox connector test that passes
@@ -81,7 +86,8 @@ maintainer-attested:
 
 **Aggregate semantics (fixed decision):** the composed
 `regression.tests` is the *aggregate* number of test executions across
-all matrix cells (2061 × 3 = 6183 when every cell runs the full suite);
+all matrix cells (the full-suite count multiplied by three when every
+cell runs the full suite);
 `failures`/`errors`/`resource_warnings` are likewise sums. Per-cell
 canonical counts live in `regression.cells`. `regression.passed`
 requires at least one cell, every present cell passed, and no degraded
@@ -97,11 +103,9 @@ into PASS.
 
 **Honesty notes.** This evidence chain cannot certify CBM on Linux/macOS
 (there is no certified binary) and says nothing about real-HOST
-certification — those gates keep their own evidence requirements. The
-LEGAL gate stays independent: while the LICENSE file is absent it remains
-BLOCKED regardless of remote CI evidence. Remote generation has not
-happened yet — the first green remote run is still pending evidence, not
-proof.
+certification — those gates keep their own evidence requirements. Remote
+generation has happened: the remote CI runs are green and their evidence
+is consumed through exactly this chain.
 
 ### `packaging.yml` — Packaging
 
@@ -132,8 +136,10 @@ ubuntu/windows/macos × py3.14. Never publishes, never tags. See
 
 ## Platform honesty
 
-**Codebase Memory (CBM)** is a private backend with a certified,
-sha256-pinned provenance of **windows-amd64 v0.9.0 only**. There is no
+**Codebase Memory (CBM)** is a third-party, external backend
+([DeusData](https://github.com/DeusData/codebase-memory-mcp), MIT —
+never bundled with Relinkra) with a certified, sha256-pinned provenance
+of **windows-amd64 v0.9.0 only**. There is no
 certified Linux or macOS binary. Off Windows, `relinkra doctor` WARNs
 honestly and the integration ladder stops before execution; CI verifies
 the absence/degraded behavior — and a CI fixture passing is **not** CBM
@@ -144,8 +150,10 @@ real-host certified **locally**, as historical recorded evidence — the
 certification is not regenerated per CI run. CI runs fixture/sandbox
 connector tests only. **Devin Cloud is UNSUPPORTED** (roadmap).
 
-**Engram** is optional: CLI subprocess plus loopback HTTP
-(127.0.0.1:7437, 2s timeout), with graceful degradation when absent.
+**Engram** is optional: a third-party project (Gentleman Programming,
+MIT), external and never bundled with Relinkra. Relinkra talks to it via
+CLI subprocess plus loopback HTTP (127.0.0.1:7437, 2s timeout), with
+graceful degradation when absent.
 
 ## Release gates
 
@@ -192,14 +200,16 @@ dependencies, separately from runtime/offline behavior. An exit 0 therefore mean
 Current report (collector evidence only): `TECHNICAL_CORE`, `PACKAGING`,
 and the platform gates are PARTIAL (no regression/packaging evidence
 until `--run-regression`/`--run-packaging` runs); `SECURITY` PASS;
-`CI` PARTIAL (`REMOTE_CI_PENDING`); `LEGAL` BLOCKED (no LICENSE).
+`LEGAL` PASS (LICENSE present, MIT); `CI` PARTIAL (`REMOTE_CI_PENDING`).
+Fed with composed run-scoped remote evidence (`--evidence`), the
+technical, platform, and `CI` gates evaluate to the remote truth.
 
 ## Local verification commands
 
 All commands run from the repository root.
 
 ```bash
-# Full regression (canonical; ~2000 tests, minutes)
+# Full regression (canonical; the full suite, takes minutes)
 python -W error::ResourceWarning -m unittest discover -s tests -q
 
 # Core subset (full suite minus the two venv E2E files; exclusions explicit)
@@ -208,7 +218,9 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 
 # Artifact contract + sha256 (build first, then inspect)
 python -m build
-python tools/artifact_checks.py dist/*
+python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
+# explicit paths — PowerShell does not expand the glob:
+# python tools/artifact_checks.py dist/relinkra-0.1.0-py3-none-any.whl dist/relinkra-0.1.0.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -221,10 +233,16 @@ python tools/release_check.py --require merge
 python tools/release_check.py --evidence external.json --require rc
 
 # Focused E2E: install the exact artifact under test (as packaging.yml does)
+# bash:
 RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
 RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
+# PowerShell equivalents:
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0-py3-none-any.whl"
+# python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0.tar.gz"
+# python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
 Without `RELINKRA_E2E_ARTIFACT`, the E2E suites build their own artifact
@@ -257,9 +275,9 @@ Each cell produces an uploaded artifact set `rc-dry-run-<os>` containing
 `rc-report.json` (gate report computed with `--run-regression
 --run-packaging`). A human gate summary lands in the step summary.
 
-The dry run **never** asserts `--require public` (LEGAL BLOCKED is
-expected today), **never** uploads outside CI artifacts, **never** tags,
-and **never** publishes. It is an RC realism rehearsal, not a release.
+The dry run **never** asserts `--require public`, **never** uploads
+outside CI artifacts, **never** tags, and **never** publishes. It is an
+RC realism rehearsal, not a release.
 
 ## Versioning policy
 
@@ -276,47 +294,48 @@ and **never** publishes. It is an RC realism rehearsal, not a release.
 
 ## Legal and NOTICE readiness
 
-- There is **no LICENSE file** at the repository root. Distribution
-  rights are undefined; until the owner chooses a license, all rights
-  are reserved. This is a **public-release blocker** — the `LEGAL` gate
-  is BLOCKED. Choosing the license is the owner's decision, not the
-  tooling's.
+- **LICENSE present: MIT.** The repository root carries an MIT LICENSE
+  file (copyright José Julián Sánchez Rodríguez, 2026), chosen by the
+  owner. The `LEGAL` gate passes. The package metadata declares the MIT
+  license as a PEP 639 SPDX expression.
 - There is no NOTICE/THIRD_PARTY file for Relinkra itself, and none is
   required for the current package contents: the wheel ships only
-  `relinkra/**` with no bundled third-party code. Re-evaluate when the
-  license is chosen.
+  `relinkra/**` with no bundled third-party code. Re-evaluate if bundled
+  content ever changes.
 - The vendored CBM payload under `.codebase-memory/` carries its own
   LICENSE and THIRD_PARTY_NOTICES, but it is **not shipped** in the
-  package (the artifact contract forbids it).
-- The README already attributes Codebase Memory MCP and Engram.
+  package (the artifact contract forbids it). CBM itself is a
+  third-party project (DeusData, MIT), not bundled with Relinkra.
+- Engram is likewise a third-party project (Gentleman Programming, MIT),
+  external and optional, never bundled.
+- The README attributes Codebase Memory MCP and Engram.
 
 ## Remaining evidence debt
 
 Pre-existing debt the tooling surfaces honestly rather than hiding:
 
-- **Python 3.9/3.10 machine certification** — covered by the suite, not
-  yet by real-machine runs.
-- **Linux/macOS real-run verification** — pending the first remote CI
-  runs.
+- ~~**Python 3.9/3.10 machine certification**~~ — **resolved**: verified
+  by the remote CI matrix runs.
+- ~~**Linux/macOS real-run verification**~~ — **resolved**: the remote
+  CI runs are green on Linux and macOS.
 - **CBM provenance Windows-amd64 only** — no certified Linux/macOS
-  binary; honest degradation is the designed behavior.
+  binary; honest degradation is the designed behavior. Open.
 - **Host certifications are historical local evidence** — not
-  regenerated per CI run.
-- **Native Gentle lineage UNBOUND** — external to this repository, out
-  of scope.
+  regenerated per CI run. Open.
 
 Public-release blockers (must all clear before publication):
 
-1. **LICENSE absent** — `LEGAL` gate BLOCKED; owner must choose.
-2. **Remote CI never run** — `CI` gate PARTIAL (`REMOTE_CI_PENDING`);
-   first runs must go green on all matrix cells.
-3. **py3.9/3.10 and Linux/macOS real-machine evidence** — arrives via
-   the remote CI runs; platform gates stay PARTIAL until then.
+1. ~~**LICENSE absent**~~ — **resolved**: MIT LICENSE present; `LEGAL`
+   gate PASS.
+2. ~~**Remote CI never run**~~ — **resolved**: remote runs are green on
+   all matrix cells; `CI` gate PASS.
+3. ~~**py3.9/3.10 and Linux/macOS real-machine evidence**~~ —
+   **resolved**: arrived via the remote CI runs; platform gates PASS.
 4. **CBM Windows-only provenance** — PARTIAL is tolerated for public
    release as documented debt; PASS requires certified Linux/macOS
-   binaries.
+   binaries. Open.
 5. **Host certification historical** — PARTIAL tolerated for public
-   release as documented debt; PASS requires CI regeneration.
+   release as documented debt; PASS requires CI regeneration. Open.
 
 ## Release checklist ownership
 
@@ -325,11 +344,12 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Before merging release work: run the full regression locally, then
       `python tools/release_check.py --run-regression --run-packaging
       --require merge`.
-- [ ] Only after the first remote CI run is green: `python
-      tools/release_check.py --evidence <remote-report.json> --require rc`,
-      and rehearse with the Release Candidate Dry Run workflow.
-- [ ] Only with the LICENSE resolved by the owner: `python
-      tools/release_check.py --evidence <all-evidence.json> --require
-      public`.
+- [x] First remote CI run green: verified — remote runs are green on all
+      matrix cells and the run-scoped evidence chain (emit → compose →
+      bind) is exercised by `release-readiness`.
+- [x] LICENSE resolved by the owner: MIT, present at the repository root.
+- [ ] Rehearse with the Release Candidate Dry Run workflow, then
+      `python tools/release_check.py --evidence <all-evidence.json>
+      --require public`.
 - [ ] Version bumps only in a dedicated release commit; RC names are
-      `0.1.0rcN`; R5B itself never tags or publishes.
+      `0.1.0rcN`; nothing in R5B/R5C/R5D tags or publishes.

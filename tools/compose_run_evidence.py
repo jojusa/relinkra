@@ -15,6 +15,8 @@ Trust contract — the composer FAILS CLOSED (exit 2, no output file) on:
   digits), or different from ``--run-id`` (cross-run evidence);
 - a fragment with a platform outside windows/linux/macos, or duplicate
   fragments for the same platform (never silently take the first);
+- a fragment claiming ``passed=true`` with ``tests <= 0`` (zero-test
+  false green — a run that executed nothing is never green);
 - a missing platform fragment while the ``full-regression`` upstream
   succeeded — anomalous: when every cell succeeded the evidence MUST
   exist;
@@ -185,6 +187,14 @@ def _validate_fragment(path: Path, data: Any) -> Dict[str, Any]:
                 f"fragment {path}: regression.{key} must be a "
                 f"non-negative integer"
             )
+    if regression["passed"] and regression["tests"] <= 0:
+        # Zero-test false green: the composer is the trust boundary, so
+        # an anomalous "passed with no tests executed" fragment is
+        # rejected here even if an emitter let it through.
+        raise ComposeError(
+            f"fragment {path}: regression.passed=true requires "
+            f"tests >= 1 (a run that executed nothing is not green)"
+        )
     return data
 
 

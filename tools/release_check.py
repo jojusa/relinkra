@@ -11,16 +11,18 @@ dependencies; every such subprocess is explicitly time-bounded.
                                   [--require {merge,rc,public}]
 
 --run-regression executes the full test suite in-process with
-ResourceWarning promoted to error; TIMEBOX: this runs ~2000 tests and
-takes minutes. --run-packaging builds the wheel and sdist into a temp
+ResourceWarning promoted to error; TIMEBOX: this runs the full suite
+and takes minutes. --run-packaging builds the wheel and sdist into a temp
 dir and enforces the artifact content contract.
 
 --require-sha (R5C) binds external evidence to a caller-supplied commit:
 when both --evidence and --require-sha are given, the external evidence
 MUST carry a ``meta.sha`` (non-empty string) equal to the required value;
 missing meta, missing/empty sha, or a mismatch exits 2 BEFORE any gate is
-evaluated. --require-sha without --evidence exits 2 (there is nothing to
-bind). The sha is NEVER compared against the local git HEAD — the caller
+evaluated. The --require-sha value itself must be exactly 40 lowercase
+hex characters; anything else exits 2 BEFORE any collector runs, so a
+malformed sha never pays for a packaging build. --require-sha without
+--evidence exits 2 (there is nothing to bind). The sha is NEVER compared against the local git HEAD — the caller
 supplies the trusted reference (GITHUB_SHA in CI), so installed-package /
 off-checkout execution cannot fail falsely. Without --require-sha the
 behavior is byte-identical to before.
@@ -61,6 +63,24 @@ from relinkra.cbm_support import CERTIFIED_CBM_BINARIES
 
 GIT_TIMEOUT = 30
 BUILD_TIMEOUT = 300
+
+#: Same 40-lowercase-hex contract as emit/compose_run_evidence.
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def validate_require_sha(require_sha: str) -> None:
+    """The --require-sha value itself must be a full 40-lowercase-hex sha.
+
+    An empty, whitespace, truncated, uppercase or otherwise malformed value
+    can never match any real evidence; rejecting it here — BEFORE any
+    collector runs — keeps a typo from paying for a packaging build only
+    to fail afterwards.
+    """
+    if not _SHA_RE.fullmatch(require_sha):
+        raise ValueError(
+            "--require-sha must be exactly 40 lowercase hex characters "
+            f"(got {require_sha!r})"
+        )
 
 _PLATFORM_KEYS = {"windows": "windows", "linux": "linux", "darwin": "macos"}
 
@@ -214,7 +234,7 @@ def collect_hosts() -> Dict[str, Any]:
 def run_regression() -> Dict[str, Any]:
     """Run the full test suite in-process; ResourceWarning is an error.
 
-    TIMEBOX: ~2000 tests; this takes minutes.
+    TIMEBOX: the full suite; this takes minutes.
     """
     loader = unittest.TestLoader()
     suite = loader.discover("tests")
@@ -486,13 +506,23 @@ def main(argv=None) -> int:
                         help="exit 1 unless the given safety holds")
     args = parser.parse_args(argv)
 
-    if args.require_sha and not args.evidence:
-        print(
-            "evidence sha validation failed: --require-sha requires "
-            "--evidence (nothing to bind the sha against)",
-            file=sys.stderr,
-        )
-        return 2
+    if args.require_sha is not None:
+        # Validate the sha value itself before any collector runs: a
+        # malformed sha can never match real evidence, so --run-packaging
+        # must not pay for a build that is guaranteed to fail.
+        try:
+            validate_require_sha(args.require_sha)
+        except ValueError as exc:
+            print(f"evidence sha validation failed: {exc}",
+                  file=sys.stderr)
+            return 2
+        if not args.evidence:
+            print(
+                "evidence sha validation failed: --require-sha requires "
+                "--evidence (nothing to bind the sha against)",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         evidence = collect_local_evidence(

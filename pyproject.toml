@@ -5,7 +5,7 @@
 # tests/test_packaging.py guards that contract.
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,6 +14,12 @@ dynamic = ["version"]
 description = "Shared code intelligence, persistent memory and optimized context for AI coding agents."
 readme = "README.md"
 requires-python = ">=3.9"
+authors = [
+    { name = "José Julián Sánchez Rodríguez" },
+]
+# PEP 639 SPDX expression (setuptools >= 77). Per PyPA rules this must not
+# be combined with a deprecated "License ::" classifier.
+license = "MIT"
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
@@ -27,6 +33,11 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jojusa/relinkra"
+Repository = "https://github.com/jojusa/relinkra"
+Issues = "https://github.com/jojusa/relinkra/issues"
 
 # Console entry points. Every target is an existing `main() -> int`;
 # no wrappers, no generated launch logic.

@@ -297,7 +297,7 @@ promoted to readiness**:
 | `tools_visible` | declared and importable in-process |
 | `required_tools_callable` | **unverified** — needs a tool call from a host |
 | `handoff_round_trip_verified` | **unverified** (or *not proven* when the backend is down) |
-| `real_host_launch_proven` | **not proven** — no real host has launched this server |
+| `real_host_launch_proven` | **proven for Devin Desktop** (R4C.1E Cascade launch, local-operational evidence); not proven for other hosts |
 | `context_route_managed` | from the route verdict |
 | `backend_bypass_absent` | from the detections |
 | `metrics_trustworthy` | from the trust verdict |

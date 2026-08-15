@@ -57,7 +57,7 @@ class CBMAdapterError(Exception):
 def strip_project_slug(qualified_name: str, cbm_project_name: str) -> str:
     """Remove the path-derived CBM project slug prefix from a qn.
 
-    ``C-Desarrollos-repo.src.calc.add`` with slug ``C-Desarrollos-repo``
+    ``C-Users-dev-repo.src.calc.add`` with slug ``C-Users-dev-repo``
     becomes ``src.calc.add``. Without a slug the qn is returned
     unchanged.
     """

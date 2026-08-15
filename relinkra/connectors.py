@@ -454,8 +454,8 @@ def claude_project_key(workspace_root) -> str:
 
     Empirically verified against Claude Code 2.1.220: the absolute path
     with forward slashes, an UPPERCASE drive letter on Windows, and no
-    trailing slash (``C:\\Desarrollos\\relinkra`` becomes
-    ``C:/Desarrollos/relinkra``; POSIX paths keep their form). Pure —
+    trailing slash (``C:\\Users\\dev\\relinkra`` becomes
+    ``C:/Users/dev/relinkra``; POSIX paths keep their form). Pure —
     no filesystem access, so the key can be computed for any root.
     """
     text = str(workspace_root).replace("\\", "/")

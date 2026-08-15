@@ -4,7 +4,7 @@ Relinkra assigns every workspace a **portable logical project identity** that
 survives clones, moves, worktrees, branch switches, and OS differences.
 
 **Relinkra does NOT replace CBM identity.** CBM's identity is path-derived
-(e.g. `C-Desarrollos-relinkra-.relinkra-r1a-fixture-a` → one SQLite DB per
+(e.g. `C-Users-dev-relinkra-.relinkra-r1a-fixture-a` → one SQLite DB per
 path). Relinkra layers a portable logical identity *above* it; each workspace
 record carries the CBM path-derived identity **unchanged** alongside the
 logical one.

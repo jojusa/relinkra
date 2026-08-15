@@ -123,5 +123,82 @@ class RequireShaTests(unittest.TestCase):
         self.assertEqual(stdout.strip(), "")
 
 
+class RequireShaFormatTests(unittest.TestCase):
+    """The --require-sha value itself: malformed values exit 2 BEFORE any
+    collector runs (R5D.2 hardening)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.evidence_path = Path(self._tmp.name) / "evidence.json"
+        self.evidence_path.write_text(
+            json.dumps({"meta": {"sha": SHA, "run_id": "31760708465",
+                                 "source": "github-actions"}}),
+            encoding="utf-8",
+        )
+
+    def _run(self, argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            code = release_check.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_rejected(self, sha):
+        code, stdout, stderr = self._run(
+            ["--evidence", str(self.evidence_path), "--require-sha", sha]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("evidence sha validation failed", stderr)
+        self.assertIn("40 lowercase hex", stderr)
+        self.assertEqual(stdout.strip(), "")
+
+    def test_empty_sha_rejected(self):
+        self._assert_rejected("")
+
+    def test_whitespace_sha_rejected(self):
+        self._assert_rejected("   ")
+
+    def test_39_char_sha_rejected(self):
+        self._assert_rejected(SHA[:-1])
+
+    def test_uppercase_sha_rejected(self):
+        self._assert_rejected(SHA.upper())
+
+    def test_valid_sha_accepted(self):
+        code, _, _ = self._run(
+            ["--evidence", str(self.evidence_path), "--require-sha", SHA]
+        )
+        self.assertEqual(code, 0)
+
+    def test_absent_flag_compatibility(self):
+        # Without --require-sha nothing changes: the same evidence merges
+        # with no sha binding at all.
+        code, _, stderr = self._run(
+            ["--evidence", str(self.evidence_path)]
+        )
+        self.assertEqual(code, 0, stderr)
+
+    def test_validation_runs_before_packaging_build(self):
+        # --require-sha bad + --run-packaging must exit 2 without paying
+        # for a build: no collector may run at all.
+        calls = []
+        original = release_check.collect_local_evidence
+        release_check.collect_local_evidence = lambda **kwargs: (
+            calls.append(kwargs) or original(**kwargs)
+        )
+        try:
+            code, _, stderr = self._run(
+                ["--evidence", str(self.evidence_path),
+                 "--require-sha", "not-a-sha", "--run-packaging"]
+            )
+        finally:
+            release_check.collect_local_evidence = original
+        self.assertEqual(code, 2)
+        self.assertIn("evidence sha validation failed", stderr)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

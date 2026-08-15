@@ -138,6 +138,21 @@ class ExplicitCountsTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIs(self._load()["regression"]["passed"], False)
 
+    def test_passed_true_with_zero_tests_rejected(self):
+        # Zero-test false green (R5D.2): a run that executed nothing is
+        # never green, even with an explicit --passed true.
+        code = self._run(tests="0", passed="true")
+        self.assertEqual(code, 2)
+        self.assertFalse(self.out.exists())
+
+    def test_passed_false_with_zero_tests_allowed(self):
+        # An honest empty failure fragment stays valid evidence.
+        code = self._run(tests="0", passed="false")
+        self.assertEqual(code, 0)
+        fragment = self._load()
+        self.assertEqual(fragment["regression"]["tests"], 0)
+        self.assertIs(fragment["regression"]["passed"], False)
+
     def test_zero_tests_never_infers_pass(self):
         # Explicit zeros with tests=0: nothing ran, so nothing is green.
         code = self._run(tests="0")

@@ -117,12 +117,18 @@ explanation.
 
 ### Engram
 
-Engram provides persistent memory and handoffs. It is optional: Relinkra
-works without it and says so honestly — memory read/write and handoffs
-report as unavailable, and commands still exit 0. To enable full memory
-read/write and handoffs, install Engram and make sure the `engram`
-executable is on `PATH`. `ENGRAM_URL` may provide the HTTP read path, but
-it does not replace the CLI write path.
+Engram provides persistent memory and handoffs. It is a third-party
+project maintained by Gentleman Programming under the MIT license —
+external, optional, and **not bundled with Relinkra**. It is installed
+and managed independently of Relinkra; this repository carries no
+authoritative upstream URL for it, so obtain it through Gentleman
+Programming's own channels.
+
+Relinkra works without Engram and says so honestly — memory read/write
+and handoffs report as unavailable, and commands still exit 0. To enable
+full memory read/write and handoffs, install Engram and make sure the
+`engram` executable is on `PATH`. `ENGRAM_URL` may provide the HTTP read
+path, but it does not replace the CLI write path.
 
 ## Upgrade and uninstall
 

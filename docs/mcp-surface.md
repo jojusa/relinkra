@@ -233,8 +233,10 @@ Every flag also reads a `RELINKRA_`-prefixed environment variable
 
 ## Agent connection examples
 
-The same stdio contract serves every host. Windsurf and Devin can use it
-later unchanged — there is no agent-specific logic in the core.
+The same stdio contract serves every host. Devin Desktop (formerly
+Windsurf) already uses it — R4C.1E recorded a real Cascade launch — and
+any other MCP-speaking host can use it unchanged; there is no
+agent-specific logic in the core.
 
 **Claude Code** (`.mcp.json` / `claude mcp add`):
 

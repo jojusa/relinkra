@@ -13,7 +13,8 @@ Two mutually exclusive evidence-input modes (exactly one required):
    ``--passed true|false``. When ``--passed`` is omitted it is derived as
    ``tests > 0 and failures == errors == resource_warnings == 0``.
    ``--passed true`` is rejected when any of failures / errors /
-   resource-warnings is non-zero.
+   resource-warnings is non-zero, and when ``--tests`` is 0 (a run that
+   executed nothing is never green).
 2. ``--run-regression``: runs the full test suite in-process, mirroring
    ``tools/release_check.py::run_regression`` (unittest discovery over
    ``tests/`` with ResourceWarning promoted to error; ResourceWarnings are
@@ -149,7 +150,7 @@ def run_regression_suite() -> Dict[str, Any]:
     Mirrors ``tools/release_check.py::run_regression`` and mirrors the
     captured runner output to stderr so CI logs keep it.
 
-    TIMEBOX: ~2000 tests; this takes minutes.
+    TIMEBOX: the full suite; this takes minutes.
     """
     loader = unittest.TestLoader()
     suite = loader.discover("tests")
@@ -235,6 +236,14 @@ def _resolve_counts(args: argparse.Namespace) -> Tuple[Dict[str, Any], bool]:
             raise UsageError(
                 "--passed true is incompatible with non-zero "
                 "failures/errors/resource-warnings"
+            )
+        if passed and tests == 0:
+            # Zero-test false green: a real regression run always
+            # executes tests; passed=true with tests=0 is anomalous,
+            # never evidence of success.
+            raise UsageError(
+                "--passed true requires --tests >= 1 (a run that "
+                "executed nothing is not green)"
             )
     counts = {
         "passed": passed,

@@ -261,6 +261,30 @@ class ComposeTests(unittest.TestCase):
         self.assertIs(composed["regression"]["passed"], False)
         self.assertIs(composed["ci"]["remote_runs_passed"], False)
 
+    def test_passed_true_with_zero_tests_rejected(self):
+        # Zero-test false green (R5D.2): the composer is the trust
+        # boundary — an anomalous passed=true fragment with no executed
+        # tests fails closed even if an emitter let it through.
+        self._write("linux.json", _fragment("linux"))
+        self._write("macos.json", _fragment("macos"))
+        self._write("windows.json",
+                    _fragment("windows", passed=True, tests=0))
+        code = self._compose()
+        self.assertEqual(code, 2)
+        self.assertFalse(self.out.exists())
+
+    def test_passed_false_with_zero_tests_composes(self):
+        # An honest empty failure fragment stays composable: only the
+        # passed=true + tests=0 combination is anomalous.
+        self._write("linux.json", _fragment("linux"))
+        self._write("macos.json", _fragment("macos"))
+        self._write("windows.json",
+                    _fragment("windows", passed=False, tests=0))
+        self.assertEqual(self._compose(), 0)
+        composed = self._load()
+        self.assertEqual(composed["platforms"]["windows"], "fail")
+        self.assertIs(composed["regression"]["passed"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

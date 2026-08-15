@@ -33,7 +33,7 @@ Relinkra links logical memories (R1C) to code symbols through a portable
 
 - **CBM node identity is NOT Relinkra identity.** CBM `qualified_name`
   embeds the path-derived project slug (e.g.
-  `C-Desarrollos-relinkra-.relinkra-r1a-fixture-a.src.calculator.add`).
+  `home-user-projects-myrepo-.relinkra-r1a-fixture-a.src.calculator.add`).
   Relinkra stores only the project-relative semantic qn
   (`src.calculator.add`); the slug is kept as `cbm_project_name`,
   workspace-local resolution metadata.

@@ -398,9 +398,12 @@ left to right — a later one is never implied by an earlier one.
 | `mcp_process_contract_validated` | The launch contract resolves and the server module imports. |
 | `real_host_launch_proven` | **A real host actually started this server.** |
 
-The last one is `false` everywhere and cannot be set by planning. Producing a
-plan proves a file could be edited; it says nothing about a host starting the
-server afterwards.
+The last one is only `true` where a real launch is on record: Devin
+Desktop carries the R4C.1E Cascade proof (see
+[Devin Desktop](#devin-desktop)). For every other connector it remains
+`false` and cannot be set by planning. Producing a plan proves a file
+could be edited; it says nothing about a host starting the server
+afterwards.
 
 ### Apply and host proof are separate
 
@@ -431,8 +434,9 @@ Windows, Linux and macOS are all first-class.
 **Still requiring CI certification on real machines:** POSIX permission
 assertions and symlink refusal are skipped on Windows and vice versa; the
 `%APPDATA%` and `$XDG_CONFIG_HOME` branches are asserted through injected
-environments rather than on real Linux and macOS hosts; and no host has been
-launched on any platform yet.
+environments rather than on real Linux and macOS hosts. Real host launches
+are recorded only for Devin Desktop (the R4C.1E Cascade proof, local
+Windows); no host launch has been recorded on Linux or macOS.
 
 ---
 

@@ -1,6 +1,10 @@
-# CBM as Relinkra's private backend (R4C.1A)
+# CBM as Relinkra's code-intelligence backend (R4C.1A)
 
-CBM (`codebase-memory-mcp`) is a **private backend** of Relinkra. The only
+CBM (`codebase-memory-mcp`) is a **third-party, external project**
+maintained by DeusData under the MIT license
+(https://github.com/DeusData/codebase-memory-mcp). It is **not bundled
+with Relinkra**: it is acquired, installed, and managed independently.
+Within Relinkra's architecture it acts as a *private backend* — the only
 supported topology is:
 
 ```
@@ -84,8 +88,8 @@ channels and exit codes) are encoded as tests in `tests/test_cbm_backend.py`:
 ## Known contract notes (0.9.0)
 
 - `--name` for `index_repository` does **not** fully override the derived
-  project name — the recorded slug can keep a path-derived prefix (e.g.
-  `C-Desarrollos-relinkra-relinkra`). Relinkra treats the CBM slug as
+  project name - the recorded slug can keep a path-derived prefix (e.g.
+  `home-user-projects-myrepo-myrepo`). Relinkra treats the CBM slug as
   opaque, records it unchanged, and strips it from semantic identity in
   the adapter. Discover the real slug from the `index_repository` response
   or `list_projects`; never re-derive it.
