@@ -10,6 +10,7 @@ PART B.
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,7 @@ BIN = "C:/fake/codebase-memory-mcp.exe"
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
 PROJECT = "C-proj"
+TRUSTED_SHA = "ab" * 32
 
 
 class TempCase(unittest.TestCase):
@@ -213,16 +215,21 @@ class TestRunIndex(TempCase):
             root=tmp,
             cache_dir=os.path.join(tmp, ".codebase-memory", "cache"),
             mode="fast",
+            expected_sha256=TRUSTED_SHA,
         )
         defaults.update(kwargs)
-        return cbm_indexing.run_index(**defaults)
+        with mock.patch.object(cbm_indexing, "_verify_binary_sha256"):
+            return cbm_indexing.run_index(**defaults)
 
     def test_success_parses_json_after_log_lines(self):
         tmp = self.make_temp_dir()
         cache = os.path.join(tmp, ".codebase-memory", "cache")
         with mock.patch("relinkra.cbm_indexing.subprocess.run") as run:
             run.return_value = _completed(stdout=self.SUCCESS_STDOUT)
-            result = cbm_indexing.run_index(BIN, tmp, cache)
+            with mock.patch.object(cbm_indexing, "_verify_binary_sha256"):
+                result = cbm_indexing.run_index(
+                    BIN, tmp, cache, expected_sha256=TRUSTED_SHA
+                )
         self.assertEqual(
             result,
             {
@@ -329,6 +336,50 @@ class TestRunIndex(TempCase):
             run.side_effect = FileNotFoundError("nope")
             with self.assertRaises(IndexSetupError):
                 self._run()
+
+    def test_trusted_binary_unchanged_allows_execution(self):
+        tmp = self.make_temp_dir()
+        binary = Path(tmp) / "cbm.exe"
+        binary.write_bytes(b"trusted")
+        expected = hashlib.sha256(b"trusted").hexdigest()
+        with mock.patch.object(
+            cbm_indexing,
+            "subprocess",
+        ) as subprocess_module:
+            subprocess_module.run.return_value = _completed(
+                stdout=self.SUCCESS_STDOUT
+            )
+            result = cbm_indexing.run_index(
+                str(binary),
+                tmp,
+                os.path.join(tmp, ".codebase-memory", "cache"),
+                expected_sha256=expected,
+            )
+        self.assertEqual(result["raw_status"], "indexed")
+        subprocess_module.run.assert_called_once()
+
+    def test_binary_swap_before_index_execution_refuses_without_process(self):
+        tmp = self.make_temp_dir()
+        binary = Path(tmp) / "cbm.exe"
+        binary.write_bytes(b"trusted")
+        expected = hashlib.sha256(b"trusted").hexdigest()
+        real_verify = cbm_indexing._verify_binary_sha256
+
+        def swap_then_verify(path, digest):
+            Path(path).write_bytes(b"replaced")
+            return real_verify(path, digest)
+
+        with mock.patch.object(
+            cbm_indexing, "_verify_binary_sha256", side_effect=swap_then_verify
+        ), mock.patch.object(cbm_indexing.subprocess, "run") as run:
+            with self.assertRaisesRegex(IndexSetupError, "hash changed"):
+                cbm_indexing.run_index(
+                    str(binary),
+                    tmp,
+                    os.path.join(tmp, ".codebase-memory", "cache"),
+                    expected_sha256=expected,
+                )
+        run.assert_not_called()
 
 
 class TestRegisterMapping(TempCase):
@@ -681,6 +732,69 @@ class TestRefreshWithQuirkRecovery(TempCase):
                 self.assertNotIsInstance(ctx.exception, StaleAfterRefreshError)
                 self.assertEqual(run_mock.call_count, 1)
                 self.assertEqual(set(os.listdir(cache)), {"sentinel.txt", "keep.db"})
+
+    def test_binary_swap_before_recovery_reindex_refuses_second_execution(self):
+        tmp, cache = self._cache_with(f"{PROJECT}.db")
+        binary = Path(tmp) / "cbm.exe"
+        binary.write_bytes(b"trusted")
+        expected = hashlib.sha256(b"trusted").hexdigest()
+        fake = FakeAdapter(heads=[OLD_HEAD, HEAD])
+        real_verify = cbm_indexing._verify_binary_sha256
+        verify_calls = 0
+
+        def verify_then_swap(path, digest):
+            nonlocal verify_calls
+            verify_calls += 1
+            if verify_calls == 2:
+                Path(path).write_bytes(b"replaced")
+            return real_verify(path, digest)
+
+        stdout = TestRunIndex.SUCCESS_STDOUT
+        with mock.patch.object(
+            cbm_indexing, "CBMCLIAdapter", _adapter_factory(fake)
+        ), mock.patch.object(
+            cbm_indexing, "git_head_sha", lambda root: HEAD
+        ), mock.patch.object(
+            cbm_indexing, "_verify_binary_sha256", side_effect=verify_then_swap
+        ), mock.patch.object(
+            cbm_indexing.subprocess,
+            "run",
+            return_value=_completed(stdout=stdout),
+        ) as run:
+            with self.assertRaisesRegex(IndexSetupError, "hash changed"):
+                cbm_indexing.refresh_with_quirk_recovery(
+                    str(binary),
+                    tmp,
+                    cache,
+                    PROJECT,
+                    expected_sha256=expected,
+                )
+        self.assertEqual(verify_calls, 2)
+        self.assertEqual(run.call_count, 1)
+
+    def test_binary_swap_before_initial_refresh_execution_refuses(self):
+        tmp, cache = self._cache_with(f"{PROJECT}.db")
+        binary = Path(tmp) / "cbm.exe"
+        binary.write_bytes(b"trusted")
+        expected = hashlib.sha256(b"trusted").hexdigest()
+        real_verify = cbm_indexing._verify_binary_sha256
+
+        def swap_then_verify(path, digest):
+            Path(path).write_bytes(b"replaced")
+            return real_verify(path, digest)
+
+        with mock.patch.object(
+            cbm_indexing, "_verify_binary_sha256", side_effect=swap_then_verify
+        ), mock.patch.object(cbm_indexing.subprocess, "run") as run:
+            with self.assertRaisesRegex(IndexSetupError, "hash changed"):
+                cbm_indexing.refresh_with_quirk_recovery(
+                    str(binary),
+                    tmp,
+                    cache,
+                    PROJECT,
+                    expected_sha256=expected,
+                )
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

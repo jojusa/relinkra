@@ -26,7 +26,9 @@ working with a repository:
 
 1. `relinkra cbm status` — shows `Index: MISSING`, `READY`, or `STALE`
    (plus the honest backend states `UNAVAILABLE`/`UNSUPPORTED`/
-   `UNKNOWN`). Every honest state exits 0.
+   `UNKNOWN`). If the executable is present but fails the certified
+   checksum, status reports it as unavailable rather than usable. Every
+   honest state exits 0.
 2. `MISSING` → `relinkra cbm index` — builds the index into the
    workspace-managed `.codebase-memory/cache/` and registers the
    workspace-to-CBM mapping in the Relinkra registry (idempotent;
@@ -155,6 +157,9 @@ channels and exit codes) are encoded as tests in `tests/test_cbm_backend.py`:
   reported "index/graph state unknown — backend not reachable", never
   "index missing" (re-indexing is only prescribed when a WORKING backend
   confirms absence). Doctor probes use a 10s timeout per stage.
+- If `cbm status` reports an unavailable or untrusted executable, re-acquire
+  the certified `0.9.0` release and verify its published checksum. Relinkra
+  does not run an executable that fails that check.
 - Certification requires the exact stable `0.9.0` string; prerelease and
   build variants such as `0.9.0-rc1` and `0.9.0+dirty` are not certified.
 - Registry/service `cache_dir` values must resolve inside the workspace's

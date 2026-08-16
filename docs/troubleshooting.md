@@ -84,6 +84,18 @@ file(s)`, the drift is your uncommitted edits: CBM's change detection
 reads the git worktree, so commit (or stash) first and refresh again —
 no reindex can clear it. Details: [CBM backend](cbm-backend.md).
 
+## CBM executable is unavailable or untrusted
+
+**Symptom:** `relinkra cbm status` reports CBM as unavailable or refuses to
+run an unverified executable.
+
+**Cause:** the resolved CBM executable is missing, unsupported on this
+platform, or does not match the certified `0.9.0` release.
+
+**Fix:** re-acquire the certified release, verify its published checksum, and
+place it in the documented managed location. CBM is optional; the rest of
+Relinkra continues to work without it. Details: [CBM backend](cbm-backend.md).
+
 ## Engram missing
 
 **Symptom:** `doctor` or `status` show Engram as unavailable; memory

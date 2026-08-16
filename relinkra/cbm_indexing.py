@@ -31,6 +31,7 @@ from .cbm_adapter import (
     CBMAdapterError,
     CBMCLIAdapter,
     CBMProjectNotIndexedError,
+    _verify_binary_sha256,
     parse_cli_json,
 )
 from .cbm_support import (
@@ -256,6 +257,7 @@ def run_index(
     cache_dir: str,
     mode: str = "fast",
     timeout: float = DEFAULT_INDEX_TIMEOUT,
+    expected_sha256: Optional[str] = None,
 ) -> Dict:
     """Run one full ``cli index_repository`` pass (flags syntax only).
 
@@ -274,6 +276,14 @@ def run_index(
     non-int values. CBM is invoked ONLY with ``--flag value`` pairs —
     a raw-JSON positional crashes the CBM 0.9.0 worker.
     """
+    if not expected_sha256:
+        raise IndexSetupError(
+            "cbm executable provenance is required before indexing"
+        )
+    try:
+        _verify_binary_sha256(str(binary), str(expected_sha256).lower())
+    except CBMAdapterError as exc:
+        raise IndexSetupError(str(exc)) from exc
     argv = [
         str(binary),
         "cli",
@@ -639,14 +649,26 @@ def refresh_with_quirk_recovery(
     5. still stale → ``StaleAfterRefreshError``. Never more than one
        recovery attempt.
     """
-    result = run_index(binary, root, cache_dir, mode=mode)
+    result = run_index(
+        binary,
+        root,
+        cache_dir,
+        mode=mode,
+        expected_sha256=expected_sha256,
+    )
     if _refresh_head_matches(
         binary, root, cache_dir, project_name, expected_sha256
     ):
         return {"quirk_recovery_used": False, "result": result}
     targets = _quirk_delete_targets(cache_dir, project_name)
     _delete_quirk_targets(targets)
-    result = run_index(binary, root, cache_dir, mode=mode)
+    result = run_index(
+        binary,
+        root,
+        cache_dir,
+        mode=mode,
+        expected_sha256=expected_sha256,
+    )
     if not _refresh_head_matches(
         binary, root, cache_dir, project_name, expected_sha256
     ):

@@ -1660,12 +1660,20 @@ def _cbm_record_for_root(
 
 
 def _cbm_availability(root: str) -> Tuple[str, Optional[str]]:
-    """``(AVAILABLE|UNAVAILABLE|UNSUPPORTED, binary)`` for line one."""
+    """``(AVAILABLE|UNTRUSTED|UNAVAILABLE|UNSUPPORTED, binary)`` for line one."""
     binary = cbm_support.resolve_cbm_binary(root)
     if not binary:
         return cbm_indexing.UNAVAILABLE, None
     if cbm_support.platform_tag() not in cbm_support.CERTIFIED_CBM_BINARIES:
         return cbm_indexing.UNSUPPORTED, binary
+    expected = cbm_support.CERTIFIED_CBM_BINARIES.get(cbm_support.platform_tag())
+    actual = cbm_support._sha256_file(binary)
+    if (
+        not expected
+        or not actual
+        or actual.lower() != str(expected.get("sha256") or "").lower()
+    ):
+        return cbm_indexing.UNTRUSTED, binary
     return "AVAILABLE", binary
 
 
@@ -1681,6 +1689,12 @@ def _cbm_freshness_snapshot(
     that exists but cannot be verified.
     """
     availability, binary = _cbm_availability(root)
+    if availability == cbm_indexing.UNTRUSTED:
+        return availability, binary, {
+            "state": cbm_indexing.UNTRUSTED,
+            "committed_drift": None,
+            "worktree_drift": None,
+        }
     if record is None and availability == "AVAILABLE":
         return availability, binary, {
             "state": cbm_indexing.MISSING,
@@ -1714,6 +1728,13 @@ def _cbm_action_gate(root: str) -> Tuple[Optional[str], Optional[dict], Optional
             f"platform {cbm_support.platform_tag()}"
         )
         print(_CBM_OPTIONAL_BACKEND_LINE)
+        return None, None, None
+    if availability == cbm_indexing.UNTRUSTED:
+        _fail(
+            "refusing to execute an unverified binary",
+            "Re-acquire the certified release with checksum verification "
+            "(see docs/cbm-backend.md).",
+        )
         return None, None, None
     expected = cbm_support.CERTIFIED_CBM_BINARIES.get(cbm_support.platform_tag())
     sha256 = cbm_support._sha256_file(binary)
@@ -1853,7 +1874,13 @@ def cmd_cbm_index(args) -> int:
         return EXIT_ERROR
     gitignore_warning = not cbm_indexing.gitignore_check(root).get("ignored")
     try:
-        result = cbm_indexing.run_index(binary, root, str(cache_dir), mode=args.mode)
+        result = cbm_indexing.run_index(
+            binary,
+            root,
+            str(cache_dir),
+            mode=args.mode,
+            expected_sha256=sha256,
+        )
     except cbm_indexing.IndexSetupError as exc:
         _fail(
             f"CBM index failed: {sanitize_wire_text(str(exc))}",

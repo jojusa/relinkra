@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,26 @@ class CbmStatusTests(CBMCLITestCase):
         self.assertIsNone(payload["freshness"]["committed_drift"])
         self.assertIsNone(payload["freshness"]["worktree_drift"])
         self.assertEqual(payload["next_action"], "relinkra cbm index")
+
+    def test_untrusted_candidate_without_record_is_not_available(self):
+        freshness = mock.Mock()
+        with contextlib.ExitStack() as stack:
+            for patch in self.happy_gate_patches(sha=BAD_SHA):
+                stack.enter_context(patch)
+            stack.enter_context(
+                mock.patch.object(cbm_indexing, "freshness_state", freshness)
+            )
+            code, out, err = self.run_cli("cbm", "status")
+            self.assertEqual(code, EXIT_OK, err)
+            self.assertIn("CBM: UNAVAILABLE", out)
+            self.assertNotIn("CBM: AVAILABLE", out)
+            self.assertIn("unverified binary", out)
+            freshness.assert_not_called()
+            code, out, err = self.run_cli("cbm", "status", "--json")
+            self.assertEqual(code, EXIT_OK, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "UNAVAILABLE")
+        self.assertEqual(payload["cbm"], "untrusted")
 
     def test_ready_omits_next_line(self):
         with contextlib.ExitStack() as stack:
@@ -274,6 +295,42 @@ class CbmStatusTests(CBMCLITestCase):
 
 
 class CbmIndexTests(CBMCLITestCase):
+    def test_trusted_candidate_swapped_after_resolution_refuses_index_execution(self):
+        tmp_binary = Path(self.repo) / "cbm-test.exe"
+        tmp_binary.write_bytes(b"trusted-at-resolution")
+        real_verify = cbm_indexing._verify_binary_sha256
+
+        def swap_then_verify(path, digest):
+            Path(path).write_bytes(b"replaced-before-exec")
+            return real_verify(path, digest)
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.happy_gate_patches(binary=str(tmp_binary)):
+                stack.enter_context(patch)
+            stack.enter_context(
+                mock.patch.object(
+                    cbm_indexing,
+                    "_verify_binary_sha256",
+                    side_effect=swap_then_verify,
+                )
+            )
+            process = stack.enter_context(
+                mock.patch.object(
+                    cbm_indexing.subprocess, "run", wraps=subprocess.run
+                )
+            )
+            code, out, err = self.run_cli("cbm", "index")
+        self.assertEqual(code, EXIT_ERROR, f"out={out!r} err={err!r}")
+        self.assertIn("hash changed", err)
+        self.assertFalse(
+            any(
+                call.args
+                and call.args[0]
+                and str(call.args[0][0]) == str(tmp_binary)
+                for call in process.call_args_list
+            )
+        )
+
     def test_no_binary_exits_one_with_docs_pointer(self):
         run_index = mock.Mock()
         with mock.patch.object(
@@ -356,6 +413,7 @@ class CbmIndexTests(CBMCLITestCase):
             },
         )
         self.assertTrue(payload["project_id"].startswith("rlk_"))
+        self.assertEqual(run_index.call_args.kwargs["expected_sha256"], CERTIFIED_SHA)
         self.assertEqual(
             register.call_args.args,
             (

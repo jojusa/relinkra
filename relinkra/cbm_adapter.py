@@ -78,6 +78,25 @@ _PROJECT_NOT_INDEXED_RE = re.compile(
 )
 
 
+def _verify_binary_sha256(cbm_bin: str, expected_sha256: Optional[str]) -> None:
+    """Re-check a trust-gated executable immediately before running it."""
+    if not expected_sha256:
+        return
+    digest = hashlib.sha256()
+    try:
+        with open(cbm_bin, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise CBMAdapterError(
+            "cbm executable changed or disappeared since trust verification"
+        ) from exc
+    if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+        raise CBMAdapterError(
+            "cbm executable hash changed since trust verification; refusing to execute"
+        )
+
+
 def strip_project_slug(qualified_name: str, cbm_project_name: str) -> str:
     """Remove the path-derived CBM project slug prefix from a qn.
 
@@ -242,21 +261,7 @@ class CBMCLIAdapter:
 
     def _verify_binary(self) -> None:
         """Re-check a trust-gated production binary immediately before exec."""
-        if not self.expected_sha256:
-            return
-        digest = hashlib.sha256()
-        try:
-            with open(self.cbm_bin, "rb") as handle:
-                for chunk in iter(lambda: handle.read(65536), b""):
-                    digest.update(chunk)
-        except OSError as exc:
-            raise CBMAdapterError(
-                "cbm executable changed or disappeared since trust verification"
-            ) from exc
-        if not hmac.compare_digest(digest.hexdigest(), self.expected_sha256):
-            raise CBMAdapterError(
-                "cbm executable hash changed since trust verification; refusing to execute"
-            )
+        _verify_binary_sha256(self.cbm_bin, self.expected_sha256)
 
     @staticmethod
     def _output_size(value) -> int:
