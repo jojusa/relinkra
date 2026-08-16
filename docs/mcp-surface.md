@@ -55,7 +55,7 @@ Implemented methods:
 | `initialize` | Negotiates the protocol version and reports `serverInfo` (incl. `contractVersion`) |
 | `notifications/initialized` | Accepted, no response (JSON-RPC notification) |
 | `ping` | Liveness, returns `{}` |
-| `tools/list` | The nine tools with their JSON Schemas |
+| `tools/list` | The eleven tools with their JSON Schemas |
 | `tools/call` | Dispatch to one application service |
 
 Protocol versions supported: `2024-11-05`, `2025-03-26`, `2025-06-18`.
@@ -98,6 +98,8 @@ wire name survives host namespacing within the 64-character limit.
 | `relinkra_memory_search` | `relinkra.memory.search` | Search shared project memory |
 | `relinkra_memory_save` | `relinkra.memory.save` | Save a memory under R1C policy |
 | `relinkra_code_resolve` | `relinkra.code.resolve` | Resolve file/symbol → portable code reference |
+| `relinkra_code_architecture` | `relinkra.code.architecture` | Return compact advisory architecture orientation |
+| `relinkra_code_relationships` | `relinkra.code.relationships` | Return bounded advisory caller/dependency relationships |
 | `relinkra_git_context` | `relinkra.git.context` | Read-only git facts |
 | `relinkra_handoff_create` | `relinkra.handoff.create` | Record a cross-agent handoff |
 | `relinkra_handoff_get` | `relinkra.handoff.get` | Fetch one handoff, or list recent ones |

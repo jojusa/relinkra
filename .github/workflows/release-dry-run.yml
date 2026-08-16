@@ -65,9 +65,10 @@ jobs:
       - name: Append the RC gate summary
         shell: bash
         run: |
+          set -euo pipefail
           {
             echo "## RC dry-run gate summary (${{ matrix.os }})"
             echo '```text'
-            python tools/release_check.py
+            python -m json.tool rc-report.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

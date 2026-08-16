@@ -3,9 +3,38 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.1.0rc2 — release candidate
+
+This release candidate improves the path from an agent request to compact,
+project-aware evidence. It is not the final 0.1.0 release and has not been
+published to PyPI.
+
+### Changed
+
+- Corrected CBM freshness derivation from the stored graph head and real
+  source changes.
+- Added the user-facing `cbm status`, `cbm index`, and `cbm refresh` lifecycle
+  with trusted automatic registration.
+- Hardened CBM provenance checks before every executable invocation,
+  including refresh and bounded recovery paths.
+- Added compact architecture orientation and bounded caller/dependency
+  traversal for structural evidence.
+- Added bounded CBM architecture and relationship evidence to ContextPackets,
+  preserving freshness, coverage, relevance, and budget metadata.
+- Hardened cross-platform path-equivalence tests for Windows 8.3 aliases and
+  macOS `/private` path aliases.
+
+### Validation and limitations
+
+- CBM remains optional and is certified with the real binary on Windows;
+  Linux/macOS behavior degrades honestly when the backend is unavailable or
+  not certified.
+- Agents retain native file search, inspection, editing, testing, and
+  validation tools; CBM evidence is advisory and may be incomplete.
+
 ## 0.1.0 — upcoming
 
-**Current release candidate: `0.1.0rc1`.** The notes below describe the
+**Current release candidate: `0.1.0rc2`.** The notes below describe the
 upcoming 0.1.0 release; the candidate ships the same content for
 pre-release verification.
 

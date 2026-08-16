@@ -54,7 +54,7 @@ pass explicit paths:
 
 ```powershell
 # PowerShell
-python tools/artifact_checks.py dist/relinkra-0.1.0rc1-py3-none-any.whl dist/relinkra-0.1.0rc1.tar.gz
+python tools/artifact_checks.py dist/relinkra-0.1.0rc2-py3-none-any.whl dist/relinkra-0.1.0rc2.tar.gz
 ```
 
 ```bash

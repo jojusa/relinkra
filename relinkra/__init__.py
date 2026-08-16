@@ -20,7 +20,7 @@ from .identity import (
 from .registry import Registry, RegistryError
 from .cbm import CBMBinaryInfo, CBMProjectIdentity, cbm_db_path, workspace_cbm_record
 
-__version__ = "0.1.0rc1"
+__version__ = "0.1.0rc2"
 
 __all__ = [
     "AmbiguousIdentityError",

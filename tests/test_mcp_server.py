@@ -13,6 +13,7 @@ import json
 import os
 import re
 import unittest
+from pathlib import Path
 
 from relinkra.app_service import (
     CONTRACT_VERSION,
@@ -264,6 +265,19 @@ class SchemaTests(MCPTestCase):
                 "relinkra_health",
             },
         )
+
+    def test_mcp_surface_docs_match_wire_tools(self):
+        docs = (
+            Path(__file__).resolve().parents[1] / "docs" / "mcp-surface.md"
+        ).read_text(encoding="utf-8")
+        documented = set(
+            re.findall(
+                r"^\| `([^`]+)` \| `relinkra\.[^`]+` \|",
+                docs,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(documented, {tool["name"] for tool in TOOLS})
 
     def test_tool_names_survive_host_namespacing(self):
         """A dotted name would break the host's tool-name pattern."""

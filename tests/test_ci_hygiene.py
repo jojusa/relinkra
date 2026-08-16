@@ -474,6 +474,15 @@ class WorkflowContractAudit(unittest.TestCase):
         for token in ("pypi", "twine", "publish"):
             self.assertNotIn(token, lowered, f"release-dry-run.yml mentions {token}")
 
+    def test_dry_run_summary_uses_computed_report(self):
+        dry_run = self.texts["release-dry-run.yml"]
+        summary = dry_run.split(
+            "- name: Append the RC gate summary", 1
+        )[1]
+        self.assertIn("rc-report.json", summary)
+        self.assertIn("python -m json.tool rc-report.json", summary)
+        self.assertNotIn("python tools/release_check.py", summary)
+
 
 # ---------------------------------------------------------------------------
 # (f) Run-scoped remote evidence contract (R5C)
