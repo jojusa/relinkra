@@ -78,7 +78,7 @@ Healthy means: no FAIL entries in `doctor` (WARN entries are typically optional 
 
 Both are third-party projects, installed and managed independently. Neither is bundled with Relinkra, and neither is required for the quick start.
 
-- **Codebase Memory (CBM)** — code intelligence backend maintained by [DeusData](https://github.com/DeusData/codebase-memory-mcp) (MIT license). Certified with the real binary on Windows; on Linux/macOS it is NOT certified, and Relinkra keeps working without it. See [CBM backend](docs/cbm-backend.md).
+- **Codebase Memory (CBM)** — code intelligence backend maintained by [DeusData](https://github.com/DeusData/codebase-memory-mcp) (MIT license). Certified with the real binary on Windows; on Linux/macOS it is NOT certified, and Relinkra keeps working without it. Manage its index with `relinkra cbm status/index/refresh` — see [CBM backend](docs/cbm-backend.md).
 - **Engram** — persistent memory backend maintained by Gentleman Programming (MIT license). External and optional; without it, memory and handoffs report as unavailable and commands still exit successfully.
 
 ## Current state

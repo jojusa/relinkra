@@ -19,6 +19,32 @@ installer mode that writes agent configuration, hooks, or global instruction
 files is ever used. Gentleman/Gentle AI and its Engram integration are out
 of scope and stay untouched.
 
+## User workflow
+
+Once the certified binary is in place, the index is a normal part of
+working with a repository:
+
+1. `relinkra cbm status` — shows `Index: MISSING`, `READY`, or `STALE`
+   (plus the honest backend states `UNAVAILABLE`/`UNSUPPORTED`/
+   `UNKNOWN`). Every honest state exits 0.
+2. `MISSING` → `relinkra cbm index` — builds the index into the
+   workspace-managed `.codebase-memory/cache/` and registers the
+   workspace-to-CBM mapping in the Relinkra registry (idempotent;
+   re-running is always safe).
+3. `STALE` → `relinkra cbm refresh` — full reindex with automatic
+   recovery from the CBM 0.9.0 modify-only quirk (deleting exactly the
+   project `.db` and its `-wal`/`-shm` companions, nothing else). When
+   the drift is uncommitted worktree changes, refresh reports the
+   honest `STALE` state back: commit first, then refresh.
+
+`.codebase-memory/` (binary, cache, index databases) is derived,
+rebuildable local data — normally git-ignored. If it is not, `cbm
+index` prints a one-line `WARN` suggesting the ignore entry (it never
+edits `.gitignore` itself).
+
+The manual acquisition and `relinkra register` flow below remains the
+advanced path for pre-existing setups.
+
 ## Certified release
 
 | Axis | Value |

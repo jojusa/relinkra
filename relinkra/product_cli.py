@@ -17,11 +17,17 @@ Exit codes are a deterministic contract, uniform across commands:
 
     0  the command ran and the outcome is good
        (status/init: degraded components still exit 0 — degraded is a
-       state to report, not a command failure)
+       state to report, not a command failure; cbm status: every honest
+       optional state — READY/MISSING/STALE/UNAVAILABLE/UNSUPPORTED/
+       UNKNOWN — exits 0)
     1  the command itself failed (not a git repo, unreadable registry,
-       invalid arguments)
+       invalid arguments) or the requested cbm action failed
+       (unavailable/unsupported/unverified backend, index or refresh
+       error, mapping failure)
     2  the command ran, but the outcome needs a human decision
-       (init: ambiguous identity; doctor: at least one FAIL)
+       (init: ambiguous identity; doctor: at least one FAIL; cbm: the
+       workspace itself is unusable — not a git repository, no usable
+       identity, or an unreadable registry)
 """
 
 from __future__ import annotations
@@ -36,9 +42,9 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, backend_policy, cbm_support
+from . import __version__, backend_policy, cbm_indexing, cbm_support
 from .app_service import (
     CONTRACT_VERSION,
     RelinkraServices,
@@ -47,12 +53,14 @@ from .app_service import (
     sanitize_wire_text,
 )
 from .backend_detection import assess_workspace
+from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
 from .connectors import resolve_launch
 from .handoff import contains_absolute_path
 from .host_discovery import DiscoveryEnvironment
 from .identity import (
     AmbiguousIdentityError,
     GitError,
+    canonicalize_path,
     discover_repository_identity,
     git_branch,
     git_head_sha,
@@ -489,6 +497,74 @@ def _enable_trusted_cbm_service(services: RelinkraServices) -> None:
         timeout=adapter.timeout,
         expected_sha256=expected["sha256"],
     )
+
+
+def _cbm_index_freshness_checks(
+    root: Path, config: Optional[WorkspaceConfig], trust_checks: List[Check]
+) -> List[Check]:
+    """One doctor line mapping managed-index freshness to the next action.
+
+    Rendered only when the registry holds a CBM record for this
+    workspace, and only after the trust ladder proved binary
+    provenance: the freshness probes execute the binary, so they follow
+    the same provenance-before-execution rule as every other CBM call.
+    """
+    try:
+        record = _cbm_record_for_root(root, config)
+    except (RegistryError, OSError, ValueError):
+        # check_registry already reports a broken registry honestly.
+        return []
+    if record is None:
+        return []
+    by_name = {check.name: check for check in trust_checks}
+    provenance = by_name.get("CBM provenance")
+    if provenance is None or provenance.status != PASS:
+        return []
+    try:
+        freshness = cbm_indexing.freshness_state(
+            cbm_support.resolve_cbm_binary(str(root)),
+            str(root),
+            record,
+            timeout=cbm_support.DOCTOR_PROBE_TIMEOUT,
+        )
+    except Exception as exc:  # diagnostics must never crash on a probe
+        return [
+            Check(
+                "CBM index freshness",
+                WARN,
+                f"could not be classified: {sanitize_wire_text(str(exc))}",
+                "Run 'relinkra cbm status' for detail.",
+            )
+        ]
+    state = _cbm_display_state(freshness["state"])
+    if state == "READY":
+        return [Check("CBM index freshness", PASS, "managed index is fresh")]
+    if state == cbm_indexing.MISSING:
+        return [
+            Check(
+                "CBM index freshness",
+                WARN,
+                "managed index is missing",
+                "Run 'relinkra cbm index'.",
+            )
+        ]
+    if state == "STALE":
+        return [
+            Check(
+                "CBM index freshness",
+                WARN,
+                "managed index is stale (graph drift)",
+                "Run 'relinkra cbm refresh'.",
+            )
+        ]
+    return [
+        Check(
+            "CBM index freshness",
+            WARN,
+            "managed index freshness is unknown",
+            "See docs/cbm-backend.md.",
+        )
+    ]
 
 
 def check_mcp(services: Optional[RelinkraServices], health: Optional[dict]) -> Check:
@@ -1316,6 +1392,11 @@ def cmd_doctor(args) -> int:
                     )
                 )
             checks.extend(trust_checks)
+            checks.extend(
+                _cbm_index_freshness_checks(
+                    resolved.root, resolved.config, trust_checks
+                )
+            )
 
             health = resolved.health or {}
             cbm_adapter = getattr(resolved.services, "cbm_adapter", None)
@@ -1497,6 +1578,499 @@ def cmd_project(args) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# CBM index lifecycle (R5E.2B): status / index / refresh
+# ---------------------------------------------------------------------------
+
+#: Third line shown instead of a Next action when the optional backend
+#: is honestly absent — the message that keeps an optional component
+#: from reading like a broken one.
+_CBM_OPTIONAL_BACKEND_LINE = (
+    "Optional backend unavailable; native agent tools remain available."
+)
+
+#: Pointer to the acquisition procedure for the two action commands.
+_CBM_ACQUISITION_POINTER = (
+    "See docs/cbm-backend.md (Acquisition) for installing the certified "
+    "binary into the workspace-managed .codebase-memory/bin/ location."
+)
+
+#: Display-space Next action per state. READY and the degenerate
+#: UNAVAILABLE/UNSUPPORTED states intentionally map to None (READY has
+#: nothing to do next; the unavailable/unsupported states print the
+#: optional-backend line instead of a Next).
+_CBM_NEXT_ACTION = {
+    "MISSING": "relinkra cbm index",
+    "STALE": "relinkra cbm refresh",
+    # UNKNOWN with an existing record is usually a partial/kill-damaged
+    # cache: refresh owns the verified heal path (db delete + reindex).
+    "UNKNOWN": "relinkra cbm refresh",
+}
+
+#: Next action when the only drift is uncommitted worktree changes.
+#: Real CBM 0.9.0 change detection reads the git worktree itself
+#: (proven by the R5E.2B real-binary cycle: even a full cache wipe and
+#: reindex leaves a modified file flagged), so no reindex can clear
+#: that drift — only committing can.
+_CBM_COMMIT_THEN_REFRESH = "commit your changes, then run 'relinkra cbm refresh'"
+
+
+def _cbm_display_state(state: str) -> str:
+    """Collapse the graded freshness states into the three user-facing
+    words. The drift detail stays available in --json."""
+    if state in (
+        cbm_indexing.STALE_COMMITTED,
+        cbm_indexing.STALE_WORKTREE,
+        cbm_indexing.STALE_BOTH,
+    ):
+        return "STALE"
+    return state
+
+
+def _cbm_next_action(display: str, freshness: dict) -> Optional[str]:
+    """The honest Next for a display state (None when there is none)."""
+    if display == "STALE" and freshness.get("committed_drift") is not True:
+        return _CBM_COMMIT_THEN_REFRESH
+    return _CBM_NEXT_ACTION.get(display)
+
+
+def _cbm_record_for_root(
+    root: Path, config: Optional[WorkspaceConfig]
+) -> Optional[dict]:
+    """The CBM record for this workspace, by pinned id or canonical path.
+
+    ``relinkra cbm index`` registers the workspace even before
+    ``relinkra init`` pins ids in a config, so when the config lookup
+    has nothing the registry is scanned for the workspace whose
+    canonical path is this root. A registry that cannot be READ
+    propagates ``RegistryError``/``OSError`` — callers that promised
+    honest errors for a broken registry must be able to tell it apart
+    from the honest "no record yet" None.
+    """
+    record = _workspace_cbm_record(root, config)
+    if record is not None:
+        return record
+    registry = Registry(str(registry_path(root)))
+    canonical = canonicalize_path(str(root))
+    for workspace in registry.workspaces.values():
+        if workspace.canonical_path == canonical and workspace.cbm:
+            candidate = workspace.cbm
+            return candidate if isinstance(candidate, dict) else None
+    return None
+
+
+def _cbm_availability(root: str) -> Tuple[str, Optional[str]]:
+    """``(AVAILABLE|UNAVAILABLE|UNSUPPORTED, binary)`` for line one."""
+    binary = cbm_support.resolve_cbm_binary(root)
+    if not binary:
+        return cbm_indexing.UNAVAILABLE, None
+    if cbm_support.platform_tag() not in cbm_support.CERTIFIED_CBM_BINARIES:
+        return cbm_indexing.UNSUPPORTED, binary
+    return "AVAILABLE", binary
+
+
+def _cbm_freshness_snapshot(
+    root: str, record: Optional[dict]
+) -> Tuple[str, Optional[str], dict]:
+    """``(availability, binary, freshness result)`` with the CLI's
+    honest absent-record mapping.
+
+    No registry record means Relinkra never indexed this workspace, so
+    with a usable backend the managed index simply does not exist yet:
+    that is MISSING, not UNKNOWN. UNKNOWN stays reserved for a record
+    that exists but cannot be verified.
+    """
+    availability, binary = _cbm_availability(root)
+    if record is None and availability == "AVAILABLE":
+        return availability, binary, {
+            "state": cbm_indexing.MISSING,
+            "committed_drift": None,
+            "worktree_drift": None,
+        }
+    return (
+        availability,
+        binary,
+        cbm_indexing.freshness_state(binary, root, record),
+    )
+
+
+def _cbm_action_gate(root: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
+    """Shared binary/trust gate for ``cbm index`` and ``cbm refresh``.
+
+    Mirrors the provenance stage of ``cbm_support.evaluate_cbm_trust``:
+    the platform tag must have certified provenance and the actual
+    binary must hash to it BEFORE anything is executed. Returns
+    ``(binary, certified_entry, sha256)`` on success; on refusal the
+    honest message has already been printed and the binary is None.
+    """
+    availability, binary = _cbm_availability(root)
+    if availability == cbm_indexing.UNAVAILABLE:
+        print(f"CBM: {availability}")
+        print(_CBM_ACQUISITION_POINTER)
+        return None, None, None
+    if availability == cbm_indexing.UNSUPPORTED:
+        print(
+            f"CBM: {availability} — no certified binary provenance for "
+            f"platform {cbm_support.platform_tag()}"
+        )
+        print(_CBM_OPTIONAL_BACKEND_LINE)
+        return None, None, None
+    expected = cbm_support.CERTIFIED_CBM_BINARIES.get(cbm_support.platform_tag())
+    sha256 = cbm_support._sha256_file(binary)
+    if (
+        not expected
+        or not sha256
+        or sha256.lower() != str(expected.get("sha256") or "").lower()
+    ):
+        _fail(
+            "refusing to execute an unverified binary",
+            "Re-acquire the certified release with checksum verification "
+            "(see docs/cbm-backend.md).",
+        )
+        return None, None, None
+    return binary, expected, sha256
+
+
+def _cbm_resolve_or_report(
+    path: Optional[str], command: str
+) -> Optional[Tuple[str, str]]:
+    """Shared workspace resolution for the cbm family.
+
+    Returns ``(root, project_id)`` or None after printing the honest
+    workspace-level failure (exit 2 territory: a human must fix the
+    repository before the optional CBM workflow can mean anything).
+    """
+    try:
+        return cbm_indexing.resolve_workspace(path)
+    except cbm_indexing.IndexSetupError as exc:
+        _fail(
+            sanitize_wire_text(str(exc)),
+            f"Run 'relinkra cbm {command}' from inside a git repository "
+            "with at least one commit.",
+        )
+        return None
+
+
+def _cbm_record_or_report(root: str) -> Optional[Tuple[Optional[dict], bool]]:
+    """Load the workspace CBM record honestly.
+
+    Returns ``(record, ok)``: ``ok`` is False only for a registry that
+    could not be READ (already reported), which callers must not treat
+    as the honest "no record yet".
+    """
+    try:
+        return _cbm_record_for_root(Path(root), WorkspaceConfig.load(Path(root))), True
+    except (RegistryError, OSError, ValueError) as exc:
+        _fail(
+            f"Could not read the Relinkra registry: "
+            f"{sanitize_wire_text(str(exc))}",
+            "Run 'relinkra doctor' to diagnose the registry.",
+        )
+        return None, False
+
+
+def cmd_cbm_status(args) -> int:
+    """Report managed CBM index freshness in three lines.
+
+    Every honest state exits 0; exit 2 is reserved for workspace-level
+    failures (not a usable git repository, unreadable registry).
+    """
+    resolved = _cbm_resolve_or_report(args.path, "status")
+    if resolved is None:
+        return EXIT_ACTION_REQUIRED
+    root, project_id = resolved
+    record, ok = _cbm_record_or_report(root)
+    if not ok:
+        return EXIT_ACTION_REQUIRED
+    availability, _binary, freshness = _cbm_freshness_snapshot(root, record)
+    display = _cbm_display_state(freshness["state"])
+    next_action = _cbm_next_action(display, freshness)
+    lines = ["", f"CBM: {availability}", f"Index: {display}"]
+    if freshness["state"] == cbm_indexing.UNTRUSTED:
+        # Provenance-before-execution: the binary was never run; the
+        # backend is effectively unusable until re-acquired.
+        lines = [
+            "",
+            "CBM: UNAVAILABLE",
+            "refusing to execute an unverified binary",
+            "Next: see docs/cbm-backend.md",
+            "",
+        ]
+        payload = {
+            "status": "UNAVAILABLE",
+            "project_id": project_id,
+            "cbm": "untrusted",
+            "freshness": {
+                "committed_drift": freshness["committed_drift"],
+                "worktree_drift": freshness["worktree_drift"],
+            },
+            "next_action": "see docs/cbm-backend.md",
+        }
+        _emit(payload, args.json, "\n".join(lines))
+        return EXIT_OK
+    if availability in (cbm_indexing.UNAVAILABLE, cbm_indexing.UNSUPPORTED):
+        lines.append(_CBM_OPTIONAL_BACKEND_LINE)
+    elif next_action:
+        lines.append(f"Next: {next_action}")
+    lines.append("")
+    payload = {
+        "status": display,
+        "project_id": project_id,
+        "cbm": availability.lower(),
+        "freshness": {
+            "committed_drift": freshness["committed_drift"],
+            "worktree_drift": freshness["worktree_drift"],
+        },
+        "next_action": next_action,
+    }
+    _emit(payload, args.json, "\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_cbm_index(args) -> int:
+    """Build the managed index and register the workspace mapping.
+
+    Exit 1 whenever the action failed (no/unsupported/unverified
+    backend, index error, mapping failure); exit 0 with the honestly
+    verified post-index state.
+    """
+    resolved = _cbm_resolve_or_report(args.path, "index")
+    if resolved is None:
+        return EXIT_ACTION_REQUIRED
+    root, project_id = resolved
+    binary, expected, sha256 = _cbm_action_gate(root)
+    if binary is None:
+        return EXIT_ERROR
+    cache_dir, cache_rel = cbm_indexing.plan_cache(root)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _fail(
+            f"Could not create the managed cache directory: "
+            f"{sanitize_wire_text(str(exc))}",
+            "Check that the workspace is writable.",
+        )
+        return EXIT_ERROR
+    gitignore_warning = not cbm_indexing.gitignore_check(root).get("ignored")
+    try:
+        result = cbm_indexing.run_index(binary, root, str(cache_dir), mode=args.mode)
+    except cbm_indexing.IndexSetupError as exc:
+        _fail(
+            f"CBM index failed: {sanitize_wire_text(str(exc))}",
+            "See docs/cbm-backend.md for the certified setup.",
+        )
+        return EXIT_ERROR
+    # Provenance already pinned this exact binary by hash, so a failed
+    # version probe degrades to the certified version string — never to
+    # a guess about an unverified executable.
+    version = str(expected.get("version") or "")
+    try:
+        probed = CBMCLIAdapter(
+            cbm_bin=binary,
+            workspace_root=root,
+            expected_sha256=sha256,
+        ).probe_version()
+        parsed = cbm_support.parse_version(probed)
+        if parsed:
+            version = ".".join(str(part) for part in parsed)
+    except CBMAdapterError:
+        pass
+    try:
+        workspace = cbm_indexing.register_mapping(
+            str(registry_path(Path(root))),
+            root,
+            result["project_name"],
+            cache_rel,
+            version,
+            sha256,
+        )
+    except cbm_indexing.IndexSetupError as exc:
+        _fail(
+            "index succeeded but mapping failed; rerun 'relinkra cbm index' "
+            f"(safe): {sanitize_wire_text(str(exc))}",
+            "The index data itself is intact; only the registry mapping "
+            "is missing.",
+        )
+        return EXIT_ERROR
+    record = workspace.get("cbm") if isinstance(workspace, dict) else None
+    freshness = cbm_indexing.freshness_state(
+        binary, root, record if isinstance(record, dict) else None
+    )
+    display = _cbm_display_state(freshness["state"])
+    payload = {
+        "action_performed": "index",
+        "status": display,
+        "project_id": project_id,
+        "nodes": result["nodes"],
+        "edges": result["edges"],
+        "quirk_recovery_used": False,
+        "gitignore_warning": gitignore_warning,
+    }
+    lines = ["", "CBM: AVAILABLE", f"Index: {display}"]
+    if display == "READY":
+        lines[2] = f"Index: READY ({result['nodes']} nodes, {result['edges']} edges)"
+    else:
+        next_action = _cbm_next_action(display, freshness)
+        if next_action:
+            payload["next_action"] = next_action
+            lines.append(f"Next: {next_action}")
+    lines.append("")
+    if gitignore_warning and not args.json:
+        print(
+            "WARN: .codebase-memory/ is not git-ignored; add it to "
+            ".gitignore — otherwise CBM reports the index permanently "
+            "STALE."
+        )
+    _emit(payload, args.json, "\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_cbm_refresh(args) -> int:
+    """Refresh a stale managed index (idempotent when already fresh).
+
+    Exit 1 when the precondition or the refresh itself failed; exit 0
+    for the READY no-op and a verified refresh.
+    """
+    resolved = _cbm_resolve_or_report(args.path, "refresh")
+    if resolved is None:
+        return EXIT_ACTION_REQUIRED
+    root, project_id = resolved
+    record, ok = _cbm_record_or_report(root)
+    if not ok:
+        return EXIT_ACTION_REQUIRED
+    availability, _binary, freshness = _cbm_freshness_snapshot(root, record)
+    display = _cbm_display_state(freshness["state"])
+    if display == cbm_indexing.MISSING:
+        print(f"CBM: {availability}")
+        print("Index: MISSING — run 'relinkra cbm index' first")
+        return EXIT_ERROR
+    if freshness["state"] == cbm_indexing.UNTRUSTED:
+        # Provenance-before-execution: refuse before ANY binary exec
+        # (the snapshot itself refused to probe the unverified binary).
+        _fail(
+            "refusing to execute an unverified binary",
+            "Re-acquire the certified release with checksum verification "
+            "(see docs/cbm-backend.md).",
+        )
+        return EXIT_ERROR
+    if display == "READY":
+        payload = {
+            "action_performed": "none",
+            "status": "READY",
+            "project_id": project_id,
+            "quirk_recovery_used": False,
+        }
+        _emit(
+            payload,
+            args.json,
+            "\n".join(
+                ["", f"CBM: {availability}", "Index: READY (already fresh)", ""]
+            ),
+        )
+        return EXIT_OK
+    if availability != "AVAILABLE":
+        _cbm_action_gate(root)  # prints the honest refusal
+        return EXIT_ERROR
+    project_name = str((record or {}).get("project_name") or "").strip()
+    raw_cache = str((record or {}).get("cache_dir") or "").strip()
+    if not project_name or not raw_cache:
+        _fail(
+            "the registered CBM mapping is unusable; re-run "
+            "'relinkra cbm index' to rebuild it",
+            "See docs/cbm-backend.md for the mapping contract.",
+        )
+        return EXIT_ERROR
+    binary, _expected, refresh_sha256 = _cbm_action_gate(root)
+    if binary is None:
+        return EXIT_ERROR
+    try:
+        cache_dir = cbm_support.absolutize_against_root(root, raw_cache)
+    except ValueError as exc:
+        _fail(
+            f"The registered CBM cache path is invalid: "
+            f"{sanitize_wire_text(str(exc))}",
+            "Re-run 'relinkra cbm index' to rebuild the mapping.",
+        )
+        return EXIT_ERROR
+    try:
+        outcome = cbm_indexing.refresh_with_quirk_recovery(
+            binary,
+            root,
+            cache_dir,
+            project_name,
+            mode=args.mode,
+            expected_sha256=refresh_sha256,
+        )
+    except cbm_indexing.StaleAfterRefreshError as exc:
+        _fail(
+            sanitize_wire_text(str(exc)),
+            "The managed cache may need manual inspection; see "
+            "docs/cbm-backend.md.",
+        )
+        return EXIT_ERROR
+    except cbm_indexing.IndexSetupError as exc:
+        _fail(
+            f"CBM refresh failed: {sanitize_wire_text(str(exc))}",
+            "See docs/cbm-backend.md for the certified setup.",
+        )
+        return EXIT_ERROR
+    recovery_used = bool(outcome.get("quirk_recovery_used"))
+    result = outcome.get("result") or {}
+    freshness = cbm_indexing.freshness_state(binary, root, record)
+    display = _cbm_display_state(freshness["state"])
+    if display == "STALE" and freshness.get("committed_drift") is not True:
+        # Real CBM 0.9.0 semantics (R5E.2B real-binary proof): change
+        # detection reads the git worktree itself, so uncommitted edits
+        # stay drift no matter how often the graph is reindexed. The
+        # refresh just captured the current content into the graph;
+        # READY returns once the changes are committed and refreshed.
+        payload = {
+            "action_performed": "refresh",
+            "status": "STALE",
+            "project_id": project_id,
+            "nodes": result.get("nodes"),
+            "edges": result.get("edges"),
+            "quirk_recovery_used": recovery_used,
+            "freshness": {
+                "committed_drift": freshness["committed_drift"],
+                "worktree_drift": freshness["worktree_drift"],
+            },
+            "next_action": _CBM_COMMIT_THEN_REFRESH,
+        }
+        _emit(
+            payload,
+            args.json,
+            "\n".join(
+                [
+                    "",
+                    "CBM: AVAILABLE",
+                    "Index: STALE — uncommitted changes keep the index flagged",
+                    f"Next: {_CBM_COMMIT_THEN_REFRESH}",
+                    "",
+                ]
+            ),
+        )
+        return EXIT_OK
+    if display != "READY":
+        print("CBM: AVAILABLE")
+        print(f"Index: {display} — refresh did not reach READY")
+        return EXIT_ERROR
+    payload = {
+        "action_performed": "refresh",
+        "status": "READY",
+        "project_id": project_id,
+        "nodes": result.get("nodes"),
+        "edges": result.get("edges"),
+        "quirk_recovery_used": recovery_used,
+    }
+    _emit(
+        payload,
+        args.json,
+        "\n".join(["", "CBM: AVAILABLE", "Index: READY (refreshed)", ""]),
+    )
+    return EXIT_OK
+
+
 def cmd_version(args) -> int:
     """Show the Relinkra version and basic compatibility information.
 
@@ -1577,6 +2151,37 @@ def build_parser() -> argparse.ArgumentParser:
             "--json", action="store_true", help="emit machine-readable JSON"
         )
         command.set_defaults(func=handler)
+
+    # The cbm family (R5E.2B): one nested subcommand set so the three
+    # optional-backend lifecycle verbs read as one workflow.
+    cbm_cmd = sub.add_parser(
+        "cbm", help="manage the optional CBM code index (status/index/refresh)"
+    )
+    cbm_sub = cbm_cmd.add_subparsers(dest="cbm_command", required=True)
+    for name, handler, help_text in (
+        ("status", cmd_cbm_status, "show managed CBM index freshness"),
+        ("index", cmd_cbm_index, "build the managed CBM index and register it"),
+        ("refresh", cmd_cbm_refresh, "refresh a stale managed CBM index"),
+    ):
+        cbm_command = cbm_sub.add_parser(name, help=help_text)
+        cbm_command.add_argument(
+            "--path",
+            default=None,
+            help="workspace directory (defaults to the current directory)",
+        )
+        cbm_command.add_argument(
+            "--json", action="store_true", help="emit machine-readable JSON"
+        )
+        if name in ("index", "refresh"):
+            # Only 'fast' is supported today; advertising more would
+            # promise an indexing mode the backend never verifies.
+            cbm_command.add_argument(
+                "--mode",
+                choices=["fast"],
+                default="fast",
+                help="indexing mode (only 'fast' is supported)",
+            )
+        cbm_command.set_defaults(func=handler)
 
     # Version takes no --path: it answers about the tool, not a workspace.
     version_cmd = sub.add_parser(

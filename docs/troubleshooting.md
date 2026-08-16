@@ -76,11 +76,13 @@ longer matches the workspace HEAD); `worktree has N changed file(s)`
 means uncommitted edits exist. Evidence is served degraded-but-usable,
 never silently dropped.
 
-**Fix:** re-index the workspace into the managed cache
-(`codebase-memory-mcp cli index_repository`). If the WARN persists,
-CBM 0.9.0 keeps the stored HEAD for modify-only re-indexes — delete the
-project `.db` under `.codebase-memory/cache/` and re-index. Details:
-[CBM backend](cbm-backend.md).
+**Fix:** run `relinkra cbm refresh` — a full reindex with automatic
+recovery from the CBM 0.9.0 modify-only quirk (it deletes exactly the
+project `.db` under `.codebase-memory/cache/` and reindexes when the
+stored HEAD refuses to move). If the WARN says `worktree has N changed
+file(s)`, the drift is your uncommitted edits: CBM's change detection
+reads the git worktree, so commit (or stash) first and refresh again —
+no reindex can clear it. Details: [CBM backend](cbm-backend.md).
 
 ## Engram missing
 
