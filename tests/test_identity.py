@@ -604,6 +604,14 @@ class Sha256RootIdentityTests(unittest.TestCase):
 
 
 class CanonicalizePathTests(unittest.TestCase):
+    def test_different_existing_paths_remain_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            left = os.path.join(tmp, "left")
+            right = os.path.join(tmp, "right")
+            os.makedirs(left)
+            os.makedirs(right)
+            self.assertNotEqual(canonicalize_path(left), canonicalize_path(right))
+
     def test_symlink_resolves_to_same_canonical_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             real = os.path.join(tmp, "real-repo")

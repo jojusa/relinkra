@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover
     import git_fixtures
 
 from relinkra import cbm_indexing, cbm_support, product_cli
+from relinkra.identity import canonicalize_path
 from relinkra.product_cli import EXIT_ACTION_REQUIRED, EXIT_ERROR, EXIT_OK
 
 BIN = "C:/fake/codebase-memory-mcp.exe"
@@ -102,6 +103,12 @@ class CBMCLITestCase(unittest.TestCase):
             ".codebase-memory/cache",
             "0.9.0",
             CERTIFIED_SHA,
+        )
+
+    def assert_path_equivalent(self, actual, expected):
+        """Compare filesystem paths using Relinkra's canonical path policy."""
+        self.assertEqual(
+            canonicalize_path(str(actual)), canonicalize_path(str(expected))
         )
 
 
@@ -414,11 +421,14 @@ class CbmIndexTests(CBMCLITestCase):
         )
         self.assertTrue(payload["project_id"].startswith("rlk_"))
         self.assertEqual(run_index.call_args.kwargs["expected_sha256"], CERTIFIED_SHA)
+        register_args = register.call_args.args
+        self.assert_path_equivalent(
+            register_args[0], product_cli.registry_path(Path(self.repo))
+        )
+        self.assert_path_equivalent(register_args[1], self.repo)
         self.assertEqual(
-            register.call_args.args,
+            register_args[2:],
             (
-                str(product_cli.registry_path(Path(self.repo))),
-                self.repo,
                 PROJECT,
                 ".codebase-memory/cache",
                 "0.9.0",
@@ -563,7 +573,11 @@ class CbmRefreshTests(CBMCLITestCase):
         self.assertEqual(payload["action_performed"], "refresh")
         self.assertTrue(payload["quirk_recovery_used"])
         self.assertEqual(payload["nodes"], 5)
-        self.assertEqual(refresh.call_args.args, (BIN, self.repo, cache_abs, PROJECT))
+        refresh_args = refresh.call_args.args
+        self.assertEqual(refresh_args[0], BIN)
+        self.assert_path_equivalent(refresh_args[1], self.repo)
+        self.assert_path_equivalent(refresh_args[2], cache_abs)
+        self.assertEqual(refresh_args[3], PROJECT)
         self.assertEqual(
             refresh.call_args.kwargs,
             {"mode": "fast", "expected_sha256": CERTIFIED_SHA},
