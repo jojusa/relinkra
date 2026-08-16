@@ -221,6 +221,171 @@ class LinkageService:
             return {}
         return _portable_cbm_authority(raw)
 
+    def structural_evidence_authority(self) -> dict:
+        """Project CBM graph authority into a compact structural contract.
+
+        Structural reads are advisory.  A PASS graph is ``fresh``; the
+        existing stale-index/worktree-drift warnings are classified as
+        ``stale``; all other missing or malformed authority is ``unknown``.
+        Raw adapter details never cross this boundary.
+        """
+        provider = getattr(self.cbm, "code_evidence_authority", None)
+        if not callable(provider):
+            return {
+                "freshness": {
+                    "state": "unknown",
+                    "reason": "graph authority is unavailable",
+                },
+                "authority": {},
+            }
+        try:
+            raw = provider()
+        except Exception:
+            return {
+                "freshness": {
+                    "state": "unknown",
+                    "reason": "graph authority could not be verified",
+                },
+                "authority": {},
+            }
+        projected = _portable_cbm_authority(raw)
+        stages = raw.get("trust_stages") if isinstance(raw, Mapping) else []
+        graph_stage = None
+        if isinstance(stages, (list, tuple)):
+            for stage in stages:
+                if not isinstance(stage, Mapping):
+                    continue
+                if str(stage.get("name") or "").strip().lower() == "cbm graph":
+                    graph_stage = stage
+                    break
+        status = str((graph_stage or {}).get("status") or "").strip().upper()
+        detail = str((graph_stage or {}).get("detail") or "").strip().lower()
+        index = projected.get("index_status") or {}
+        git = index.get("git") if isinstance(index, Mapping) else {}
+        revision = git.get("head_sha") if isinstance(git, Mapping) else None
+        if status == "PASS" and isinstance(revision, str) and revision:
+            state = "fresh"
+            reason = "graph matches the workspace revision"
+        elif status == "WARN" and (
+            "stale index" in detail or "worktree has" in detail
+        ):
+            state = "stale"
+            reason = "graph is older than the current workspace"
+        else:
+            state = "unknown"
+            reason = "graph freshness could not be established"
+        return {
+            "freshness": {
+                "state": state,
+                "reason": reason,
+                "source_revision": revision,
+                "advisory_only": True,
+            },
+            "authority": projected,
+        }
+
+    def architecture_orientation(
+        self, *, path: Optional[str] = None, limit: int = 5
+    ) -> dict:
+        """Read optional compact architecture evidence without failing callers."""
+        authority = self.structural_evidence_authority()
+        freshness = authority["freshness"]["state"]
+        if freshness not in ("fresh", "stale"):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": authority["freshness"]["reason"],
+            }
+        method = getattr(self.cbm, "architecture_orientation", None)
+        if not callable(method):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": "CBM architecture capability is unavailable",
+            }
+        try:
+            evidence = _adapter_call(
+                "architecture_orientation", method, path=path, limit=limit
+            )
+        except CBMAdapterError as exc:
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": str(exc),
+            }
+        if not isinstance(evidence, Mapping):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": "CBM architecture capability returned malformed evidence",
+            }
+        return {
+            "evidence": dict(evidence),
+            "freshness": authority["freshness"],
+            "authority": authority["authority"],
+            "warning": None,
+        }
+
+    def trace_relationships(
+        self,
+        *,
+        function_name: str,
+        direction: str = "both",
+        max_hops: int = 2,
+        limit: int = 20,
+    ) -> dict:
+        """Read optional bounded callers/dependencies evidence."""
+        authority = self.structural_evidence_authority()
+        freshness = authority["freshness"]["state"]
+        if freshness not in ("fresh", "stale"):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": authority["freshness"]["reason"],
+            }
+        method = getattr(self.cbm, "trace_relationships", None)
+        if not callable(method):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": "CBM traversal capability is unavailable",
+            }
+        try:
+            evidence = _adapter_call(
+                "trace_relationships",
+                method,
+                function_name=function_name,
+                direction=direction,
+                max_hops=max_hops,
+                limit=limit,
+            )
+        except CBMAdapterError as exc:
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": str(exc),
+            }
+        if not isinstance(evidence, Mapping):
+            return {
+                "evidence": None,
+                "freshness": authority["freshness"],
+                "authority": authority["authority"],
+                "warning": "CBM traversal capability returned malformed evidence",
+            }
+        return {
+            "evidence": dict(evidence),
+            "freshness": authority["freshness"],
+            "authority": authority["authority"],
+            "warning": None,
+        }
+
     # -- resolution ---------------------------------------------------
 
     def resolve_reference(self, ref: Any) -> ResolvedReference:

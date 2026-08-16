@@ -44,10 +44,13 @@ Hard rules:
   3. OMIT OPTIONAL MEMORIES: whole memories of optional types, from the
      END of the list first. Bodies are never cut mid-sentence.
      reason=optional_section_budget_exhausted.
-  4. OMIT OPTIONAL CODE FACTS: code_facts beyond the FIRST one (the
+  4. OMIT OPTIONAL STRUCTURAL CODE FACTS: CBM architecture/traversal facts
+     are shed before any direct code fact, including when they are the only
+     code facts.
+  5. OMIT OPTIONAL CODE FACTS: code_facts beyond the FIRST one (the
      direct focus is important), from the end.
      reason=optional_section_budget_exhausted.
-  5. OMIT IMPORTANT ITEMS from the end: important memories, then pending,
+  6. OMIT IMPORTANT ITEMS from the end: important memories, then pending,
      then handoffs, then code_references beyond the first.
      reason=important_section_budget_exhausted.
   6. Still over ``budget - reserve`` -> BUDGET_UNSATISFIABLE typed
@@ -155,6 +158,15 @@ _ITEM_SECTIONS = ("memories", "code_references", "code_facts", "pending",
 _SECTION_KINDS = {"memories": "memory", "code_references": "code_reference",
                   "code_facts": "code_fact", "pending": "pending",
                   "handoffs": "handoff", "git_facts": "git_fact"}
+
+STRUCTURAL_EVIDENCE_KINDS = frozenset(
+    {
+        "architecture_fact",
+        "caller_relationship",
+        "dependency_relationship",
+        "bounded_path",
+    }
+)
 
 # Git fact policy classes (design §3): repository state, HEAD facts, the
 # focused file's change state, working-tree changes, commit lists and file
@@ -797,6 +809,11 @@ def _source_id(section: str, item: PacketItem) -> str:
     return item.provenance.memory_id or ""
 
 
+def _is_structural_code_fact(item: PacketItem) -> bool:
+    """CBM structural facts are optional, never the protected code focus."""
+    return item.data.get("evidence_kind") in STRUCTURAL_EVIDENCE_KINDS
+
+
 # -- the accountant ------------------------------------------------------------
 
 
@@ -1024,7 +1041,22 @@ def _ladder_fixed_order(
                 REASON_OPTIONAL_EXHAUSTED,
             )
         index -= 1
-    # Step 4: omit code_facts beyond the FIRST (the direct focus), end first.
+    # Step 4: shed optional CBM structural facts before protecting the direct
+    # code fact. This also removes the sole code fact when it is structural.
+    index = len(working.code_facts) - 1
+    while index >= 0:
+        if fits():
+            return
+        item = working.code_facts[index]
+        if _is_structural_code_fact(item):
+            working.code_facts.pop(index)
+            sid = _source_id("code_facts", item)
+            actions[("code_fact", sid, occ_map[id(item)])] = (
+                ACTION_OMITTED,
+                REASON_OPTIONAL_EXHAUSTED,
+            )
+        index -= 1
+    # Step 5: omit code_facts beyond the FIRST (the direct focus), end first.
     while len(working.code_facts) > 1:
         if fits():
             return
@@ -1034,7 +1066,7 @@ def _ladder_fixed_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
-    # Step 5: omit important items, from the end of each list first.
+    # Step 6: omit important items, from the end of each list first.
     for section in ("memories", "pending", "handoffs"):
         items = getattr(working, section)
         while items:
@@ -1153,10 +1185,27 @@ def _ladder_ranked_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
-    # Step 4: omit code_facts beyond the FIRST (the direct focus),
-    # lowest relevance first.
+    # Step 4: shed all optional CBM structural facts before protecting the
+    # direct focus. Relevance may choose which structural fact disappears
+    # first, but never makes one essential.
     positions = _rank_positions(relevance, "code_facts")
-    extras = list(working.code_facts[1:])
+    structural = [
+        item for item in working.code_facts if _is_structural_code_fact(item)
+    ]
+    for item in _worst_first(structural, "code_facts", positions, occ_map):
+        if fits():
+            return
+        sid = _source_id("code_facts", item)
+        _remove_item(working.code_facts, item)
+        actions[("code_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED,
+            REASON_OPTIONAL_EXHAUSTED,
+        )
+    # Step 5: omit non-structural code_facts beyond the FIRST, lowest
+    # relevance first.
+    extras = [
+        item for item in working.code_facts if not _is_structural_code_fact(item)
+    ][1:]
     for item in _worst_first(extras, "code_facts", positions, occ_map):
         if fits():
             return
@@ -1168,7 +1217,7 @@ def _ladder_ranked_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
-    # Step 5: omit important items, lowest relevance first per list.
+    # Step 6: omit important items, lowest relevance first per list.
     for section in ("memories", "pending", "handoffs"):
         items = getattr(working, section)
         positions = _rank_positions(relevance, section)

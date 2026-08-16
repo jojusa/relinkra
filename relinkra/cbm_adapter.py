@@ -30,7 +30,7 @@ import json
 import os
 import re
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .code_reference import CodeReference, derive_language
 from .identity import GitError, git_head_sha
@@ -48,6 +48,18 @@ MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 # external/stdlib symbols like <python-builtins>).
 _NON_REPO_PATHS = frozenset({"{}", ""})
 _GRAPH_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+ARCHITECTURE_DEFAULT_LIMIT = 5
+ARCHITECTURE_MAX_LIMIT = 12
+ARCHITECTURE_MAX_FIELD_CHARS = 256
+ARCHITECTURE_MAX_PAYLOAD_BYTES = 16 * 1024
+TRACE_DEFAULT_DEPTH = 2
+TRACE_MAX_DEPTH = 3
+TRACE_DEFAULT_LIMIT = 20
+TRACE_MAX_LIMIT = 50
+TRACE_MAX_FIELD_CHARS = 256
+TRACE_MAX_PAYLOAD_BYTES = 24 * 1024
+TRACE_DIRECTIONS = frozenset(("inbound", "outbound", "both"))
 
 
 class CBMAdapterError(Exception):
@@ -583,6 +595,395 @@ class CBMCLIAdapter:
             }
         )
         return {"changed_count": count, "changed_files": files}
+
+    def architecture_orientation(
+        self,
+        *,
+        project: Optional[str] = None,
+        path: Optional[str] = None,
+        limit: int = ARCHITECTURE_DEFAULT_LIMIT,
+    ) -> dict:
+        """Return a compact, stable subset of CBM 0.9.0 architecture data.
+
+        The certified tool accepts ``aspects=['overview']`` and returns a
+        large object.  Relinkra deliberately consumes only aggregate counts,
+        packages, languages, layers, boundaries, hotspots, and a few cluster
+        representatives.  Raw qualified names and the CBM project slug do
+        not cross this boundary.
+        """
+        slug = self._project(project)
+        limit = self._bounded_limit(limit, ARCHITECTURE_MAX_LIMIT, "limit")
+        flags = ["--project", slug, "--aspects", "overview"]
+        if path:
+            flags += ["--path", str(path).strip()]
+        payload = self._run_or_classify("get_architecture", flags)
+        if not isinstance(payload, dict):
+            raise CBMAdapterError(
+                "cbm get_architecture returned a non-object payload"
+            )
+        result = self._normalize_architecture(payload, limit)
+        self._ensure_payload_bound(
+            result, ARCHITECTURE_MAX_PAYLOAD_BYTES, "architecture"
+        )
+        return result
+
+    def trace_relationships(
+        self,
+        *,
+        function_name: str,
+        project: Optional[str] = None,
+        direction: str = "both",
+        max_hops: int = TRACE_DEFAULT_DEPTH,
+        limit: int = TRACE_DEFAULT_LIMIT,
+    ) -> dict:
+        """Return bounded caller/dependency relationships from ``trace_path``.
+
+        CBM 0.9.0 returns ``callers`` and ``callees`` arrays whose entries
+        contain only ``name``, ``qualified_name`` and ``hop`` for call traces.
+        The adapter strips the path-derived slug, sorts deterministically,
+        caps the result, and states explicitly that an empty graph result is
+        not proof of absence.
+        """
+        slug = self._project(project)
+        function_name = str(function_name or "").strip()
+        if not function_name:
+            raise CBMAdapterError("a function_name is required")
+        direction = str(direction or "both").strip().lower()
+        if direction not in TRACE_DIRECTIONS:
+            raise CBMAdapterError(
+                "trace direction must be inbound, outbound, or both"
+            )
+        max_hops = self._bounded_limit(
+            max_hops, TRACE_MAX_DEPTH, "max_hops", minimum=1
+        )
+        limit = self._bounded_limit(limit, TRACE_MAX_LIMIT, "limit")
+        flags = [
+            "--project", slug,
+            "--function-name", function_name,
+            "--direction", direction,
+            "--depth", str(max_hops),
+            "--mode", "calls",
+            "--include-tests", "false",
+        ]
+        payload = self._run_or_classify("trace_path", flags)
+        if not isinstance(payload, dict):
+            raise CBMAdapterError(
+                "cbm trace_path returned a non-object payload"
+            )
+        if not payload:
+            raise CBMAdapterError("cbm trace_path returned an empty payload")
+        target = self._required_text(payload, "function", "trace_path")
+        if target != function_name:
+            raise CBMAdapterError(
+                "cbm trace_path returned a mismatched function"
+            )
+        returned_direction = self._required_text(
+            payload, "direction", "trace_path"
+        ).lower()
+        returned_mode = self._required_text(payload, "mode", "trace_path").lower()
+        if returned_direction != direction or returned_mode != "calls":
+            raise CBMAdapterError(
+                "cbm trace_path returned an unexpected direction or mode"
+            )
+        relationships = []
+        if direction in ("inbound", "both"):
+            relationships.extend(
+                self._normalize_trace_entries(
+                    payload, "callers", "caller", slug, max_hops
+                )
+            )
+        if direction in ("outbound", "both"):
+            relationships.extend(
+                self._normalize_trace_entries(
+                    payload, "callees", "dependency", slug, max_hops
+                )
+            )
+        relationships.sort(
+            key=lambda item: (
+                item["hop"], item["relationship"],
+                item["qualified_name"], item["name"],
+            )
+        )
+        truncated = len(relationships) > limit
+        relationships = relationships[:limit]
+        result = {
+            "target": self._bounded_text(
+                strip_project_slug(target, slug), TRACE_MAX_FIELD_CHARS
+            ),
+            "direction": direction,
+            "max_hops": max_hops,
+            "relationships": relationships,
+            "coverage": {
+                "complete": False,
+                "truncated": truncated,
+                "returned": len(relationships),
+                "requested_limit": limit,
+                "requested_depth": max_hops,
+                "qualification": (
+                    "No relationships were found in the current indexed "
+                    "graph; this does not prove that none exist."
+                    if not relationships
+                    else "The bounded graph result may be incomplete; "
+                    "native file and symbol exploration remains available."
+                ),
+            },
+        }
+        self._ensure_payload_bound(result, TRACE_MAX_PAYLOAD_BYTES, "trace")
+        return result
+
+    @staticmethod
+    def _bounded_limit(value, maximum: int, name: str, minimum: int = 1) -> int:
+        if isinstance(value, bool):
+            raise CBMAdapterError(f"{name} must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise CBMAdapterError(f"{name} must be an integer") from exc
+        if parsed < minimum or parsed > maximum:
+            raise CBMAdapterError(
+                f"{name} must be between {minimum} and {maximum}"
+            )
+        return parsed
+
+    @classmethod
+    def _required_text(cls, payload: dict, key: str, tool: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise CBMAdapterError(
+                f"cbm {tool} returned malformed {key}"
+            )
+        return value.strip()
+
+    @classmethod
+    def _bounded_text(cls, value: str, maximum: int) -> str:
+        if len(value) <= maximum:
+            return value
+        return value[: maximum - 3].rstrip() + "..."
+
+    @staticmethod
+    def _ensure_payload_bound(payload: dict, maximum: int, label: str) -> None:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > maximum:
+            raise CBMAdapterError(
+                f"cbm {label} evidence exceeded the {maximum}-byte output limit"
+            )
+
+    @staticmethod
+    def _records(payload: dict, key: str, tool: str) -> List[dict]:
+        if key not in payload:
+            raise CBMAdapterError(f"cbm {tool} returned missing {key}")
+        value = payload[key]
+        if not isinstance(value, list):
+            raise CBMAdapterError(
+                f"cbm {tool} returned malformed {key}"
+            )
+        if any(not isinstance(item, dict) for item in value):
+            raise CBMAdapterError(
+                f"cbm {tool} returned malformed {key} entry"
+            )
+        return value
+
+    def _normalize_architecture(self, payload: dict, limit: int) -> dict:
+        if not payload:
+            raise CBMAdapterError("cbm get_architecture returned an empty payload")
+        project = self._required_text(payload, "project", "get_architecture")
+        del project  # Validate the stable identity, but never expose the slug.
+        aggregate = {}
+        for key in ("total_nodes", "total_edges"):
+            value = payload.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CBMAdapterError(
+                    f"cbm get_architecture returned malformed {key}"
+                )
+            aggregate[key] = value
+
+        languages = []
+        for item in self._records(payload, "languages", "get_architecture"):
+            language = self._required_text(item, "language", "get_architecture")
+            count = item.get("file_count")
+            if not language or not isinstance(count, int) or isinstance(count, bool):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed language"
+                )
+            if count < 0:
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed language"
+                )
+            languages.append({
+                "language": self._bounded_text(language, ARCHITECTURE_MAX_FIELD_CHARS),
+                "file_count": count,
+            })
+        languages.sort(key=lambda item: (item["language"].casefold(), item["language"]))
+
+        packages = []
+        for item in self._records(payload, "packages", "get_architecture"):
+            name = self._required_text(item, "name", "get_architecture")
+            count = item.get("node_count")
+            if not name or not isinstance(count, int) or isinstance(count, bool):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed package"
+                )
+            if count < 0:
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed package"
+                )
+            packages.append({
+                "name": self._bounded_text(name, ARCHITECTURE_MAX_FIELD_CHARS),
+                "node_count": count,
+            })
+        packages.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+
+        layers = []
+        for item in self._records(payload, "layers", "get_architecture"):
+            layer = self._required_text(item, "layer", "get_architecture")
+            name = item.get("name")
+            reason = item.get("reason")
+            if not isinstance(name, str) or not isinstance(reason, str):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed layer"
+                )
+            name = name.strip()
+            reason = reason.strip()
+            if not layer:
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed layer"
+                )
+            layers.append({
+                "name": self._bounded_text(name, ARCHITECTURE_MAX_FIELD_CHARS),
+                "layer": self._bounded_text(layer, ARCHITECTURE_MAX_FIELD_CHARS),
+                "reason": self._bounded_text(reason, ARCHITECTURE_MAX_FIELD_CHARS),
+            })
+        layers.sort(key=lambda item: (item["layer"].casefold(), item["name"].casefold()))
+
+        boundaries = []
+        for item in self._records(payload, "boundaries", "get_architecture"):
+            source = self._required_text(item, "from", "get_architecture")
+            target = self._required_text(item, "to", "get_architecture")
+            count = item.get("call_count")
+            if not source or not target or not isinstance(count, int) or isinstance(count, bool):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed boundary"
+                )
+            if count < 0:
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed boundary"
+                )
+            boundaries.append({
+                "from": self._bounded_text(source, ARCHITECTURE_MAX_FIELD_CHARS),
+                "to": self._bounded_text(target, ARCHITECTURE_MAX_FIELD_CHARS),
+                "call_count": count,
+            })
+        boundaries.sort(key=lambda item: (item["from"].casefold(), item["to"].casefold()))
+
+        hotspots = []
+        for item in self._records(payload, "hotspots", "get_architecture"):
+            name = self._required_text(item, "name", "get_architecture")
+            qualified_name = self._required_text(
+                item, "qualified_name", "get_architecture"
+            )
+            fan_in = item.get("fan_in")
+            if not name or not isinstance(fan_in, int) or isinstance(fan_in, bool):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed hotspot"
+                )
+            if fan_in < 0:
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed hotspot"
+                )
+            hotspots.append({
+                "name": self._bounded_text(name, ARCHITECTURE_MAX_FIELD_CHARS),
+                "fan_in": fan_in,
+            })
+        hotspots.sort(key=lambda item: (-item["fan_in"], item["name"].casefold(), item["name"]))
+
+        clusters = []
+        for item in self._records(payload, "clusters", "get_architecture"):
+            label = self._required_text(item, "label", "get_architecture")
+            members = item.get("members")
+            top_nodes = item.get("top_nodes")
+            if (
+                not isinstance(members, int)
+                or isinstance(members, bool)
+                or members < 0
+                or not isinstance(top_nodes, list)
+            ):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed cluster"
+                )
+            if any(not isinstance(n, str) for n in top_nodes):
+                raise CBMAdapterError(
+                    "cbm get_architecture returned malformed cluster nodes"
+                )
+            clusters.append({
+                "label": self._bounded_text(label, ARCHITECTURE_MAX_FIELD_CHARS),
+                "members": members,
+                "top_nodes": [
+                    self._bounded_text(n.strip(), ARCHITECTURE_MAX_FIELD_CHARS)
+                    for n in sorted({n.strip() for n in top_nodes if n.strip()})[:3]
+                ],
+            })
+        clusters.sort(key=lambda item: (-item["members"], item["label"].casefold()))
+
+        aggregate.update({
+            "languages": languages[:limit],
+            "packages": packages[:limit],
+            "layers": layers[:limit],
+            "boundaries": boundaries[:limit],
+            "hotspots": hotspots[:limit],
+            "clusters": clusters[: min(3, limit)],
+        })
+        return aggregate
+
+    def _normalize_trace_entries(
+        self,
+        payload: dict,
+        key: str,
+        relationship: str,
+        slug: str,
+        max_hops: int,
+    ) -> List[dict]:
+        if key not in payload:
+            raise CBMAdapterError(f"cbm trace_path returned missing {key}")
+        value = payload[key]
+        if not isinstance(value, list):
+            raise CBMAdapterError(f"cbm trace_path returned malformed {key}")
+        normalized: Dict[tuple, dict] = {}
+        for item in value:
+            if not isinstance(item, dict):
+                raise CBMAdapterError(
+                    f"cbm trace_path returned malformed {key} entry"
+                )
+            qn = self._required_text(item, "qualified_name", "trace_path")
+            name = self._required_text(item, "name", "trace_path")
+            hop = item.get("hop")
+            if (
+                not qn
+                or not isinstance(hop, int)
+                or isinstance(hop, bool)
+                or hop < 1
+                or hop > max_hops
+            ):
+                raise CBMAdapterError(
+                    f"cbm trace_path returned malformed {key} entry"
+                )
+            relative_qn = strip_project_slug(qn, slug)
+            if not relative_qn:
+                raise CBMAdapterError(
+                    f"cbm trace_path returned malformed {key} entry"
+                )
+            display_name = self._bounded_text(name, TRACE_MAX_FIELD_CHARS)
+            record = {
+                "relationship": relationship,
+                "name": display_name,
+                "qualified_name": self._bounded_text(
+                    relative_qn, TRACE_MAX_FIELD_CHARS
+                ),
+                "hop": hop,
+            }
+            normalized[(relationship, relative_qn, hop)] = record
+        return list(normalized.values())
 
     def code_evidence_authority(self) -> dict:
         """Return the portable graph attestation used by read-side evidence.

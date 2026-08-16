@@ -33,6 +33,7 @@ Selection rules (all deterministic, no embeddings, no LLM ranking):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -99,6 +100,7 @@ WARN_STALE = "stale_code_reference"
 WARN_MISSING = "missing_code_reference"
 WARN_AMBIGUOUS = "ambiguous_code_reference"
 WARN_CBM_UNAVAILABLE = "cbm_unavailable"
+WARN_CBM_STRUCTURAL = "cbm_structural_unavailable"
 WARN_ENGRAM_UNAVAILABLE = "engram_unavailable"
 WARN_WORKSPACE_MISMATCH = "workspace_mismatch"
 WARN_WORKSPACE_NOT_REGISTERED = "workspace_not_registered"
@@ -154,6 +156,8 @@ class Guardrails:
     max_git_facts: int = 24
     max_git_diff_entries: int = 8
     max_git_cochange: int = 10
+    max_structural_facts: int = 4
+    max_structural_relationships: int = 12
 
 
 @dataclass
@@ -282,6 +286,18 @@ class ContextBuilder:
             )
         )
         linked_ids |= focus_linked_ids
+
+        code_fact_items.extend(
+            self._build_structural_evidence(
+                request,
+                mode,
+                project_id,
+                focus,
+                code_fact_items,
+                warnings,
+                omitted,
+            )
+        )
 
         try:
             git_items = self._collect_git_facts(
@@ -875,6 +891,216 @@ class ContextBuilder:
 
     # -- code focus -------------------------------------------------------
 
+    @staticmethod
+    def _structural_request_kinds(request) -> tuple[bool, bool]:
+        """Use deterministic task words, never an LLM, for optional reads."""
+        tokens = set(
+            _TASK_TOKEN_RE.findall((request.task or "").casefold())
+        )
+        architecture = bool(
+            tokens
+            & {
+                "architecture", "architectural", "orientation", "module",
+                "modules", "component", "components", "boundary",
+                "boundaries", "layer", "layers", "structure", "impact",
+            }
+        )
+        traversal = bool(
+            tokens
+            & {
+                "caller", "callers", "callee", "callees", "dependency",
+                "dependencies", "impact", "path", "paths", "relationship",
+                "relationships", "trace", "traversal",
+            }
+        )
+        return architecture, traversal
+
+    @staticmethod
+    def _structural_source_id(kind: str, data: dict) -> str:
+        payload = json.dumps(
+            {"kind": kind, "data": data},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return "struct_" + hashlib.sha256(payload).hexdigest()[:32]
+
+    @staticmethod
+    def _structural_item(
+        *,
+        project_id: str,
+        kind: str,
+        result: dict,
+        payload: dict,
+        why: str,
+    ) -> PacketItem:
+        authority = result.get("authority") or {}
+        data = {
+            "evidence_kind": kind,
+            "project_id": project_id,
+            "freshness": result.get("freshness") or {
+                "state": "unknown",
+                "reason": "graph freshness was not provided",
+            },
+        }
+        for key in ("index_status", "trust_stages"):
+            if key in authority:
+                data[key] = authority[key]
+        data.update(payload)
+        return PacketItem(
+            data=data,
+            provenance=Provenance(
+                source="cbm",
+                why_included=why,
+                code_reference_id=ContextBuilder._structural_source_id(
+                    kind, data
+                ),
+            ),
+        )
+
+    def _build_structural_evidence(
+        self,
+        request,
+        mode,
+        project_id,
+        focus,
+        code_fact_items,
+        warnings,
+        omitted,
+    ) -> List[PacketItem]:
+        g = self.guardrails
+        wants_architecture, wants_traversal = self._structural_request_kinds(request)
+        if not (wants_architecture or wants_traversal):
+            return []
+        if self.cbm is None:
+            warnings.append(
+                PacketWarning(
+                    WARN_CBM_STRUCTURAL,
+                    "optional CBM structural evidence is unavailable; "
+                    "continue with native file and symbol exploration",
+                )
+            )
+            return []
+
+        items: List[PacketItem] = []
+        if wants_architecture and len(items) < g.max_structural_facts:
+            path = None
+            if request.file:
+                try:
+                    path = normalize_repo_path(request.file)
+                except CodeRefError:
+                    path = None
+            result = self.linkage.architecture_orientation(
+                path=path, limit=min(5, g.max_structural_facts)
+            )
+            if result.get("evidence") is not None:
+                evidence = result["evidence"]
+                items.append(
+                    self._structural_item(
+                        project_id=project_id,
+                        kind="architecture_fact",
+                        result=result,
+                        payload={
+                            "architecture": evidence,
+                            "coverage": {
+                                "complete": False,
+                                "qualification": (
+                                    "Architecture is a compact bounded view; "
+                                    "native repository exploration remains available."
+                                ),
+                            },
+                        },
+                        why=f"compact CBM architecture orientation (mode={mode})",
+                    )
+                )
+            else:
+                warnings.append(
+                    PacketWarning(
+                        WARN_CBM_STRUCTURAL,
+                        result.get("warning")
+                        or "optional CBM architecture evidence was omitted",
+                    )
+                )
+
+        if wants_traversal and len(items) < g.max_structural_facts:
+            function_name = self._structural_function_name(focus, code_fact_items)
+            if not function_name:
+                warnings.append(
+                    PacketWarning(
+                        WARN_CBM_STRUCTURAL,
+                        "caller/dependency evidence needs a resolved symbol; "
+                        "continue with native symbol navigation",
+                    )
+                )
+            else:
+                direction = self._structural_direction(request.task)
+                result = self.linkage.trace_relationships(
+                    function_name=function_name,
+                    direction=direction,
+                    max_hops=2,
+                    limit=g.max_structural_relationships,
+                )
+                if result.get("evidence") is not None:
+                    evidence = result["evidence"]
+                    items.append(
+                        self._structural_item(
+                            project_id=project_id,
+                            kind="bounded_path",
+                            result=result,
+                            payload=evidence,
+                            why=f"bounded CBM relationships (direction={direction})",
+                        )
+                    )
+                else:
+                    warnings.append(
+                        PacketWarning(
+                            WARN_CBM_STRUCTURAL,
+                            result.get("warning")
+                            or "optional CBM relationship evidence was omitted",
+                        )
+                    )
+        if len(items) > g.max_structural_facts:
+            omitted["code_facts"] += len(items) - g.max_structural_facts
+            items = items[: g.max_structural_facts]
+        return items
+
+    @staticmethod
+    def _structural_direction(task: Optional[str]) -> str:
+        tokens = set(_TASK_TOKEN_RE.findall((task or "").casefold()))
+        inbound = bool(tokens & {"caller", "callers"})
+        outbound = bool(
+            tokens & {"callee", "callees", "dependency", "dependencies"}
+        )
+        if inbound and not outbound:
+            return "inbound"
+        if outbound and not inbound:
+            return "outbound"
+        return "both"
+
+    @staticmethod
+    def _structural_function_name(focus, code_fact_items) -> Optional[str]:
+        # Traversal is allowed only for the explicitly resolved focus. The
+        # ambiguous path intentionally creates several code facts, but none
+        # of those candidates is a safe traversal target.
+        if not isinstance(focus, dict):
+            return None
+        if focus.get("resolution_state") not in (RESOLVED, STALE):
+            return None
+        qn = str(focus.get("qualified_name") or "").strip()
+        slug = str(focus.get("cbm_project_name") or "").strip()
+        if qn and slug:
+            return f"{slug}.{qn}"
+        for item in code_fact_items:
+            data = item.data
+            if data.get("resolution_state") not in (RESOLVED, STALE):
+                continue
+            if str(data.get("qualified_name") or "").strip() != qn:
+                continue
+            slug = str(item.provenance.cbm_project_name or "").strip()
+            if qn and slug:
+                return f"{slug}.{qn}"
+        return None
+
     def _build_code_focus(
         self, request, mode, project_id, workspace_id, scope,
         warnings, omitted, engram_ok,
@@ -926,8 +1152,10 @@ class ContextBuilder:
                     "reference_kind": "symbol",
                     "file_path": ref.file_path,
                     "qualified_name": ref.qualified_name or ref.symbol_name,
+                    "cbm_project_name": ref.cbm_project_name,
                 }
                 resolution, adapter_failed = self._resolve_focus(ref, warnings)
+                focus["resolution_state"] = resolution.state
                 if not adapter_failed:
                     self._resolution_warning(resolution, warnings)
                 code_ref_items.append(

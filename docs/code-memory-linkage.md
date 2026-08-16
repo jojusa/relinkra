@@ -147,3 +147,19 @@ the path and repository-identity layers), absolute/secret paths,
 traversal, env secrets (symbol fields pass through the R1C redactor),
 raw CBM cache paths (absolute → rejected), or source contents.
 Separators normalize cross-platform (`\` → `/`) before hashing.
+
+## Structural evidence
+
+The optional structural path is deliberately narrower than CBM itself:
+
+- architecture orientation uses the bounded `get_architecture` overview;
+- caller/dependency evidence uses bounded `trace_path` call relationships;
+- raw Cypher, graph schema, and unbounded graph responses never reach agents.
+
+Structural evidence is included in a ContextPacket only for deterministic
+architecture, impact, caller, dependency, path, or relationship requests.
+Each item is marked `source=cbm`, carries the logical Relinkra project id,
+graph freshness, and a coverage qualification. The graph may be incomplete,
+so an empty caller/dependency result is not a negative repository claim.
+CBM remains optional and native search and inspection remain authoritative
+fallback tools for the agent.

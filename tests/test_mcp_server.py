@@ -256,6 +256,8 @@ class SchemaTests(MCPTestCase):
                 "relinkra_memory_search",
                 "relinkra_memory_save",
                 "relinkra_code_resolve",
+                "relinkra_code_architecture",
+                "relinkra_code_relationships",
                 "relinkra_git_context",
                 "relinkra_handoff_create",
                 "relinkra_handoff_get",
@@ -450,6 +452,80 @@ class ArgumentValidationTests(MCPTestCase):
 
 class ToolBehaviourTests(MCPTestCase):
     workspace_root = "."
+
+    def test_structural_tools_degrade_without_cbm(self):
+        architecture = self.ok("relinkra_code_architecture")
+        self.assertFalse(architecture["available"])
+        self.assertTrue(architecture["advisory_only"])
+        self.assertTrue(architecture["native_tools_remain_available"])
+        self.assertEqual(architecture["freshness"]["state"], "unknown")
+
+        relationships = self.ok(
+            "relinkra_code_relationships", symbol="Target"
+        )
+        self.assertFalse(relationships["available"])
+        self.assertTrue(relationships["advisory_only"])
+        self.assertTrue(relationships["native_tools_remain_available"])
+        self.assertEqual(relationships["evidence"], None)
+
+    def test_structural_tool_surface_does_not_expose_cbm_schema(self):
+        for name in ("relinkra_code_architecture", "relinkra_code_relationships"):
+            tool = next(item for item in TOOLS if item["name"] == name)
+            rendered = json.dumps(tool, sort_keys=True).lower()
+            self.assertNotIn("cypher", rendered)
+            self.assertNotIn("trace_path", rendered)
+            self.assertNotIn("get_architecture", rendered)
+
+    def test_structural_tools_return_portable_high_level_evidence(self):
+        class StructuralCBM:
+            def code_evidence_authority(self):
+                return {
+                    "index_status": {"git": {"head_sha": "a" * 40}},
+                    "trust_stages": [{"name": "CBM graph", "status": "PASS"}],
+                }
+
+            def architecture_orientation(self, **kwargs):
+                return {
+                    "total_nodes": 2,
+                    "total_edges": 1,
+                    "layers": [{"layer": "api", "name": "routes", "reason": "entry"}],
+                }
+
+            def search_symbols(self, **kwargs):
+                return [{
+                    "qualified_name": "C-Desarrollos-relinkra-ws.src.Target",
+                    "relative_qualified_name": "src.Target",
+                }]
+
+            def trace_relationships(self, **kwargs):
+                return {
+                    "target": "src.Target",
+                    "direction": kwargs["direction"],
+                    "max_hops": kwargs["max_hops"],
+                    "relationships": [{
+                        "relationship": "caller",
+                        "name": "Caller",
+                        "qualified_name": "src.Caller",
+                        "hop": 1,
+                    }],
+                    "coverage": {
+                        "complete": False,
+                        "qualification": "bounded graph result may be incomplete",
+                    },
+                }
+
+        self.services.cbm_adapter = StructuralCBM()
+        architecture = self.ok("relinkra_code_architecture")
+        relationships = self.ok(
+            "relinkra_code_relationships", symbol="Target", direction="inbound"
+        )
+        self.assertTrue(architecture["available"])
+        self.assertTrue(relationships["available"])
+        self.assertEqual(relationships["evidence"]["relationships"][0]["relationship"], "caller")
+        rendered = json.dumps({"architecture": architecture, "relationships": relationships})
+        self.assertNotIn("C-Desarrollos-relinkra-ws", rendered)
+        self.assertNotIn("trace_path", rendered)
+        self.assertTrue(relationships["native_tools_remain_available"])
 
     def test_project_resolve(self):
         payload = self.ok("relinkra_project_resolve")

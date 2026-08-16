@@ -120,6 +120,25 @@ channels and exit codes) are encoded as tests in `tests/test_cbm_backend.py`:
 
 ## Known contract notes (0.9.0)
 
+### Optional structural evidence
+
+Relinkra can optionally use two read-only CBM 0.9.0 capabilities through its
+own high-level surfaces:
+
+- `relinkra_code_architecture` returns a compact orientation with aggregate
+  packages, layers, boundaries, hotspots, and language facts.
+- `relinkra_code_relationships` returns bounded callers or dependencies for a
+  selected symbol.
+
+These results are advisory and are bounded before they enter a ContextPacket.
+They carry the same graph freshness authority as focused code evidence. A
+stale graph is labelled stale; an unavailable, missing, untrusted, or
+unverifiable graph is omitted with a warning. An empty relationship result
+means that no relationship was found in the current indexed graph, not that
+the repository has no such relationship. Agents can always continue with
+native file search, symbol navigation, inspection, editing, testing, and
+validation. Relinkra does not expose CBM's raw Cypher or graph schema.
+
 - `--name` for `index_repository` does **not** fully override the derived
   project name - the recorded slug can keep a path-derived prefix (e.g.
   `home-user-projects-myrepo-myrepo`). Relinkra treats the CBM slug as

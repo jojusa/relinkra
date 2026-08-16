@@ -27,8 +27,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import __version__, cbm_support
-from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
-from .code_reference import CodeRefError
+from .cbm_adapter import (
+    ARCHITECTURE_MAX_LIMIT,
+    CBMAdapterError,
+    CBMCLIAdapter,
+    TRACE_MAX_DEPTH,
+    TRACE_MAX_LIMIT,
+)
+from .code_reference import CodeRefError, normalize_repo_path
 from .context_budget import (
     BudgetValidationError,
     apply_budget,
@@ -76,6 +82,7 @@ from .memory import (
     MemoryValidationError,
     sanitize_error,
 )
+from .linkage import LinkageService
 from .registry import DEFAULT_REGISTRY_PATH, Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
 
@@ -743,6 +750,167 @@ class RelinkraServices:
             "explainability": packet.explainability,
         })
 
+    def code_architecture(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> dict:
+        """Return compact optional architecture evidence, never raw CBM."""
+        project_id = self._resolve_project_id(project_id)
+        self._resolve_workspace_id(workspace_id)
+        normalized_path = None
+        if path:
+            try:
+                normalized_path = normalize_repo_path(path)
+            except CodeRefError as exc:
+                raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
+        result = LinkageService(self.memories, self.cbm_adapter).architecture_orientation(
+            path=normalized_path, limit=min(5, ARCHITECTURE_MAX_LIMIT)
+        )
+        return self._structural_response(
+            project_id, result, "architecture_fact", "architecture"
+        )
+
+    def code_relationships(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        symbol: str = "",
+        direction: str = "both",
+        max_hops: int = 2,
+        limit: int = 20,
+    ) -> dict:
+        """Return high-level callers/dependencies for one resolved symbol."""
+        project_id = self._resolve_project_id(project_id)
+        self._resolve_workspace_id(workspace_id)
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            raise ServiceError(ERR_INVALID_INPUT, "symbol is required")
+        direction = str(direction or "both").strip().lower()
+        if direction not in ("inbound", "outbound", "both"):
+            raise ServiceError(
+                ERR_INVALID_INPUT,
+                "direction must be inbound, outbound, or both",
+            )
+        if isinstance(max_hops, bool) or not isinstance(max_hops, int):
+            raise ServiceError(ERR_INVALID_INPUT, "max_hops must be an integer")
+        if not 1 <= max_hops <= TRACE_MAX_DEPTH:
+            raise ServiceError(
+                ERR_INVALID_INPUT,
+                f"max_hops must be between 1 and {TRACE_MAX_DEPTH}",
+            )
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ServiceError(ERR_INVALID_INPUT, "limit must be an integer")
+        if not 1 <= limit <= TRACE_MAX_LIMIT:
+            raise ServiceError(
+                ERR_INVALID_INPUT,
+                f"limit must be between 1 and {TRACE_MAX_LIMIT}",
+            )
+
+        linkage = LinkageService(self.memories, self.cbm_adapter)
+        authority = linkage.structural_evidence_authority()
+        if authority["freshness"]["state"] not in ("fresh", "stale"):
+            return self._structural_response(
+                project_id,
+                {
+                    "evidence": None,
+                    "freshness": authority["freshness"],
+                    "authority": authority["authority"],
+                    "warning": authority["freshness"]["reason"],
+                },
+                "bounded_path",
+                "relationships",
+            )
+        target, warning = self._resolve_structural_target(symbol)
+        if target is None:
+            return self._structural_response(
+                project_id,
+                {
+                    "evidence": None,
+                    "freshness": authority["freshness"],
+                    "authority": authority["authority"],
+                    "warning": warning,
+                },
+                "bounded_path",
+                "relationships",
+            )
+        result = linkage.trace_relationships(
+            function_name=target,
+            direction=direction,
+            max_hops=max_hops,
+            limit=limit,
+        )
+        return self._structural_response(
+            project_id, result, "bounded_path", "relationships"
+        )
+
+    def _resolve_structural_target(self, symbol: str):
+        if self.cbm_adapter is None:
+            return None, "optional CBM traversal is unavailable"
+        query = symbol.rsplit(".", 1)[-1] or symbol
+        try:
+            candidates = self.cbm_adapter.search_symbols(query=query, limit=10)
+        except Exception as exc:
+            return None, sanitize_wire_text(str(exc))
+        candidates = [c for c in candidates if isinstance(c, dict)]
+        exact = [
+            c
+            for c in candidates
+            if c.get("relative_qualified_name") == symbol
+            or c.get("qualified_name") == symbol
+        ]
+        if len(exact) == 1:
+            candidate = exact[0]
+        elif len(candidates) == 1:
+            candidate = candidates[0]
+        elif not candidates:
+            return None, (
+                "symbol was not resolved in the current graph; native symbol "
+                "navigation remains available"
+            )
+        else:
+            return None, (
+                "symbol is ambiguous in the current graph; use native symbol "
+                "navigation to choose the intended target"
+            )
+        qualified_name = str(candidate.get("qualified_name") or "").strip()
+        if not qualified_name:
+            return None, "resolved symbol had no usable graph identity"
+        return qualified_name, None
+
+    @staticmethod
+    def _structural_response(
+        project_id: str, result: dict, kind: str, label: str
+    ) -> dict:
+        warnings = []
+        if result.get("warning"):
+            warnings.append(
+                ServiceWarning(
+                    "cbm_structural_unavailable", result["warning"]
+                ).to_dict()
+            )
+        evidence = result.get("evidence")
+        payload = {
+            "project_id": project_id,
+            "available": evidence is not None,
+            "evidence_kind": kind,
+            "freshness": result.get("freshness") or {
+                "state": "unknown",
+                "reason": "graph freshness was not provided",
+            },
+            "authority": result.get("authority") or {},
+            "evidence": evidence,
+            "warnings": warnings,
+            "advisory_only": True,
+            "native_tools_remain_available": True,
+        }
+        if evidence is not None:
+            payload["evidence"] = dict(evidence)
+        return strip_portable_cbm_labels(payload)
+
     def git_context(
         self,
         *,
@@ -1111,6 +1279,11 @@ class RelinkraServices:
                 "handoffs": engram.available,
                 "code_resolution": cbm.available,
                 "git_intelligence": git.available,
+                # The generic deep probe only executes search_graph. The
+                # structural operations remain configured-but-unchecked
+                # until a capability-specific probe exists.
+                "code_architecture": False,
+                "code_relationships": False,
                 # Deliberate, permanent absences — not degradations.
                 "agent_private_access": False,
                 "git_write": False,
@@ -1128,6 +1301,11 @@ class RelinkraServices:
                     ("git_intelligence", git),
                 )
                 if not probe.checked
+            )
+            + sorted(
+                name
+                for name in ("code_architecture", "code_relationships")
+                if self.cbm_adapter is not None
             ),
             # Boolean, never the path itself.
             "workspace_root_configured": bool(self.config.workspace_root),

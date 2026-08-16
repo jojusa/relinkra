@@ -537,7 +537,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         client = self._spawn()
         self._handshake(client)
         tools = client.request("tools/list")["result"]["tools"]
-        self.assertEqual(len(tools), 9)
+        self.assertEqual(len(tools), 11)
         health = client.request(
             "tools/call",
             {"name": "relinkra_health", "arguments": {}},
@@ -571,7 +571,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         # The very next request must be served normally.
         self.assertEqual(client.request("ping")["result"], {})
         self.assertEqual(
-            len(client.request("tools/list")["result"]["tools"]), 9
+            len(client.request("tools/list")["result"]["tools"]), 11
         )
 
     def test_oversized_request_is_rejected_and_session_survives(self):
@@ -608,7 +608,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         # The session continues normally.
         self.assertEqual(client.request("ping")["result"], {})
         self.assertEqual(
-            len(client.request("tools/list")["result"]["tools"]), 9
+            len(client.request("tools/list")["result"]["tools"]), 11
         )
 
     def test_server_survives_a_long_mixed_sequence(self):
@@ -621,7 +621,7 @@ class ProcessLifecycleTests(unittest.TestCase):
             bad = client.request("no/such/method")
             self.assertEqual(bad["error"]["code"], -32601)
         self.assertEqual(
-            len(client.request("tools/list")["result"]["tools"]), 9
+            len(client.request("tools/list")["result"]["tools"]), 11
         )
 
     def test_repeated_start_stop_leaves_no_process_behind(self):

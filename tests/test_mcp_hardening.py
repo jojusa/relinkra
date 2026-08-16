@@ -275,7 +275,7 @@ class PortableWireAuditTests(HardeningTestCase):
         return {k: v for k, v in values.items() if v}
 
     def _all_tool_outputs(self):
-        """Invoke all nine tools and return {tool_name: response}."""
+        """Invoke every tool and return {tool_name: response}."""
         handoff = self.ok(
             "relinkra_handoff_create",
             source_agent="opencode",
@@ -305,6 +305,12 @@ class PortableWireAuditTests(HardeningTestCase):
             ),
             "relinkra_code_resolve": self.ok(
                 "relinkra_code_resolve", file="src/audit.py"
+            ),
+            "relinkra_code_architecture": self.ok(
+                "relinkra_code_architecture"
+            ),
+            "relinkra_code_relationships": self.ok(
+                "relinkra_code_relationships", symbol="audit"
             ),
             "relinkra_git_context": self.ok("relinkra_git_context"),
             "relinkra_handoff_create": self.ok(

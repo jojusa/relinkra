@@ -245,6 +245,60 @@ TOOLS: List[dict] = [
         },
     },
     {
+        "name": "relinkra_code_architecture",
+        "logical_name": "relinkra.code.architecture",
+        "description": (
+            "Return a compact, advisory architecture orientation for the "
+            "registered project: packages, layers, boundaries, hotspots, "
+            "and related aggregate facts. CBM is optional and native file "
+            "and symbol exploration remains available."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID,
+                "workspace_id": _WORKSPACE_ID,
+                "path": _string("Optional repo-relative directory prefix."),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "relinkra_code_relationships",
+        "logical_name": "relinkra.code.relationships",
+        "description": (
+            "Return bounded advisory caller/dependency relationships for a "
+            "symbol. Results may be incomplete; an empty result is not a "
+            "claim that no relationship exists."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID,
+                "workspace_id": _WORKSPACE_ID,
+                "symbol": _string("Symbol or qualified symbol name."),
+                "direction": _string(
+                    "Relationship direction.",
+                    enum=["inbound", "outbound", "both"],
+                ),
+                "max_hops": {
+                    "type": "integer",
+                    "description": "Maximum graph hops (1-3; default 2).",
+                    "minimum": 1,
+                    "maximum": 3,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum relationships (1-50; default 20).",
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "relinkra_git_context",
         "logical_name": "relinkra.git.context",
         "description": (
@@ -497,6 +551,8 @@ class MCPServer:
             "relinkra_memory_search": self.services.memory_search,
             "relinkra_memory_save": self.services.memory_save,
             "relinkra_code_resolve": self.services.code_resolve,
+            "relinkra_code_architecture": self.services.code_architecture,
+            "relinkra_code_relationships": self.services.code_relationships,
             "relinkra_git_context": self.services.git_context,
             "relinkra_handoff_create": self.services.handoff_create,
             "relinkra_handoff_get": self.services.handoff_get,

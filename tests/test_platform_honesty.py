@@ -36,6 +36,8 @@ EXPECTED_MCP_TOOLS = {
     "relinkra_memory_search",
     "relinkra_memory_save",
     "relinkra_code_resolve",
+    "relinkra_code_architecture",
+    "relinkra_code_relationships",
     "relinkra_git_context",
     "relinkra_handoff_create",
     "relinkra_handoff_get",
