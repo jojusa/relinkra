@@ -820,50 +820,22 @@ class AgentInstruction:
         }
 
 
+AGENT_GUIDANCE = (
+    "Relinkra is the shared project context layer. Use it when prior project "
+    "memory or handoff continuity, architecture orientation, callers, "
+    "dependencies, impact, Git context, or bounded context selection can "
+    "reduce redundant exploration. Do not use it blindly for trivial tasks. "
+    "Preserve native search, read, edit, test, and verification tools; verify "
+    "current source evidence. Relinkra context is advisory: stale evidence "
+    "is not authoritative."
+)
+
 AGENT_INSTRUCTIONS: Tuple[AgentInstruction, ...] = (
     AgentInstruction(
-        "context_via_relinkra",
-        "Use Relinkra for project context.",
-        "Relinkra composes identity, relevance, budget, memory and Git facts "
-        "into one packet; a raw backend returns fragments of that.",
-    ),
-    AgentInstruction(
-        "memory_via_relinkra",
-        "Use Relinkra for memory search, memory save and handoffs.",
-        "Handoffs must be readable by an agent that has never run this "
-        "workflow, which is what the portable envelope guarantees.",
-    ),
-    AgentInstruction(
-        "no_direct_cbm",
-        "Do not query CBM directly for ordinary project work.",
-        "CBM is Relinkra's private backend. A direct call skips relevance "
-        "ranking, budgeting, memory linkage and attribution.",
-    ),
-    AgentInstruction(
-        "engram_only_for_gentleman",
-        "Use Engram directly only when a Gentleman workflow explicitly "
-        "requires it.",
-        "SDD workflow state, reviews and receipts belong to Gentleman; "
-        "everything agent-neutral belongs to Relinkra.",
-    ),
-    AgentInstruction(
-        "no_double_memory_read",
-        "Do not query both Relinkra and Engram for the same project-memory "
-        "need.",
-        "One need, one authority. Two reads cost tokens twice and can "
-        "return two versions of the same record.",
-    ),
-    AgentInstruction(
-        "report_degraded_health",
-        "Report degraded Relinkra health rather than silently bypassing it.",
-        "A silent fallback turns a fixable outage into an invisible one, and "
-        "makes every later metric unattributable.",
-    ),
-    AgentInstruction(
-        "preserve_unknown_servers",
-        "Leave MCP servers you do not recognise alone.",
-        "Relinkra classifies registrations; it never disables what it did "
-        "not install.",
+        "when_relinkra_helps",
+        AGENT_GUIDANCE,
+        "A compact host-neutral rule improves tool discoverability without "
+        "forcing every request through Relinkra or replacing native tools.",
     ),
 )
 
@@ -1009,6 +981,7 @@ __all__ = [
     "ENGRAM_UNAVAILABLE",
     "ENGRAM_UNKNOWN",
     "INSTRUCTION_VERSION",
+    "AGENT_GUIDANCE",
     "MANAGED_MODE_REQUIREMENTS",
     "METRICS_TRUST_STATES",
     "OBSERVABILITY_HOST_CONFIG",

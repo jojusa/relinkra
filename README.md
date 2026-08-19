@@ -40,6 +40,18 @@ relinkra init        # registers this project and workspace
 relinkra doctor      # deep diagnostics with suggested fixes
 ```
 
+If the optional CBM backend is installed, build and maintain its index with
+the real commands below:
+
+```text
+relinkra cbm index
+relinkra cbm status
+relinkra cbm refresh
+```
+
+There is no `relinkra cbm setup` command in this release. CBM remains
+optional; native agent tools continue to work without it.
+
 Connect your agent host (example: `claude`; run `relinkra connect list` to see every supported host):
 
 ```bash
@@ -49,6 +61,12 @@ relinkra connect check claude     # confirms the registration is valid
 ```
 
 Restart the agent, and it launches Relinkra as its MCP (Model Context Protocol) server. Optionally, once you have used it from the real host, record the proof with `relinkra connect verify claude --proof <file>`.
+
+Once the connector is configured, ask normal project questions. You should
+not normally need to say "use Relinkra": the MCP server advertises when its
+shared context, memory, architecture, relationship, Git, or bounded-packet
+tools can reduce redundant exploration. It does not force those tools for
+trivial work, replace native tools, or make stale context authoritative.
 
 ## What just happened?
 

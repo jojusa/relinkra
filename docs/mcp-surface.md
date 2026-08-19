@@ -185,11 +185,12 @@ absences, not degradations.
 
 `capabilities_unchecked` names any capability whose backing component was
 **not** liveness-probed on this call, so a caller can tell "verified
-working" from "configured, unverified". Today that is `code_resolution`
-when a CBM binary is configured: probing the code indexer on every status
-request would be too expensive, so it is advertised and labelled rather
-than silently implying verification. A component known to be absent is a
-checked negative, not an unchecked one.
+working" from "configured, unverified". The health payload also exposes
+`components.*.state` and `capability_states`: `unprobed` is distinct from
+`available` and `unavailable`. An unprobed capability is represented as
+`null`, not a false negative; a component known to be absent is a checked
+`unavailable` result. Health never turns an unprobed capability into a false
+PASS.
 
 ## Security properties
 
@@ -277,6 +278,16 @@ Tools then appear as `mcp__relinkra__relinkra_context_get`, etc.
 command = "python"
 args = ["-m", "relinkra.mcp_cli", "--workspace-root", "."]
 ```
+
+### Agent guidance
+
+The MCP `initialize` response includes one compact, host-neutral guidance
+string from Relinkra's central policy. It explains when project memory,
+handoffs, architecture, relationships, Git context, or a bounded context
+packet can reduce redundant exploration. It preserves native tools and
+current-source verification, and treats stale context as advisory rather
+than authoritative. Connectors register the transport only; they do not
+write per-host `AGENTS.md`, `CLAUDE.md`, or Devin instruction files.
 
 A minimal hand-rolled client is also enough — write one JSON object per
 line to stdin and read one per line from stdout. `tests/test_mcp_proof.py`

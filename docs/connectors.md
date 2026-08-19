@@ -147,7 +147,7 @@ connector; they do not create separate proof identities or writable targets.
 Bare `devin` remains ambiguous with the distinct, unsupported `devin-cloud`
 connector. Devin Cloud is outside the scope of R4C.1E.
 
-R4C.1E verified a real Devin Desktop/Cascade launch, the expected nine-tool
+R4C.1E verified a real Devin Desktop/Cascade launch, the expected eleven-tool
 Relinkra roster, six successful tool calls, project binding, handoff retrieval,
 and an explicit null `workspace_id`. The evidence is local-operational and
 does not independently attest the host. Doctor trust may therefore remain

@@ -83,6 +83,26 @@ contract id). Doctor's CBM trust ladder reads it — update both together.
 Binary resolution order at runtime: `RELINKRA_CBM_BIN` → managed
 `.codebase-memory/bin/` → `PATH`.
 
+### MUST-BEFORE-FINAL-0.1.0 follow-up: managed acquisition/discovery
+
+Keep acquisition separate from R5G.6. The bounded follow-up should make the
+Relinkra MCP/service discover a version-pinned, checksum-verified CBM release
+in the workspace-managed location before constructing the adapter:
+
+1. `relinkra cbm acquire` resolves the certified platform asset, verifies
+   its published digest, and installs only under `.codebase-memory/bin/`.
+2. Adapter startup resolves `managed binary → PATH` and records the selected
+   source, version, and digest in the existing registry; an explicit
+   `RELINKRA_CBM_BIN` remains an operator override for compatibility.
+3. Acquisition never writes host configs, agent instruction files, or global
+   state. Offline, unsupported, or failed verification remains optional
+   degradation, never a silent unverified binary.
+
+Acceptance is one managed fresh-project proof plus regression coverage for
+asset selection, checksum failure, override precedence, offline degradation,
+and unchanged connector behavior. No host should store its own CBM path as
+the product's authority.
+
 ## Upgrade detection and adoption
 
 - Doctor reports **certified / supported-uncertified / unsupported /

@@ -33,6 +33,7 @@ from .memory import MemoryStoreError, sanitize_error
 ENGRAM_BIN = "engram"
 DEFAULT_ENGRAM_URL = "http://127.0.0.1:7437"
 ENGRAM_URL_ENV = "ENGRAM_URL"
+ENGRAM_DATA_DIR_ENV = "ENGRAM_DATA_DIR"
 
 
 @dataclass
@@ -180,8 +181,11 @@ class EngramCLIAdapter:
     ~300 chars and breaks envelope parsing). If HTTP is unavailable the
     adapter falls back to ``engram search``.
 
-    The HTTP base URL comes from ``http_url``, else the ``ENGRAM_URL``
-    env var, else ``http://127.0.0.1:7437``. Pass ``http_url=""`` (or set
+    The HTTP base URL comes from explicit ``http_url`` first, then the
+    ``ENGRAM_URL`` env var. When a non-empty ``ENGRAM_DATA_DIR`` is set
+    without an explicit URL, HTTP is disabled so an isolated CLI process
+    cannot silently read the default shared server. Otherwise the default
+    is ``http://127.0.0.1:7437``. Pass ``http_url=""`` (or set
     ``ENGRAM_URL=""``) to disable HTTP and force the CLI path.
 
     ``project_alias`` (optional) rewrites ONLY the physical project filter
@@ -204,7 +208,12 @@ class EngramCLIAdapter:
         self.engram_bin = engram_bin
         self.timeout = timeout
         if http_url is None:
-            http_url = os.environ.get(ENGRAM_URL_ENV, DEFAULT_ENGRAM_URL)
+            if ENGRAM_URL_ENV in os.environ:
+                http_url = os.environ[ENGRAM_URL_ENV]
+            elif os.environ.get(ENGRAM_DATA_DIR_ENV):
+                http_url = ""
+            else:
+                http_url = DEFAULT_ENGRAM_URL
         self.http_url = (http_url or "").rstrip("/")
         self.http_timeout = http_timeout
         self.project_alias = (project_alias or "").strip() or None

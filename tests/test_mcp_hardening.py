@@ -4,7 +4,7 @@ Offline and deterministic. Covers the areas R3 left unproven for
 long-running real-agent usage: JSON-RPC contract edges, recovery after a
 component comes back, concurrent handoff idempotency, reachability of
 handoffs past one store page, a systematic portable-wire audit of all
-nine tools, and capability honesty.
+eleven tools, and capability honesty.
 
 Live process lifecycle (disconnect, EOF, broken pipe, restart) is proven
 against real subprocesses in test_mcp_proof.py.
@@ -572,17 +572,15 @@ class CapabilityHonestyTests(HardeningTestCase):
         self.assertNotIn("code_resolution", health["capabilities_unchecked"])
 
     def test_configured_but_unprobed_component_is_named_unchecked(self):
-        """A configured CBM is not advertised as callable.
-
-        Liveness-probing the code indexer on every health call would be
-        too expensive, so the capability is reported as unavailable,
-        checked=False, and listed as unchecked rather than implying
-        verification.
-        """
+        """A configured CBM is represented as unprobed, not unavailable."""
         self.services.cbm_adapter = object()
         health = self.ok("relinkra_health")
-        self.assertFalse(health["capabilities"]["code_resolution"])
+        self.assertIsNone(health["capabilities"]["code_resolution"])
         self.assertFalse(health["components"]["cbm"]["checked"])
+        self.assertEqual(health["components"]["cbm"]["state"], "unprobed")
+        self.assertEqual(health["capability_states"]["code_resolution"], "unprobed")
+        self.assertIsNone(health["capabilities"]["code_architecture"])
+        self.assertIsNone(health["capabilities"]["code_relationships"])
         self.assertIn("code_resolution", health["capabilities_unchecked"])
         # Liveness-probed components are never listed as unchecked.
         self.assertNotIn("memory_write", health["capabilities_unchecked"])

@@ -467,17 +467,10 @@ class AgentContractTests(unittest.TestCase):
 
     def test_every_required_instruction_is_present(self):
         ids = {item.instruction_id for item in AGENT_INSTRUCTIONS}
-        self.assertLessEqual(
-            {
-                "context_via_relinkra",
-                "memory_via_relinkra",
-                "no_direct_cbm",
-                "engram_only_for_gentleman",
-                "no_double_memory_read",
-                "report_degraded_health",
-            },
-            ids,
-        )
+        self.assertEqual(ids, {"when_relinkra_helps"})
+        text = AGENT_INSTRUCTIONS[0].text.lower()
+        for phrase in ("shared project context layer", "trivial tasks", "native", "stale"):
+            self.assertIn(phrase, text)
 
     def test_every_instruction_carries_a_rationale(self):
         for item in AGENT_INSTRUCTIONS:

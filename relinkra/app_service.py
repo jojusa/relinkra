@@ -162,14 +162,23 @@ class ServiceConfig:
 class _Probe:
     """Availability of one underlying engine."""
 
-    available: bool
+    available: Optional[bool]
     detail: str = ""
     checked: bool = True
+    state: Optional[str] = None
+
+    def resolved_state(self) -> str:
+        if self.state:
+            return self.state
+        if not self.checked:
+            return "unprobed"
+        return "available" if self.available else "unavailable"
 
     def to_dict(self) -> dict:
         return {
             "available": self.available,
             "checked": self.checked,
+            "state": self.resolved_state(),
             "detail": sanitize_wire_text(self.detail),
         }
 
@@ -1216,7 +1225,7 @@ class RelinkraServices:
                 ("cbm", cbm),
                 ("git", git),
             )
-            if not probe.available
+            if probe.resolved_state() in {"unavailable", "stale", "degraded"}
         ]
         if self._registry_error or self.registry is None:
             degraded.append("registry")
@@ -1277,16 +1286,37 @@ class RelinkraServices:
                 "memory_read": engram.available,
                 "memory_write": engram.available,
                 "handoffs": engram.available,
-                "code_resolution": cbm.available,
+                "code_resolution": cbm.available if cbm.checked else None,
                 "git_intelligence": git.available,
-                # The generic deep probe only executes search_graph. The
-                # structural operations remain configured-but-unchecked
-                # until a capability-specific probe exists.
-                "code_architecture": False,
-                "code_relationships": False,
+                # The generic deep probe proves the code index route, but
+                # not each structural operation independently. Null means
+                # unprobed, never a false negative.
+                "code_architecture": (
+                    None if cbm.resolved_state() == "unprobed" else cbm.available
+                ),
+                "code_relationships": (
+                    None if cbm.resolved_state() == "unprobed" else cbm.available
+                ),
                 # Deliberate, permanent absences — not degradations.
                 "agent_private_access": False,
                 "git_write": False,
+            },
+            "capability_states": {
+                "memory_read": engram.resolved_state(),
+                "memory_write": engram.resolved_state(),
+                "handoffs": engram.resolved_state(),
+                "code_resolution": cbm.resolved_state(),
+                "code_architecture": (
+                    "unavailable"
+                    if cbm.resolved_state() == "unavailable"
+                    else "unprobed"
+                ),
+                "code_relationships": (
+                    "unavailable"
+                    if cbm.resolved_state() == "unavailable"
+                    else "unprobed"
+                ),
+                "git_intelligence": git.resolved_state(),
             },
             # Capabilities whose backing component was NOT liveness-probed
             # this call. Listed explicitly so a caller can tell "verified
@@ -1401,9 +1431,10 @@ class RelinkraServices:
             )
         if not deep:
             return _Probe(
-                available=False,
+                available=None,
                 checked=False,
                 detail="configured; not liveness-checked",
+                state="unprobed",
             )
         cached = getattr(self, "_deep_cbm_probe", None)
         now = time.monotonic()

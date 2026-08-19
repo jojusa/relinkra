@@ -36,6 +36,7 @@ from .app_service import (
     RelinkraServices,
     ServiceError,
 )
+from .backend_policy import agent_instruction_text
 
 SERVER_NAME = "relinkra"
 
@@ -82,8 +83,9 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.project.resolve",
         "description": (
             "Resolve the logical Relinkra project identity for this server, "
-            "including repository identity and the active workspace. Call "
-            "this first: every other tool is scoped to a project_id."
+            "including repository identity and the active workspace. Use "
+            "when the project or workspace is ambiguous; other tools are "
+            "scoped to the resolved project_id."
         ),
         "inputSchema": {
             "type": "object",
@@ -101,8 +103,9 @@ TOOLS: List[dict] = [
             "Get a deterministic Project Context Packet: logical identity, "
             "active shared memories, memory-code links, code facts, git "
             "intelligence, pending work, and relevant handoffs — ranked by "
-            "relevance and bounded by a token budget. This is the main "
-            "entry point for starting work on a project."
+            "relevance and bounded by a token budget. Use when project "
+            "history, orientation, or a bounded investigation can reduce "
+            "redundant exploration; it is not required for trivial edits."
         ),
         "inputSchema": {
             "type": "object",
@@ -144,8 +147,9 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.memory.search",
         "description": (
             "Search shared project memory (decisions, constraints, "
-            "discoveries, bugs, pending work, handoffs). Agent-private "
-            "memory is never returned through this surface."
+            "discoveries, bugs, pending work, handoffs). Use when prior "
+            "decisions or continuity may affect the current task. "
+            "Agent-private memory is never returned through this surface."
         ),
         "inputSchema": {
             "type": "object",
@@ -186,8 +190,9 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.memory.save",
         "description": (
             "Save a project memory (decision, constraint, discovery, bug, "
-            "architecture note, pending work). Deduplicated and "
-            "superseded automatically by the Relinkra memory policy."
+            "architecture note, pending work). Use for durable project "
+            "decisions or handoff-relevant discoveries, not transient notes. "
+            "Deduplication and supersession follow Relinkra policy."
         ),
         "inputSchema": {
             "type": "object",
@@ -230,8 +235,9 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.code.resolve",
         "description": (
             "Resolve a file or symbol to a portable code reference plus any "
-            "memories linked to it. Degrades to an unresolved reference "
-            "with a warning when the code index is unavailable."
+            "memories linked to it. Use when a stable file/symbol identity or "
+            "linked project context is useful. Degrades to an unresolved "
+            "reference with a warning when the code index is unavailable."
         ),
         "inputSchema": {
             "type": "object",
@@ -250,8 +256,9 @@ TOOLS: List[dict] = [
         "description": (
             "Return a compact, advisory architecture orientation for the "
             "registered project: packages, layers, boundaries, hotspots, "
-            "and related aggregate facts. CBM is optional and native file "
-            "and symbol exploration remains available."
+            "and related aggregate facts. Use to orient a structural change "
+            "before deeper exploration. CBM is optional; native file and "
+            "symbol exploration remains available."
         ),
         "inputSchema": {
             "type": "object",
@@ -268,7 +275,8 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.code.relationships",
         "description": (
             "Return bounded advisory caller/dependency relationships for a "
-            "symbol. Results may be incomplete; an empty result is not a "
+            "symbol. Use when callers, dependencies, or impact matter to a "
+            "change. Results may be incomplete; an empty result is not a "
             "claim that no relationship exists."
         ),
         "inputSchema": {
@@ -304,7 +312,8 @@ TOOLS: List[dict] = [
         "description": (
             "Read-only git intelligence for the configured workspace: "
             "repository state, HEAD facts, recent commits, working diff, "
-            "and optional per-file history. Never mutates the repository."
+            "and optional per-file history. Use when current state or history "
+            "can prevent redundant investigation. Never mutates the repository."
         ),
         "inputSchema": {
             "type": "object",
@@ -331,8 +340,9 @@ TOOLS: List[dict] = [
         "description": (
             "Record a cross-agent handoff: what the task was, what is done, "
             "what is pending, decisions, warnings, and the git state. "
-            "Shared with every agent on the project and readable by name "
-            "from any other agent or workspace."
+            "Use when another agent may continue the work. It is shared with "
+            "every agent on the project and readable by name from any other "
+            "agent or workspace."
         ),
         "inputSchema": {
             "type": "object",
@@ -381,7 +391,8 @@ TOOLS: List[dict] = [
         "logical_name": "relinkra.handoff.get",
         "description": (
             "Fetch one handoff by id, or list the most recent handoffs for "
-            "the project. Use target_agent to find work left for you."
+            "the project. Use when resuming prior work; target_agent finds "
+            "work left for you."
         ),
         "inputSchema": {
             "type": "object",
@@ -410,7 +421,9 @@ TOOLS: List[dict] = [
         "description": (
             "Report Relinkra version and schema contract, project "
             "resolution status, availability of Engram / code index / git, "
-            "degraded components, and supported capabilities."
+            "degraded components, capability states, and supported "
+            "capabilities. Use to diagnose optional-backend availability, not "
+            "as proof that current source is correct."
         ),
         "inputSchema": {
             "type": "object",
@@ -571,6 +584,7 @@ class MCPServer:
         return {
             "protocolVersion": self.protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
+            "instructions": agent_instruction_text(),
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": __version__,

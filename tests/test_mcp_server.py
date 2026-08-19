@@ -332,6 +332,20 @@ class ProtocolTests(MCPTestCase):
         )
         self.assertIn("tools", result["capabilities"])
 
+    def test_initialize_advertises_compact_project_guidance(self):
+        instructions = self.rpc("initialize", {})["result"]["instructions"]
+        self.assertIn("shared project context layer", instructions)
+        self.assertIn("trivial tasks", instructions)
+        self.assertIn("native", instructions)
+        self.assertIn("stale", instructions)
+
+    def test_tool_descriptions_include_when_useful_cues(self):
+        descriptions = {tool["name"]: tool["description"] for tool in TOOLS}
+        self.assertIn("when project history", descriptions["relinkra_context_get"])
+        self.assertIn("prior decisions", descriptions["relinkra_memory_search"])
+        self.assertIn("callers", descriptions["relinkra_code_relationships"])
+        self.assertIn("current state", descriptions["relinkra_git_context"])
+
     def test_ping(self):
         self.assertEqual(self.rpc("ping")["result"], {})
 

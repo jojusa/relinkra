@@ -381,18 +381,19 @@ gets quoted as evidence — so no metric ever gets one it did not earn.
 
 ## 9. Agent instruction contract
 
-A host-neutral contract, available as structured connector metadata for a
-future `relinkra connect <agent>`. **It is not written to any host
-configuration in this phase**, and the emitted document says so
-(`written_to_host: false`).
+A host-neutral contract is available as structured connector metadata and is
+also emitted through the MCP `initialize.instructions` field. Connectors
+still write transport registration only; the emitted document remains marked
+`written_to_host: false` so Relinkra does not silently overwrite host
+instruction files.
 
-- Use Relinkra for project context.
-- Use Relinkra for memory search, memory save and handoffs.
-- Do not query CBM directly for ordinary project work.
-- Use Engram directly only when a Gentleman workflow explicitly requires it.
-- Do not query both Relinkra and Engram for the same project-memory need.
-- Report degraded Relinkra health rather than silently bypassing it.
-- Leave MCP servers you do not recognise alone.
+Relinkra is the shared project context layer. Agents should use it when
+project memory or handoff continuity, architecture orientation,
+callers/dependencies/impact, Git context, or bounded context selection can
+reduce redundant exploration. It should not be used blindly for trivial
+tasks. Native search, read, edit, test, and verification remain available;
+current source evidence wins, and stale context is advisory rather than
+authoritative.
 
 ---
 

@@ -158,8 +158,10 @@ skipped (counted in `skipped_malformed`). Resolution: reads try the
 local **Engram HTTP API** first, an *optional read path on the same
 physical backend*:
 
-- Base URL: `ENGRAM_URL` env var, default `http://127.0.0.1:7437`
-  (set `ENGRAM_URL=""` to disable HTTP entirely).
+- Base URL precedence is explicit `http_url`, then `ENGRAM_URL` (including an
+  empty value), then a non-empty `ENGRAM_DATA_DIR` safety mode that disables
+  HTTP, then the default `http://127.0.0.1:7437`. Set `ENGRAM_URL=""` to
+  disable HTTP explicitly.
 - `GET /search?q=<query>&project=<project>` returns a JSON array with
   **full untruncated `content`**; `GET /observations/{id}` returns a
   full record. Both are read-only and safe.

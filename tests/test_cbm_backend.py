@@ -1641,11 +1641,17 @@ class TestDeepHealth(unittest.TestCase):
 
     def test_shallow_health_is_config_only(self):
         services = _services_with(_ServiceFakeAdapter())
-        cbm = services.health()["components"]["cbm"]
+        health = services.health()
+        cbm = health["components"]["cbm"]
         # Configuration alone is not a callable-backend proof and must not
-        # advertise code resolution as available.
-        self.assertFalse(cbm["available"])
+        # advertise a confirmed negative merely because it was not probed.
+        self.assertIsNone(cbm["available"])
         self.assertFalse(cbm["checked"])
+        self.assertEqual(cbm["state"], "unprobed")
+        self.assertIsNone(health["capabilities"]["code_resolution"])
+        self.assertIsNone(health["capabilities"]["code_architecture"])
+        self.assertIsNone(health["capabilities"]["code_relationships"])
+        self.assertEqual(health["capability_states"]["code_architecture"], "unprobed")
         self.assertIn("configured", cbm["detail"])
 
     def test_deep_health_runs_real_query(self):

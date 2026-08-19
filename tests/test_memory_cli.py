@@ -328,6 +328,22 @@ class TestEngramHTTPReadPath(unittest.TestCase):
         )
         with mock.patch.dict(os.environ, {"ENGRAM_URL": "http://y:2"}):
             self.assertEqual(EngramCLIAdapter().http_url, "http://y:2")
+            self.assertEqual(EngramCLIAdapter(http_url="").http_url, "")
+        with mock.patch.dict(
+            os.environ,
+            {"ENGRAM_DATA_DIR": "C:/isolated-engram"},
+            clear=True,
+        ):
+            self.assertEqual(EngramCLIAdapter().http_url, "")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ENGRAM_DATA_DIR": "C:/isolated-engram",
+                "ENGRAM_URL": "http://explicit:7437",
+            },
+            clear=True,
+        ):
+            self.assertEqual(EngramCLIAdapter().http_url, "http://explicit:7437")
         with mock.patch.dict(os.environ, {}, clear=True):
             os.environ.pop("ENGRAM_URL", None)
             self.assertEqual(EngramCLIAdapter().http_url, DEFAULT_ENGRAM_URL)
