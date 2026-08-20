@@ -363,18 +363,18 @@ class LiveMCPProofTests(unittest.TestCase):
 
         tools = agent_a.request("tools/list")["result"]["tools"]
         self.assertIn(
-            "relinkra_handoff_create", {tool["name"] for tool in tools}
+            "handoff_create", {tool["name"] for tool in tools}
         )
 
-        resolved_a = agent_a.call_tool("relinkra_project_resolve")
+        resolved_a = agent_a.call_tool("project_resolve")
         self.assertEqual(resolved_a["project_id"], self.project_id)
 
-        health = agent_a.call_tool("relinkra_health")
+        health = agent_a.call_tool("health")
         self.assertTrue(health["components"]["git"]["available"])
         self.assertTrue(health["components"]["engram"]["available"])
 
         created = agent_a.call_tool(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="Prove the Relinkra MCP surface end to end",
@@ -396,7 +396,7 @@ class LiveMCPProofTests(unittest.TestCase):
         # --- agent B: an independent second process ------------------------
         agent_b = self._client()
 
-        resolved_b = agent_b.call_tool("relinkra_project_resolve")
+        resolved_b = agent_b.call_tool("project_resolve")
         self.assertEqual(
             resolved_b["project_id"],
             resolved_a["project_id"],
@@ -404,7 +404,7 @@ class LiveMCPProofTests(unittest.TestCase):
         )
 
         fetched = agent_b.call_tool(
-            "relinkra_handoff_get", handoff_id=handoff_id
+            "handoff_get", handoff_id=handoff_id
         )["handoff"]
         self.assertEqual(fetched["handoff_id"], handoff_id)
         self.assertEqual(fetched["source_agent"], "opencode")
@@ -418,7 +418,7 @@ class LiveMCPProofTests(unittest.TestCase):
                          created["git_state"]["head_sha"])
 
         inbox = agent_b.call_tool(
-            "relinkra_handoff_get", target_agent="claude"
+            "handoff_get", target_agent="claude"
         )
         self.assertIn(
             handoff_id, [h["handoff_id"] for h in inbox["handoffs"]]
@@ -426,7 +426,7 @@ class LiveMCPProofTests(unittest.TestCase):
 
         # --- context for the same project, from agent B --------------------
         context = agent_b.call_tool(
-            "relinkra_context_get",
+            "context_get",
             task="Prove the Relinkra MCP surface end to end",
             include_git=True,
             budget="medium",
@@ -480,7 +480,7 @@ class LiveMCPProofTests(unittest.TestCase):
 
         bad_args = client.request(
             "tools/call",
-            {"name": "relinkra_health", "arguments": {"drop": "tables"}},
+            {"name": "health", "arguments": {"drop": "tables"}},
         )
         self.assertEqual(bad_args["error"]["code"], -32602)
 
@@ -540,7 +540,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(len(tools), 11)
         health = client.request(
             "tools/call",
-            {"name": "relinkra_health", "arguments": {}},
+            {"name": "health", "arguments": {}},
         )["result"]
         self.assertIn("content", health)
 

@@ -31,16 +31,16 @@ from relinkra.host_discovery import (
 NON_WINDOWS_TAGS = ("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64")
 
 EXPECTED_MCP_TOOLS = {
-    "relinkra_project_resolve",
-    "relinkra_context_get",
-    "relinkra_memory_search",
-    "relinkra_memory_save",
-    "relinkra_code_resolve",
-    "relinkra_code_architecture",
-    "relinkra_code_relationships",
-    "relinkra_git_context",
-    "relinkra_handoff_create",
-    "relinkra_handoff_get",
+    "project_resolve",
+    "context_get",
+    "memory_search",
+    "memory_save",
+    "code_resolve",
+    "code_architecture",
+    "code_relationships",
+    "git_context",
+    "handoff_create",
+    "handoff_get",
 }
 
 
@@ -114,11 +114,11 @@ class WindowsPinGuardTests(unittest.TestCase):
 
 class McpSurfaceHonestyTests(unittest.TestCase):
     def test_tool_roster_is_the_documented_surface(self):
-        # The 8 domain tools plus relinkra_health (a diagnostics endpoint,
+        # The 8 domain tools plus health (a diagnostics endpoint,
         # not a CBM tool); anything beyond that set is a surface change
         # this guard exists to catch.
         names = {tool["name"] for tool in mcp_server.TOOLS}
-        self.assertEqual(names, EXPECTED_MCP_TOOLS | {"relinkra_health"})
+        self.assertEqual(names, EXPECTED_MCP_TOOLS | {"health"})
 
     def test_no_tool_exposes_cbm_directly(self):
         for tool in mcp_server.TOOLS:

@@ -145,9 +145,9 @@ channels and exit codes) are encoded as tests in `tests/test_cbm_backend.py`:
 Relinkra can optionally use two read-only CBM 0.9.0 capabilities through its
 own high-level surfaces:
 
-- `relinkra_code_architecture` returns a compact orientation with aggregate
+- `code_architecture` returns a compact orientation with aggregate
   packages, layers, boundaries, hotspots, and language facts.
-- `relinkra_code_relationships` returns bounded callers or dependencies for a
+- `code_relationships` returns bounded callers or dependencies for a
   selected symbol.
 
 These results are advisory and are bounded before they enter a ContextPacket.

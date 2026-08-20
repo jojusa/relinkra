@@ -191,7 +191,7 @@ mistaken for a drive letter.
 ## Example
 
 ```jsonc
-// relinkra_handoff_create
+// handoff_create
 {
   "source_agent": "opencode",
   "target_agent": "claude",
@@ -208,6 +208,6 @@ mistaken for a drive letter.
 Any other agent, in any workspace, then reads it back:
 
 ```jsonc
-// relinkra_handoff_get
+// handoff_get
 { "target_agent": "claude" }
 ```

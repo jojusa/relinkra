@@ -821,13 +821,13 @@ class AgentInstruction:
 
 
 AGENT_GUIDANCE = (
-    "Relinkra is the shared project context layer. Use it when prior project "
-    "memory or handoff continuity, architecture orientation, callers, "
-    "dependencies, impact, Git context, or bounded context selection can "
-    "reduce redundant exploration. Do not use it blindly for trivial tasks. "
-    "Preserve native search, read, edit, test, and verification tools; verify "
-    "current source evidence. Relinkra context is advisory: stale evidence "
-    "is not authoritative."
+    "Relinkra is the shared project context layer. When a task asks about "
+    "architecture, callers, dependencies, impact, cross-module relationships, "
+    "prior project decisions or memory, handoff continuity, or Git history, "
+    "prefer checking the relevant Relinkra tool early when it can reduce "
+    "broad exploration. Do not use it for trivial or purely local tasks. "
+    "Verify stale/advisory evidence against current source. Native search, "
+    "read, edit, test, and validation tools remain fully available."
 )
 
 AGENT_INSTRUCTIONS: Tuple[AgentInstruction, ...] = (

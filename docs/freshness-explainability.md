@@ -205,11 +205,11 @@ input schema:
 
 | Tool | Additive output |
 |---|---|
-| `relinkra_context_get` | Per-item `explain`, plus packet `contradictions` and `explainability`. |
-| `relinkra_memory_search` | Per-memory `explain` and top-level `explainability`. |
-| `relinkra_code_resolve` | Explained code references/facts plus packet-level contradiction metadata. |
-| `relinkra_git_context` | A compact `explain` sidecar, including degraded `unknown` results. |
-| `relinkra_handoff_get` | A compact `explain` sidecar on each returned handoff, including historical records. |
+| `context_get` | Per-item `explain`, plus packet `contradictions` and `explainability`. |
+| `memory_search` | Per-memory `explain` and top-level `explainability`. |
+| `code_resolve` | Explained code references/facts plus packet-level contradiction metadata. |
+| `git_context` | A compact `explain` sidecar, including degraded `unknown` results. |
+| `handoff_get` | A compact `explain` sidecar on each returned handoff, including historical records. |
 
 Clients that ignore unknown output properties continue using the original
 payload. Strict output decoders should allow the documented additive fields.

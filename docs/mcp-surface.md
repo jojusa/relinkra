@@ -79,31 +79,37 @@ reject that as a malformed frame.
 
 ## Tool naming
 
-The surface is `relinkra_<domain>_<verb>` — **underscores, not dots.**
+The surface uses **server-local** names (`code_relationships`,
+`context_get`, ...) — **underscores, not dots.**
 
-Hosts namespace an MCP tool as `mcp__<server>__<tool>`, and the resulting
-identifier must match `^[a-zA-Z0-9_-]{1,64}$`. A dotted logical name like
-`relinkra.project.resolve` would become
+Hosts namespace an MCP tool with the server id (`mcp__<server>__<tool>` on
+Claude-family clients, `<server>_<tool>` on OpenCode), and the resulting
+identifier must match `^[a-zA-Z0-9_-]{1,64}$`. Because the server id is
+already `relinkra`, the wire names deliberately do NOT carry a `relinkra_`
+prefix of their own: `relinkra_code_relationships` would otherwise surface
+as the redundant double name `relinkra_relinkra_code_relationships`. A
+dotted logical name like `relinkra.project.resolve` would likewise become
 `mcp__relinkra__relinkra.project.resolve`, which fails that pattern on
 Claude-family clients. The dotted names remain the documented logical
-contract and are carried in the tool table below; a test asserts every
-wire name survives host namespacing within the 64-character limit.
+contract and are carried in the tool table below; tests assert every wire
+name survives host namespacing within the 64-character limit and that no
+wire name repeats the server namespace.
 
 ## Tool contract
 
 | Wire name | Logical name | Purpose |
 |-----------|--------------|---------|
-| `relinkra_project_resolve` | `relinkra.project.resolve` | Resolve logical project identity + active workspace |
-| `relinkra_context_get` | `relinkra.context.get` | One deterministic Project Context Packet |
-| `relinkra_memory_search` | `relinkra.memory.search` | Search shared project memory |
-| `relinkra_memory_save` | `relinkra.memory.save` | Save a memory under R1C policy |
-| `relinkra_code_resolve` | `relinkra.code.resolve` | Resolve file/symbol → portable code reference |
-| `relinkra_code_architecture` | `relinkra.code.architecture` | Return compact advisory architecture orientation |
-| `relinkra_code_relationships` | `relinkra.code.relationships` | Return bounded advisory caller/dependency relationships |
-| `relinkra_git_context` | `relinkra.git.context` | Read-only git facts |
-| `relinkra_handoff_create` | `relinkra.handoff.create` | Record a cross-agent handoff |
-| `relinkra_handoff_get` | `relinkra.handoff.get` | Fetch one handoff, or list recent ones |
-| `relinkra_health` | `relinkra.health` | Contract, engine availability, degraded components |
+| `project_resolve` | `relinkra.project.resolve` | Resolve logical project identity + active workspace |
+| `context_get` | `relinkra.context.get` | One deterministic Project Context Packet |
+| `memory_search` | `relinkra.memory.search` | Search shared project memory |
+| `memory_save` | `relinkra.memory.save` | Save a memory under R1C policy |
+| `code_resolve` | `relinkra.code.resolve` | Resolve file/symbol → portable code reference |
+| `code_architecture` | `relinkra.code.architecture` | Return compact advisory architecture orientation |
+| `code_relationships` | `relinkra.code.relationships` | Return bounded advisory caller/dependency relationships |
+| `git_context` | `relinkra.git.context` | Read-only git facts |
+| `handoff_create` | `relinkra.handoff.create` | Record a cross-agent handoff |
+| `handoff_get` | `relinkra.handoff.get` | Fetch one handoff, or list recent ones |
+| `health` | `relinkra.health` | Contract, engine availability, degraded components |
 
 Every tool declares a JSON Schema with `additionalProperties: false`.
 Validation is strict and server-side: object shape, required keys,
@@ -125,7 +131,7 @@ application service at all.
 
 ## Context integration
 
-`relinkra_context_get` composes from logical identity, active shared
+`context_get` composes from logical identity, active shared
 memories, memory↔code links, CBM facts, git intelligence, pending work,
 and relevant handoffs — then passes through **relevance → budget →
 portable serialization**, preserving the existing ordering invariants.
@@ -255,7 +261,7 @@ agent-specific logic in the core.
 }
 ```
 
-Tools then appear as `mcp__relinkra__relinkra_context_get`, etc.
+Tools then appear as `mcp__relinkra__context_get`, etc.
 
 **OpenCode** (`opencode.json`):
 

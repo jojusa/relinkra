@@ -1775,7 +1775,7 @@ class TestMCPHealthDeep(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": "relinkra_health", "arguments": {"deep": True}},
+                "params": {"name": "health", "arguments": {"deep": True}},
             }
         )
         payload = json.loads(response["result"]["content"][0]["text"])

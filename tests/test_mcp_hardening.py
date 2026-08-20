@@ -194,7 +194,7 @@ class JsonRpcContractTests(HardeningTestCase):
                 "id": 8,
                 "method": "tools/call",
                 "params": {
-                    "name": "relinkra_handoff_get",
+                    "name": "handoff_get",
                     "arguments": {"handoff_id": "hof_" + "0" * 32},
                 },
             }
@@ -214,7 +214,7 @@ class JsonRpcContractTests(HardeningTestCase):
                 "id": 9,
                 "method": "tools/call",
                 "params": {
-                    "name": "relinkra_handoff_get",
+                    "name": "handoff_get",
                     "arguments": {"nope": 1},
                 },
             }
@@ -242,11 +242,11 @@ class JsonRpcContractTests(HardeningTestCase):
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "relinkra_health", "arguments": {"x": 1}},
+                "params": {"name": "health", "arguments": {"x": 1}},
             }
         )
         # Still healthy afterwards.
-        recovered = self.ok("relinkra_health")
+        recovered = self.ok("health")
         self.assertIn("contract_version", recovered)
 
     def test_parse_error_carries_null_id(self):
@@ -277,51 +277,51 @@ class PortableWireAuditTests(HardeningTestCase):
     def _all_tool_outputs(self):
         """Invoke every tool and return {tool_name: response}."""
         handoff = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="audit the wire",
             include_git_state=True,
         )["handoff"]
         self.ok(
-            "relinkra_memory_save",
+            "memory_save",
             memory_type="decision",
             title="audit decision",
             body="body",
         )
         outputs = {
-            "relinkra_project_resolve": self.ok("relinkra_project_resolve"),
-            "relinkra_context_get": self.ok(
-                "relinkra_context_get", task="audit the wire"
+            "project_resolve": self.ok("project_resolve"),
+            "context_get": self.ok(
+                "context_get", task="audit the wire"
             ),
-            "relinkra_memory_search": self.ok(
-                "relinkra_memory_search", limit=50
+            "memory_search": self.ok(
+                "memory_search", limit=50
             ),
-            "relinkra_memory_save": self.ok(
-                "relinkra_memory_save",
+            "memory_save": self.ok(
+                "memory_save",
                 memory_type="discovery",
                 title="audit discovery",
                 body="body",
             ),
-            "relinkra_code_resolve": self.ok(
-                "relinkra_code_resolve", file="src/audit.py"
+            "code_resolve": self.ok(
+                "code_resolve", file="src/audit.py"
             ),
-            "relinkra_code_architecture": self.ok(
-                "relinkra_code_architecture"
+            "code_architecture": self.ok(
+                "code_architecture"
             ),
-            "relinkra_code_relationships": self.ok(
-                "relinkra_code_relationships", symbol="audit"
+            "code_relationships": self.ok(
+                "code_relationships", symbol="audit"
             ),
-            "relinkra_git_context": self.ok("relinkra_git_context"),
-            "relinkra_handoff_create": self.ok(
-                "relinkra_handoff_create",
+            "git_context": self.ok("git_context"),
+            "handoff_create": self.ok(
+                "handoff_create",
                 source_agent="claude",
                 task="second audit handoff",
             ),
-            "relinkra_handoff_get": self.ok(
-                "relinkra_handoff_get", handoff_id=handoff["handoff_id"]
+            "handoff_get": self.ok(
+                "handoff_get", handoff_id=handoff["handoff_id"]
             ),
-            "relinkra_health": self.ok("relinkra_health"),
+            "health": self.ok("health"),
         }
         return outputs
 
@@ -374,7 +374,7 @@ class PortableWireAuditTests(HardeningTestCase):
             "Bearer abcdef0123456789",
         )
         payload = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task=f"rotate {secrets[1]}",
             summary=f"used {secrets[0]} and {secrets[2]}",
@@ -385,9 +385,9 @@ class PortableWireAuditTests(HardeningTestCase):
 
     def test_repo_relative_paths_and_opaque_ids_survive(self):
         """Scrubbing must not destroy the useful parts of the payload."""
-        payload = self.ok("relinkra_code_resolve", file="src/audit.py")
+        payload = self.ok("code_resolve", file="src/audit.py")
         self.assertIn("src/audit.py", json.dumps(payload))
-        resolved = self.ok("relinkra_project_resolve")
+        resolved = self.ok("project_resolve")
         self.assertTrue(resolved["project_id"].startswith("rlk_"))
         self.assertTrue(resolved["workspace_id"].startswith("ws_"))
 
@@ -430,7 +430,7 @@ class RealAdapterWireAuditTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": "relinkra_health", "arguments": {}},
+                "params": {"name": "health", "arguments": {}},
             }
         )["result"]["structuredContent"]
 
@@ -505,13 +505,13 @@ class CapabilityHonestyTests(HardeningTestCase):
     workspace_root = "."
 
     def test_capabilities_track_real_component_state(self):
-        healthy = self.ok("relinkra_health")
+        healthy = self.ok("health")
         self.assertTrue(healthy["capabilities"]["memory_write"])
         self.assertTrue(healthy["capabilities"]["handoffs"])
         self.assertTrue(healthy["capabilities"]["git_intelligence"])
 
         self.store.available = False
-        degraded = self.ok("relinkra_health")
+        degraded = self.ok("health")
         self.assertFalse(
             degraded["capabilities"]["handoffs"],
             "handoffs advertised while the memory store is down",
@@ -544,10 +544,10 @@ class CapabilityHonestyTests(HardeningTestCase):
 
     def test_advertised_handoff_capability_is_executable(self):
         """If health says handoffs work, creating one must succeed."""
-        health = self.ok("relinkra_health")
+        health = self.ok("health")
         self.assertTrue(health["capabilities"]["handoffs"])
         created = self.call(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="capability honesty",
         )
@@ -555,10 +555,10 @@ class CapabilityHonestyTests(HardeningTestCase):
 
     def test_withdrawn_capability_matches_real_failure(self):
         self.store.available = False
-        health = self.ok("relinkra_health")
+        health = self.ok("health")
         self.assertFalse(health["capabilities"]["handoffs"])
         attempted = self.call(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="should fail",
         )
@@ -566,7 +566,7 @@ class CapabilityHonestyTests(HardeningTestCase):
 
     def test_absent_component_is_a_known_negative_not_unchecked(self):
         """"Not configured" is a fact, not an unverified guess."""
-        health = self.ok("relinkra_health")
+        health = self.ok("health")
         self.assertFalse(health["capabilities"]["code_resolution"])
         self.assertTrue(health["components"]["cbm"]["checked"])
         self.assertNotIn("code_resolution", health["capabilities_unchecked"])
@@ -574,7 +574,7 @@ class CapabilityHonestyTests(HardeningTestCase):
     def test_configured_but_unprobed_component_is_named_unchecked(self):
         """A configured CBM is represented as unprobed, not unavailable."""
         self.services.cbm_adapter = object()
-        health = self.ok("relinkra_health")
+        health = self.ok("health")
         self.assertIsNone(health["capabilities"]["code_resolution"])
         self.assertFalse(health["components"]["cbm"]["checked"])
         self.assertEqual(health["components"]["cbm"]["state"], "unprobed")
@@ -594,7 +594,7 @@ class CapabilityHonestyTests(HardeningTestCase):
         not a crash or a leaked traceback.
         """
         self.services.cbm_adapter = object()  # configured but unusable
-        result = self.call("relinkra_code_resolve", file="src/audit.py")
+        result = self.call("code_resolve", file="src/audit.py")
         payload = result["structuredContent"]
         if result["isError"]:
             self.assertIn(
@@ -606,7 +606,7 @@ class CapabilityHonestyTests(HardeningTestCase):
             self.assertIn("code_references", payload)
 
     def test_permanent_absences_are_not_degradations(self):
-        health = self.ok("relinkra_health")
+        health = self.ok("health")
         self.assertFalse(health["capabilities"]["agent_private_access"])
         self.assertFalse(health["capabilities"]["git_write"])
         self.assertNotIn(
@@ -621,55 +621,55 @@ class DegradedRecoveryTests(HardeningTestCase):
 
     def test_memory_store_recovers_in_the_same_process(self):
         self.store.available = False
-        down = self.call("relinkra_memory_search")
+        down = self.call("memory_search")
         self.assertTrue(down["isError"])
         self.assertEqual(
             down["structuredContent"]["error"]["code"], "unavailable"
         )
 
         self.store.available = True
-        recovered = self.ok("relinkra_memory_search", limit=50)
+        recovered = self.ok("memory_search", limit=50)
         self.assertGreater(recovered["count"], 0)
 
     def test_health_tracks_the_component_back_to_ok(self):
         self.store.available = False
-        self.assertIn("engram", self.ok("relinkra_health")["degraded"])
+        self.assertIn("engram", self.ok("health")["degraded"])
         self.store.available = True
-        self.assertNotIn("engram", self.ok("relinkra_health")["degraded"])
+        self.assertNotIn("engram", self.ok("health")["degraded"])
 
     def test_data_written_before_an_outage_is_still_there_after(self):
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="survives an outage",
         )["handoff"]
 
         self.store.available = False
-        self.assertTrue(self.call("relinkra_handoff_get")["isError"])
+        self.assertTrue(self.call("handoff_get")["isError"])
 
         self.store.available = True
         fetched = self.ok(
-            "relinkra_handoff_get", handoff_id=created["handoff_id"]
+            "handoff_get", handoff_id=created["handoff_id"]
         )["handoff"]
         self.assertEqual(fetched["handoff_id"], created["handoff_id"])
 
     def test_git_recovers_in_the_same_process(self):
         self.git.fail = True
-        down = self.ok("relinkra_git_context")
+        down = self.ok("git_context")
         self.assertFalse(down["available"])
         self.assertTrue(down["warnings"])
 
         self.git.fail = False
-        recovered = self.ok("relinkra_git_context")
+        recovered = self.ok("git_context")
         self.assertTrue(recovered["available"])
         self.assertEqual(recovered["repository_state"]["branch"], "main")
 
     def test_git_outage_never_blocks_memory_tools(self):
         self.git.fail = True
-        self.assertFalse(self.call("relinkra_memory_search")["isError"])
+        self.assertFalse(self.call("memory_search")["isError"])
         self.assertFalse(
             self.call(
-                "relinkra_handoff_create",
+                "handoff_create",
                 source_agent="opencode",
                 task="git is down",
             )["isError"]
@@ -679,9 +679,9 @@ class DegradedRecoveryTests(HardeningTestCase):
         """The same MCPServer instance serves before, during, and after."""
         server_id = id(self.server)
         self.store.available = False
-        self.call("relinkra_memory_search")
+        self.call("memory_search")
         self.store.available = True
-        self.ok("relinkra_memory_search")
+        self.ok("memory_search")
         self.assertEqual(id(self.server), server_id)
 
 

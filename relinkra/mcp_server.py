@@ -14,12 +14,16 @@ UTF-8, one message per line. No HTTP, no third-party dependency — the
 whole Relinkra codebase is standard library only and this layer does not
 change that.
 
-Tool naming: the surface is ``relinkra_<domain>_<verb>`` (underscores,
-not dots). Hosts namespace an MCP tool as ``mcp__<server>__<tool>`` and
-the resulting identifier must match ``^[a-zA-Z0-9_-]{1,64}$``; a dotted
-name like ``relinkra.project.resolve`` would not survive that mapping on
-Claude-family clients. The dotted names remain the documented logical
-contract and are reported by ``relinkra_health``.
+Tool naming: the surface uses server-local names (``code_relationships``,
+``context_get``, ...). Hosts namespace an MCP tool with the server id, so
+OpenCode renders them as ``relinkra_code_relationships`` and Claude-family
+clients as ``mcp__relinkra__code_relationships`` — concise and without a
+redundant ``relinkra_relinkra_*`` double prefix. Names stay
+underscore-separated because host identifiers must match
+``^[a-zA-Z0-9_-]{1,64}$``; a dotted name like ``project.resolve`` would
+not survive that mapping on Claude-family clients. The dotted names
+(``relinkra.project.resolve``, ...) remain the documented logical contract
+and are reported by ``health``.
 """
 
 from __future__ import annotations
@@ -79,10 +83,12 @@ _WORKSPACE_ID = _string(
 
 TOOLS: List[dict] = [
     {
-        "name": "relinkra_project_resolve",
+        "name": "project_resolve",
         "logical_name": "relinkra.project.resolve",
+        "title": "Resolve project identity",
+        "read_only": True,
         "description": (
-            "Resolve the logical Relinkra project identity for this server, "
+            "Resolve the logical project identity for this server, "
             "including repository identity and the active workspace. Use "
             "when the project or workspace is ambiguous; other tools are "
             "scoped to the resolved project_id."
@@ -97,15 +103,18 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_context_get",
+        "name": "context_get",
         "logical_name": "relinkra.context.get",
+        "title": "Get project context packet",
+        "read_only": True,
         "description": (
             "Get a deterministic Project Context Packet: logical identity, "
             "active shared memories, memory-code links, code facts, git "
             "intelligence, pending work, and relevant handoffs — ranked by "
-            "relevance and bounded by a token budget. Use when project "
-            "history, orientation, or a bounded investigation can reduce "
-            "redundant exploration; it is not required for trivial edits."
+            "relevance and bounded by a token budget. Use when gathering "
+            "bounded project evidence for a complex investigation, or when "
+            "it can reduce broad, repeated exploration; not needed for "
+            "trivial edits."
         ),
         "inputSchema": {
             "type": "object",
@@ -143,13 +152,16 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_memory_search",
+        "name": "memory_search",
         "logical_name": "relinkra.memory.search",
+        "title": "Search project memory",
+        "read_only": True,
         "description": (
-            "Search shared project memory (decisions, constraints, "
-            "discoveries, bugs, pending work, handoffs). Use when prior "
-            "decisions or continuity may affect the current task. "
-            "Agent-private memory is never returned through this surface."
+            "Search shared project memory for prior decisions, constraints, "
+            "discoveries, bugs, pending work, and handoffs. Use when "
+            "previous findings, earlier session conclusions, or existing "
+            "project knowledge may affect the current task. Agent-private "
+            "memory is never returned through this surface."
         ),
         "inputSchema": {
             "type": "object",
@@ -186,8 +198,10 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_memory_save",
+        "name": "memory_save",
         "logical_name": "relinkra.memory.save",
+        "title": "Save project memory",
+        "read_only": False,
         "description": (
             "Save a project memory (decision, constraint, discovery, bug, "
             "architecture note, pending work). Use for durable project "
@@ -231,13 +245,16 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_code_resolve",
+        "name": "code_resolve",
         "logical_name": "relinkra.code.resolve",
+        "title": "Resolve code reference",
+        "read_only": True,
         "description": (
             "Resolve a file or symbol to a portable code reference plus any "
-            "memories linked to it. Use when a stable file/symbol identity or "
-            "linked project context is useful. Degrades to an unresolved "
-            "reference with a warning when the code index is unavailable."
+            "project memories linked to it. Use when a stable file/symbol "
+            "identity or the prior knowledge attached to it is useful. "
+            "Degrades to an unresolved reference with a warning when the "
+            "code index is unavailable."
         ),
         "inputSchema": {
             "type": "object",
@@ -251,14 +268,18 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_code_architecture",
+        "name": "code_architecture",
         "logical_name": "relinkra.code.architecture",
+        "title": "Architecture orientation",
+        "read_only": True,
         "description": (
             "Return a compact, advisory architecture orientation for the "
-            "registered project: packages, layers, boundaries, hotspots, "
-            "and related aggregate facts. Use to orient a structural change "
-            "before deeper exploration. CBM is optional; native file and "
-            "symbol exploration remains available."
+            "registered project: modules, packages, layers, boundaries, "
+            "subsystems, and hotspots. Use for questions about architecture, "
+            "layering, or where code belongs, and to orient a structural "
+            "change before deeper exploration. Advisory only — verify "
+            "against current source; native file and symbol exploration "
+            "remains available."
         ),
         "inputSchema": {
             "type": "object",
@@ -271,22 +292,31 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_code_relationships",
+        "name": "code_relationships",
         "logical_name": "relinkra.code.relationships",
+        "title": "Symbol callers and dependencies",
+        "read_only": True,
         "description": (
             "Return bounded advisory caller/dependency relationships for a "
-            "symbol. Use when callers, dependencies, or impact matter to a "
-            "change. Results may be incomplete; an empty result is not a "
-            "claim that no relationship exists."
+            "symbol. Use early for questions like who calls this, callers, "
+            "callees, dependencies, dependents, who depends on this, impact "
+            "analysis, or cross-module relationships around a change. "
+            "Results may be incomplete or stale; an empty result is not a "
+            "claim that no relationship exists — verify important claims "
+            "against current source."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": _PROJECT_ID,
                 "workspace_id": _WORKSPACE_ID,
-                "symbol": _string("Symbol or qualified symbol name."),
+                "symbol": _string(
+                    "Symbol, function, or class to inspect for callers or "
+                    "dependencies."
+                ),
                 "direction": _string(
-                    "Relationship direction.",
+                    "inbound for callers/dependents, outbound for "
+                    "dependencies/callees, both for both directions.",
                     enum=["inbound", "outbound", "both"],
                 ),
                 "max_hops": {
@@ -307,13 +337,16 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_git_context",
+        "name": "git_context",
         "logical_name": "relinkra.git.context",
+        "title": "Git history and state",
+        "read_only": True,
         "description": (
             "Read-only git intelligence for the configured workspace: "
-            "repository state, HEAD facts, recent commits, working diff, "
-            "and optional per-file history. Use when current state or history "
-            "can prevent redundant investigation. Never mutates the repository."
+            "current branch/worktree state, HEAD facts, recent commits, "
+            "working diff, and optional per-file history. Use for questions "
+            "about recent changes, when or why code changed, or commit "
+            "context. Never mutates the repository."
         ),
         "inputSchema": {
             "type": "object",
@@ -335,14 +368,16 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_handoff_create",
+        "name": "handoff_create",
         "logical_name": "relinkra.handoff.create",
+        "title": "Create cross-agent handoff",
+        "read_only": False,
         "description": (
             "Record a cross-agent handoff: what the task was, what is done, "
             "what is pending, decisions, warnings, and the git state. "
-            "Use when another agent may continue the work. It is shared with "
-            "every agent on the project and readable by name from any other "
-            "agent or workspace."
+            "Use when another agent or a future session may continue the "
+            "work. It is shared with every agent on the project and "
+            "readable by name from any other agent or workspace."
         ),
         "inputSchema": {
             "type": "object",
@@ -387,12 +422,15 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_handoff_get",
+        "name": "handoff_get",
         "logical_name": "relinkra.handoff.get",
+        "title": "Get handoffs",
+        "read_only": True,
         "description": (
             "Fetch one handoff by id, or list the most recent handoffs for "
-            "the project. Use when resuming prior work; target_agent finds "
-            "work left for you."
+            "the project. Use when resuming or continuing another agent's "
+            "work, recovering a previous investigation, or checking "
+            "unresolved questions; target_agent finds work left for you."
         ),
         "inputSchema": {
             "type": "object",
@@ -416,14 +454,16 @@ TOOLS: List[dict] = [
         },
     },
     {
-        "name": "relinkra_health",
+        "name": "health",
         "logical_name": "relinkra.health",
+        "title": "Relinkra health and diagnostics",
+        "read_only": True,
         "description": (
             "Report Relinkra version and schema contract, project "
-            "resolution status, availability of Engram / code index / git, "
-            "degraded components, capability states, and supported "
-            "capabilities. Use to diagnose optional-backend availability, not "
-            "as proof that current source is correct."
+            "resolution status, availability of the code index / memory "
+            "backend / git, degraded components, and capability states. "
+            "Use to troubleshoot Relinkra or backend availability, not as "
+            "proof that current source is correct."
         ),
         "inputSchema": {
             "type": "object",
@@ -559,17 +599,17 @@ class MCPServer:
             "tools/call": self._handle_tools_call,
         }
         self._tool_dispatch: Dict[str, Callable[..., dict]] = {
-            "relinkra_project_resolve": self.services.project_resolve,
-            "relinkra_context_get": self.services.context_get,
-            "relinkra_memory_search": self.services.memory_search,
-            "relinkra_memory_save": self.services.memory_save,
-            "relinkra_code_resolve": self.services.code_resolve,
-            "relinkra_code_architecture": self.services.code_architecture,
-            "relinkra_code_relationships": self.services.code_relationships,
-            "relinkra_git_context": self.services.git_context,
-            "relinkra_handoff_create": self.services.handoff_create,
-            "relinkra_handoff_get": self.services.handoff_get,
-            "relinkra_health": lambda deep=False: self.services.health(deep=bool(deep)),
+            "project_resolve": self.services.project_resolve,
+            "context_get": self.services.context_get,
+            "memory_search": self.services.memory_search,
+            "memory_save": self.services.memory_save,
+            "code_resolve": self.services.code_resolve,
+            "code_architecture": self.services.code_architecture,
+            "code_relationships": self.services.code_relationships,
+            "git_context": self.services.git_context,
+            "handoff_create": self.services.handoff_create,
+            "handoff_get": self.services.handoff_get,
+            "health": lambda deep=False: self.services.health(deep=bool(deep)),
         }
 
     # -- protocol ---------------------------------------------------------
@@ -597,8 +637,19 @@ class MCPServer:
             "tools": [
                 {
                     "name": tool["name"],
+                    # ``title`` and ``annotations`` are standard Tool
+                    # fields from protocol 2025-03-26 onward; on the
+                    # older 2024-11-05 revision they are simply unknown
+                    # keys, which clients ignore. Emitting them
+                    # unconditionally is therefore safe on every version
+                    # this server negotiates.
+                    "title": tool["title"],
                     "description": tool["description"],
                     "inputSchema": tool["inputSchema"],
+                    "annotations": {
+                        "title": tool["title"],
+                        "readOnlyHint": tool["read_only"],
+                    },
                 }
                 for tool in TOOLS
             ]

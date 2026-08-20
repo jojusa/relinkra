@@ -469,7 +469,23 @@ class AgentContractTests(unittest.TestCase):
         ids = {item.instruction_id for item in AGENT_INSTRUCTIONS}
         self.assertEqual(ids, {"when_relinkra_helps"})
         text = AGENT_INSTRUCTIONS[0].text.lower()
-        for phrase in ("shared project context layer", "trivial tasks", "native", "stale"):
+        for phrase in (
+            "shared project context layer",
+            # Structural triggers, explicit so host models can match tasks.
+            "architecture",
+            "callers",
+            "dependencies",
+            "impact",
+            "memory",
+            "handoff continuity",
+            "git history",
+            # Advisory semantics: prefer-when-useful, never compulsory.
+            "prefer checking",
+            "trivial",
+            "native",
+            "stale",
+            "current source",
+        ):
             self.assertIn(phrase, text)
 
     def test_every_instruction_carries_a_rationale(self):
