@@ -753,12 +753,83 @@ class TestPinPolicy(unittest.TestCase):
             managed.mkdir(parents=True)
             exe = managed / "codebase-memory-mcp.exe"
             exe.write_text("bin", encoding="utf-8")
-            found = cbm_support.resolve_cbm_binary(tmp, environ={})
+            # An empty per-user data root keeps the managed step hermetic.
+            data_root = Path(tmp) / "no-managed-data-root"
+            found = cbm_support.resolve_cbm_binary(
+                tmp, environ={"RELINKRA_DATA_ROOT": str(data_root)}
+            )
             self.assertEqual(found, str(exe))
 
     def test_resolve_cbm_binary_none(self):
-        with mock.patch("shutil.which", return_value=None):
-            self.assertIsNone(cbm_support.resolve_cbm_binary(None, environ={}))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("shutil.which", return_value=None):
+                self.assertIsNone(
+                    cbm_support.resolve_cbm_binary(
+                        None, environ={"RELINKRA_DATA_ROOT": tmp}
+                    )
+                )
+
+    def test_resolve_cbm_binary_prefers_per_user_managed_over_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data-root"
+            workspace = Path(tmp) / "workspace"
+            per_user = Path(
+                cbm_support.managed_cbm_binary_path(
+                    cbm_support.CERTIFIED_CBM_VERSION,
+                    "windows-amd64",
+                    data_root=str(data_root),
+                )
+            )
+            per_user.parent.mkdir(parents=True)
+            per_user.write_bytes(b"managed")
+            workspace_bin = workspace / ".codebase-memory" / "bin"
+            workspace_bin.mkdir(parents=True)
+            (workspace_bin / "codebase-memory-mcp.exe").write_bytes(b"workspace")
+            environ = {"RELINKRA_DATA_ROOT": str(data_root)}
+            with mock.patch.object(
+                cbm_support, "platform_tag", lambda: "windows-amd64"
+            ):
+                self.assertEqual(
+                    cbm_support.resolve_cbm_binary(str(workspace), environ=environ),
+                    str(per_user),
+                )
+
+    def test_resolve_cbm_binary_env_override_wins_over_managed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            per_user = Path(
+                cbm_support.managed_cbm_binary_path(
+                    cbm_support.CERTIFIED_CBM_VERSION,
+                    "windows-amd64",
+                    data_root=tmp,
+                )
+            )
+            per_user.parent.mkdir(parents=True)
+            per_user.write_bytes(b"managed")
+            with mock.patch.object(
+                cbm_support, "platform_tag", lambda: "windows-amd64"
+            ):
+                self.assertEqual(
+                    cbm_support.resolve_cbm_binary(
+                        None,
+                        environ={
+                            "RELINKRA_CBM_BIN": "x/cbm.exe",
+                            "RELINKRA_DATA_ROOT": tmp,
+                        },
+                    ),
+                    "x/cbm.exe",
+                )
+
+    def test_resolve_cbm_binary_falls_through_to_path_when_no_managed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                cbm_support, "platform_tag", lambda: "windows-amd64"
+            ), mock.patch("shutil.which", return_value="C:/path/cbm.exe"):
+                self.assertEqual(
+                    cbm_support.resolve_cbm_binary(
+                        None, environ={"RELINKRA_DATA_ROOT": tmp}
+                    ),
+                    "C:/path/cbm.exe",
+                )
 
     def test_cache_path_must_stay_inside_managed_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -942,6 +1013,24 @@ class TestDoctorTrustLadder(unittest.TestCase):
             checks = _ladder(root, _FakeAdapter, binary=None)
             self.assertEqual(list(checks), ["CBM binary"])
             self.assertEqual(checks["CBM binary"].status, "WARN")
+
+    def test_binary_missing_on_certified_platform_recommends_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            # _ladder's default platform_tag is the certified windows-amd64.
+            checks = _ladder(root, _FakeAdapter, binary=None)
+            self.assertEqual(list(checks), ["CBM binary"])
+            self.assertEqual(checks["CBM binary"].status, "WARN")
+            self.assertIn("relinkra cbm setup", checks["CBM binary"].action)
+
+    def test_binary_missing_on_uncertified_platform_stays_honest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_workspace(tmp)
+            checks = _ladder(root, _FakeAdapter, binary=None, platform_tag="linux-amd64")
+            self.assertEqual(list(checks), ["CBM binary"])
+            self.assertEqual(checks["CBM binary"].status, "WARN")
+            self.assertNotIn("relinkra cbm setup", checks["CBM binary"].action)
+            self.assertIn("linux-amd64", checks["CBM binary"].detail)
 
     def test_uncertified_version_warns(self):
         with tempfile.TemporaryDirectory() as tmp:

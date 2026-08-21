@@ -222,6 +222,11 @@ class CbmStatusTests(CBMCLITestCase):
             product_cli.cbm_support,
             "resolve_cbm_binary",
             lambda root=None, environ=None: None,
+        ), mock.patch.object(
+            # Uncertified platform: setup cannot help, so no Next line.
+            product_cli.cbm_support,
+            "platform_tag",
+            lambda: "linux-amd64",
         ), mock.patch.object(cbm_indexing, "freshness_state", freshness):
             code, out, err = self.run_cli("cbm", "status")
         self.assertEqual(code, EXIT_OK, err)
@@ -234,6 +239,30 @@ class CbmStatusTests(CBMCLITestCase):
         )
         self.assertNotIn("Next:", out)
         freshness.assert_called_once()  # still consulted, honestly reports UNAVAILABLE
+
+    def test_unavailable_on_certified_platform_recommends_setup(self):
+        freshness = mock.Mock(
+            return_value={
+                "state": cbm_indexing.UNAVAILABLE,
+                "committed_drift": None,
+                "worktree_drift": None,
+            }
+        )
+        with mock.patch.object(
+            product_cli.cbm_support,
+            "resolve_cbm_binary",
+            lambda root=None, environ=None: None,
+        ), mock.patch.object(
+            product_cli.cbm_support, "platform_tag", lambda: "windows-amd64"
+        ), mock.patch.object(cbm_indexing, "freshness_state", freshness):
+            code, out, err = self.run_cli("cbm", "status")
+            self.assertEqual(code, EXIT_OK, err)
+            self.assertIn("CBM: UNAVAILABLE", out)
+            self.assertIn("Next: relinkra cbm setup", out)
+            code, out, err = self.run_cli("cbm", "status", "--json")
+        self.assertEqual(code, EXIT_OK, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["next_action"], "relinkra cbm setup")
 
     def test_untrusted_binary_refuses_without_executing(self):
         freshness = mock.Mock(

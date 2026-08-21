@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from relinkra import product_cli
 from relinkra.product_cli import (
@@ -580,6 +581,26 @@ class DoctorTests(CLITestCase):
         self.assertIn(WARN, out)
         self.assertIn("Engram", out)
         self.assertIn("Suggested action", out)
+
+    def test_doctor_missing_cbm_recommends_setup_on_certified_platform(self):
+        """A fresh user (no CBM anywhere) must get the actionable command."""
+        self.init()
+        with mock.patch.object(
+            product_cli.cbm_support, "platform_tag", return_value="windows-amd64"
+        ):
+            code, out, _ = self.run_cli("doctor")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("relinkra cbm setup", out)
+
+    def test_doctor_missing_cbm_on_uncertified_platform_is_honest(self):
+        self.init()
+        with mock.patch.object(
+            product_cli.cbm_support, "platform_tag", return_value="linux-amd64"
+        ):
+            code, out, _ = self.run_cli("doctor")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("No certified code-index release", out)
+        self.assertNotIn("relinkra cbm setup", out)
 
     def test_doctor_fails_outside_a_repository(self):
         plain = Path(self.tmp.name) / "plain"

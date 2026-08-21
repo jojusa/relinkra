@@ -11,8 +11,9 @@ source of truth for:
 - the adapter contract version (the CLI flags + JSON shapes
   ``CBMCLIAdapter`` depends on);
 - version classification (certified / supported / unsupported);
-- binary resolution for diagnostics: explicit env, then the isolated
-  Relinkra-managed location, then PATH — never an agent configuration.
+- binary resolution for diagnostics: explicit env, then the per-user
+  Relinkra-managed certified binary (R5H.1), then the workspace-managed
+  location, then PATH — never an agent configuration.
 
 The human-readable policy (upgrade detection, rollback, fixture
 strategy) lives in ``docs/cbm-backend.md``.
@@ -134,19 +135,70 @@ def managed_binary_candidates(root: str) -> List[str]:
     ]
 
 
+def relinkra_data_root(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Per-user data root for Relinkra-managed, cross-workspace state.
+
+    ``RELINKRA_DATA_ROOT`` overrides everything (an advanced/testing
+    seam; normal users never set it). Windows: ``~/.local/relinkra``
+    (the established pilot convention, kept uniform across platforms);
+    elsewhere: ``$XDG_DATA_HOME/relinkra`` or ``~/.local/share/relinkra``.
+    """
+    env = environ if environ is not None else os.environ
+    override = (env.get("RELINKRA_DATA_ROOT") or "").strip()
+    if override:
+        return override
+    home = os.path.expanduser("~")
+    if platform.system().lower() == "windows":
+        return os.path.join(home, ".local", "relinkra")
+    xdg = (env.get("XDG_DATA_HOME") or "").strip()
+    base = xdg if xdg else os.path.join(home, ".local", "share")
+    return os.path.join(base, "relinkra")
+
+
+def managed_cbm_binary_path(
+    version: str,
+    tag: str,
+    data_root: Optional[str] = None,
+) -> str:
+    """Per-user managed binary path for a certified (version, tag) pair.
+
+    ``<data_root>/backends/cbm/<version>/codebase-memory-mcp[.exe]`` —
+    versioned and deterministic, outside any project repository, shared
+    across projects and agent hosts. ``data_root`` defaults to
+    :func:`relinkra_data_root`.
+    """
+    root = data_root if data_root is not None else relinkra_data_root()
+    name = (
+        "codebase-memory-mcp.exe" if tag.startswith("windows") else "codebase-memory-mcp"
+    )
+    return os.path.join(root, "backends", "cbm", version, name)
+
+
 def resolve_cbm_binary(
     root: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Resolve the CBM executable without touching agent configuration.
 
-    Order: ``RELINKRA_CBM_BIN`` env, then the isolated Relinkra-managed
-    workspace location, then PATH. Returns None when nothing is found.
+    Order: ``RELINKRA_CBM_BIN`` env (verbatim operator override, not
+    validated at resolution time), then the per-user Relinkra-managed
+    certified binary (R5H.1), then the workspace-managed
+    ``.codebase-memory/bin`` location, then PATH. Returns None when
+    nothing is found.
     """
     env = environ if environ is not None else os.environ
     explicit = (env.get("RELINKRA_CBM_BIN") or "").strip()
     if explicit:
         return explicit
+    tag = platform_tag()
+    if tag in CERTIFIED_CBM_BINARIES:
+        # Only the certified version's managed path is ever auto-
+        # discovered; runtime trust is still SHA-256-gated downstream.
+        managed = managed_cbm_binary_path(
+            CERTIFIED_CBM_VERSION, tag, data_root=relinkra_data_root(env)
+        )
+        if os.path.isfile(managed):
+            return managed
     if root:
         for candidate in managed_binary_candidates(root):
             if os.path.isfile(candidate):
@@ -265,15 +317,29 @@ def evaluate_cbm_trust(
     if record is None and binary is None:
         return []
     if binary is None:
+        missing_detail = (
+            "no CBM executable resolved (RELINKRA_CBM_BIN, the per-user "
+            "Relinkra-managed location, the workspace "
+            ".codebase-memory/bin location, or PATH)"
+        )
+        if platform_tag() in CERTIFIED_CBM_BINARIES:
+            return [
+                TrustStage(
+                    "CBM binary",
+                    STAGE_WARN,
+                    missing_detail,
+                    "Run 'relinkra cbm setup' to install the certified "
+                    "binary into the Relinkra-managed location.",
+                )
+            ]
         return [
             TrustStage(
                 "CBM binary",
                 STAGE_WARN,
-                "no CBM executable resolved (RELINKRA_CBM_BIN, the managed "
-                ".codebase-memory/bin location, or PATH)",
-                "Acquire a certified release into the Relinkra-managed "
-                "location (see docs/cbm-backend.md); never via an "
-                "agent-configuring installer.",
+                f"{missing_detail}; no certified release exists for "
+                f"platform {platform_tag()}",
+                "CBM is optional — everything else keeps working. See "
+                "docs/cbm-backend.md for platform support.",
             )
         ]
     stages: List[TrustStage] = [TrustStage("CBM binary", STAGE_PASS, "executable resolved")]

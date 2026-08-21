@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, backend_policy, cbm_indexing, cbm_support
+from . import __version__, backend_policy, cbm_acquire, cbm_indexing, cbm_support
 from .app_service import (
     CONTRACT_VERSION,
     RelinkraServices,
@@ -416,6 +416,23 @@ def _component_check(name: str, probe: dict, action: str) -> Check:
     return Check(name, WARN, probe.get("detail") or "unavailable", action)
 
 
+def _cbm_missing_component_action() -> str:
+    """Next-step text for an absent CBM backend, platform-aware.
+
+    Certified platforms get the actionable managed-acquisition command;
+    uncertified ones stay honest about the missing release.
+    """
+    if cbm_support.platform_tag() in cbm_support.CERTIFIED_CBM_BINARIES:
+        return (
+            "Optional. Run 'relinkra cbm setup' to install the certified "
+            "code-index binary; everything else works without it."
+        )
+    return (
+        "Optional. No certified code-index release exists for platform "
+        f"{cbm_support.platform_tag()}; everything else works without it."
+    )
+
+
 def component_checks(health: dict) -> List[Check]:
     """Turn the R3 health report into CLI checks.
 
@@ -434,8 +451,7 @@ def component_checks(health: dict) -> List[Check]:
         _component_check(
             "CBM",
             components.get("cbm") or {},
-            "Optional. Configure a code-index binary to enable symbol "
-            "resolution; everything else works without it.",
+            _cbm_missing_component_action(),
         ),
         _component_check(
             "Git intelligence",
@@ -1589,10 +1605,10 @@ _CBM_OPTIONAL_BACKEND_LINE = (
     "Optional backend unavailable; native agent tools remain available."
 )
 
-#: Pointer to the acquisition procedure for the two action commands.
+#: Pointer to the acquisition command for the two action commands.
 _CBM_ACQUISITION_POINTER = (
-    "See docs/cbm-backend.md (Acquisition) for installing the certified "
-    "binary into the workspace-managed .codebase-memory/bin/ location."
+    "Run 'relinkra cbm setup' to install the certified binary into the "
+    "Relinkra-managed location (see docs/cbm-backend.md)."
 )
 
 #: Display-space Next action per state. READY and the degenerate
@@ -1720,7 +1736,12 @@ def _cbm_action_gate(root: str) -> Tuple[Optional[str], Optional[dict], Optional
     availability, binary = _cbm_availability(root)
     if availability == cbm_indexing.UNAVAILABLE:
         print(f"CBM: {availability}")
-        print(_CBM_ACQUISITION_POINTER)
+        if cbm_support.platform_tag() in cbm_support.CERTIFIED_CBM_BINARIES:
+            print(_CBM_ACQUISITION_POINTER)
+        else:
+            # No certified release for this platform: setup cannot help,
+            # so the honest message is the optional-backend one.
+            print(_CBM_OPTIONAL_BACKEND_LINE)
         return None, None, None
     if availability == cbm_indexing.UNSUPPORTED:
         print(
@@ -1829,7 +1850,14 @@ def cmd_cbm_status(args) -> int:
         }
         _emit(payload, args.json, "\n".join(lines))
         return EXIT_OK
-    if availability in (cbm_indexing.UNAVAILABLE, cbm_indexing.UNSUPPORTED):
+    if availability == cbm_indexing.UNAVAILABLE and (
+        cbm_support.platform_tag() in cbm_support.CERTIFIED_CBM_BINARIES
+    ):
+        # Certified platform with no binary: setup is the honest fix.
+        next_action = "relinkra cbm setup"
+        lines.append(f"Next: {next_action}")
+        lines.append(_CBM_OPTIONAL_BACKEND_LINE)
+    elif availability in (cbm_indexing.UNAVAILABLE, cbm_indexing.UNSUPPORTED):
         lines.append(_CBM_OPTIONAL_BACKEND_LINE)
     elif next_action:
         lines.append(f"Next: {next_action}")
@@ -1846,6 +1874,60 @@ def cmd_cbm_status(args) -> int:
     }
     _emit(payload, args.json, "\n".join(lines))
     return EXIT_OK
+
+
+def cmd_cbm_setup(args) -> int:
+    """Install the certified CBM binary into the Relinkra-managed location.
+
+    Exit 0 for INSTALLED and ALREADY_INSTALLED; exit 1 for NOT_CERTIFIED
+    (no certified release for this platform) and FAILED (acquisition or
+    verification error) — an honest nonzero, never a silent unverified
+    fallback.
+    """
+    result = cbm_acquire.setup_cbm(from_file=args.from_file)
+    payload = result.to_dict()
+    if result.status in (
+        cbm_acquire.STATUS_INSTALLED,
+        cbm_acquire.STATUS_ALREADY_INSTALLED,
+    ):
+        headline = (
+            "CBM: ALREADY_INSTALLED"
+            if result.status == cbm_acquire.STATUS_ALREADY_INSTALLED
+            else "CBM: INSTALLED"
+        )
+        lines = [
+            "",
+            headline,
+            f"Managed binary: {result.managed_path}",
+            f"Version: {cbm_support.CERTIFIED_CBM_VERSION} "
+            f"({cbm_support.platform_tag()})",
+            "SHA-256: verified against the certified pin",
+            "",
+            "Next: relinkra cbm index",
+            "",
+        ]
+        _emit(payload, args.json, "\n".join(lines))
+        return EXIT_OK
+    if result.status == cbm_acquire.STATUS_NOT_CERTIFIED:
+        lines = [
+            "",
+            f"CBM: NOT_CERTIFIED — {result.detail}",
+            _CBM_OPTIONAL_BACKEND_LINE,
+            "",
+        ]
+        _emit(payload, args.json, "\n".join(lines))
+        return EXIT_ERROR
+    if args.json:
+        # Machine-readable failure: the payload carries error/detail so
+        # callers get the same verdict they get on stdout for every
+        # other setup outcome.
+        _emit(payload, True, "")
+    else:
+        _fail(
+            result.error or "CBM setup failed",
+            result.detail or "See docs/cbm-backend.md (Acquisition).",
+        )
+    return EXIT_ERROR
 
 
 def cmd_cbm_index(args) -> int:
@@ -2179,10 +2261,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.set_defaults(func=handler)
 
-    # The cbm family (R5E.2B): one nested subcommand set so the three
-    # optional-backend lifecycle verbs read as one workflow.
+    # The cbm family (R5E.2B): one nested subcommand set so the
+    # optional-backend lifecycle verbs read as one workflow. R5H.1 adds
+    # `setup`: managed acquisition of the certified binary.
     cbm_cmd = sub.add_parser(
-        "cbm", help="manage the optional CBM code index (status/index/refresh)"
+        "cbm",
+        help="manage the optional CBM code index (setup/status/index/refresh)",
     )
     cbm_sub = cbm_cmd.add_subparsers(dest="cbm_command", required=True)
     for name, handler, help_text in (
@@ -2209,6 +2293,24 @@ def build_parser() -> argparse.ArgumentParser:
                 help="indexing mode (only 'fast' is supported)",
             )
         cbm_command.set_defaults(func=handler)
+
+    # setup is user-level, not workspace-level: it takes no --path.
+    setup_command = cbm_sub.add_parser(
+        "setup",
+        help="install the certified CBM binary (Relinkra-managed location)",
+    )
+    setup_command.add_argument(
+        "--from-file",
+        dest="from_file",
+        default=None,
+        metavar="PATH",
+        help="install from a local release archive or executable "
+        "(offline path; verified with the same pinned checksums)",
+    )
+    setup_command.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    setup_command.set_defaults(func=cmd_cbm_setup)
 
     # Version takes no --path: it answers about the tool, not a workspace.
     version_cmd = sub.add_parser(

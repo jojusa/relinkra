@@ -59,8 +59,10 @@ unsupported version).
 supported range (0.9.x, certified 0.9.0).
 
 **Fix:** this is optional — everything except symbol-level code
-resolution works without it. To enable it, install CBM 0.9.0 and either
-put it on `PATH`, point `RELINKRA_CBM_BIN` at the binary, or use the
+resolution works without it. To enable it, run `relinkra cbm setup`
+(checksum-verified install of the certified 0.9.0 release into the
+per-user Relinkra-managed location). Advanced alternatives: put the
+binary on `PATH`, point `RELINKRA_CBM_BIN` at it, or use the
 workspace-managed `.codebase-memory/bin/` location. On macOS/Linux, note
 that the certified binary currently ships for windows-amd64 only.
 

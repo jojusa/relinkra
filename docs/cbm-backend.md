@@ -21,9 +21,14 @@ of scope and stay untouched.
 
 ## User workflow
 
-Once the certified binary is in place, the index is a normal part of
-working with a repository:
+Install the certified binary once per machine, then the index is a
+normal part of working with a repository:
 
+0. `relinkra cbm setup` — downloads the certified release for this
+   platform, verifies the archive and the executable against the pinned
+   SHA-256 digests, probes the version, and installs it into the
+   per-user Relinkra-managed location. Idempotent; offline path:
+   `relinkra cbm setup --from-file <archive-or-exe>`.
 1. `relinkra cbm status` — shows `Index: MISSING`, `READY`, or `STALE`
    (plus the honest backend states `UNAVAILABLE`/`UNSUPPORTED`/
    `UNKNOWN`). If the executable is present but fails the certified
@@ -65,6 +70,52 @@ contract id). Doctor's CBM trust ladder reads it — update both together.
 
 ## Acquisition (safe, reproducible)
 
+`relinkra cbm setup` is the normal acquisition path (R5H.1). It:
+
+1. Resolves the certified record for the current platform tag. On a
+   platform without certified provenance it reports `NOT_CERTIFIED`
+   honestly (exit non-zero) and downloads nothing.
+2. Downloads the version-pinned asset derived deterministically from the
+   certified tag
+   (`.../releases/download/v0.9.0/codebase-memory-mcp-<tag>.zip`, never
+   a floating `latest`), or takes a local archive/executable with
+   `--from-file` (the documented offline path — same verification
+   semantics).
+3. Verifies the archive SHA-256 against the pinned release digest
+   **before** opening it, extracts only the expected executable member
+   (archive member names are never trusted as destinations; absolute
+   paths and `..` traversal are refused), and verifies the extracted
+   executable SHA-256 against the pinned binary digest.
+4. Only then executes the binary — once, for a bounded `--version`
+   probe that must classify as the certified version.
+5. Activates atomically: the binary is staged in a sibling temp
+   directory on the same filesystem and moved into place under an
+   interprocess lock. Concurrent setups serialize; a pre-existing (even
+   corrupt) installation is replaced only after the new binary is fully
+   verified, and is left untouched on any failure.
+
+The managed location is per-user, versioned, and shared across projects
+and hosts — outside any project repository:
+
+```
+<data-root>/backends/cbm/<version>/codebase-memory-mcp[.exe]
+```
+
+where `<data-root>` is `~/.local/relinkra` on Windows and
+`$XDG_DATA_HOME/relinkra` (or `~/.local/share/relinkra`) elsewhere.
+`RELINKRA_DATA_ROOT` overrides it (advanced/testing only). Setup writes
+a `relinkra-cbm-provenance.json` record (source, digests, install time)
+next to the binary as audit evidence; runtime trust never depends on
+that file — the SHA-256 gates stay authoritative.
+
+Binary resolution order at runtime: `RELINKRA_CBM_BIN` → per-user
+Relinkra-managed certified binary → workspace `.codebase-memory/bin/` →
+`PATH`.
+
+### Manual acquisition (advanced)
+
+The manual flow remains available for pre-existing setups:
+
 1. Download the release archive for the platform from the upstream
    `v0.9.0` release (version-pinned URL, never `latest`).
 2. Verify the archive SHA-256 against **both** the release `checksums.txt`
@@ -79,29 +130,6 @@ contract id). Doctor's CBM trust ladder reads it — update both together.
    committed.
 5. Record the workspace-to-CBM mapping with `relinkra register`
    (`--cbm-project-name --cbm-cache-dir --cbm-version --cbm-sha256`).
-
-Binary resolution order at runtime: `RELINKRA_CBM_BIN` → managed
-`.codebase-memory/bin/` → `PATH`.
-
-### MUST-BEFORE-FINAL-0.1.0 follow-up: managed acquisition/discovery
-
-Keep acquisition separate from R5G.6. The bounded follow-up should make the
-Relinkra MCP/service discover a version-pinned, checksum-verified CBM release
-in the workspace-managed location before constructing the adapter:
-
-1. `relinkra cbm acquire` resolves the certified platform asset, verifies
-   its published digest, and installs only under `.codebase-memory/bin/`.
-2. Adapter startup resolves `managed binary → PATH` and records the selected
-   source, version, and digest in the existing registry; an explicit
-   `RELINKRA_CBM_BIN` remains an operator override for compatibility.
-3. Acquisition never writes host configs, agent instruction files, or global
-   state. Offline, unsupported, or failed verification remains optional
-   degradation, never a silent unverified binary.
-
-Acceptance is one managed fresh-project proof plus regression coverage for
-asset selection, checksum failure, override precedence, offline degradation,
-and unchanged connector behavior. No host should store its own CBM path as
-the product's authority.
 
 ## Upgrade detection and adoption
 

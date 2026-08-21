@@ -40,17 +40,17 @@ relinkra init        # registers this project and workspace
 relinkra doctor      # deep diagnostics with suggested fixes
 ```
 
-If the optional CBM backend is installed, build and maintain its index with
-the real commands below:
+Optionally install the CBM code-intelligence backend — recommended for
+architecture and relationship intelligence; everything works without it:
 
 ```text
+relinkra cbm setup     # downloads and checksum-verifies the certified binary
 relinkra cbm index
 relinkra cbm status
 relinkra cbm refresh
 ```
 
-There is no `relinkra cbm setup` command in this release. CBM remains
-optional; native agent tools continue to work without it.
+CBM remains optional; native agent tools continue to work without it.
 
 Connect your agent host (example: `claude`; run `relinkra connect list` to see every supported host):
 

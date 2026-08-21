@@ -11,7 +11,9 @@ repository.
 2. From a clone of this repository: `pip install .`
 3. Inside your project's git repository: `relinkra init`
 4. Confirm everything works: `relinkra doctor`
-5. Connect your agent: `relinkra connect plan <host>` then
+5. Optionally enable code intelligence: `relinkra cbm setup`, then
+   `relinkra cbm index`
+6. Connect your agent: `relinkra connect plan <host>` then
    `relinkra connect apply <host>`
 
 ## Requirements
@@ -107,8 +109,13 @@ explanation.
 
 - **Certified version: 0.9.0** (supported range: 0.9.x, up to but not
   including 0.10.0).
+- **Install:** `relinkra cbm setup` downloads the certified release,
+  verifies its SHA-256 against the pinned digests, and installs it into
+  the per-user Relinkra-managed location. Offline:
+  `relinkra cbm setup --from-file <archive-or-exe>`.
 - **Discovery order:** the `RELINKRA_CBM_BIN` environment variable, then
-  a workspace-managed `.codebase-memory/bin/` directory, then `PATH`.
+  the per-user Relinkra-managed location, then a workspace-managed
+  `.codebase-memory/bin/` directory, then `PATH`.
 - **Platform note:** the certified binary currently ships for
   windows-amd64 only. On macOS and Linux this is a known limitation —
   `doctor` explains the state and everything else remains usable. See
