@@ -265,6 +265,9 @@ class CbmStatusTests(CBMCLITestCase):
         self.assertEqual(payload["next_action"], "relinkra cbm setup")
 
     def test_untrusted_binary_refuses_without_executing(self):
+        # Deterministic untrusted provenance: the binary resolves and its
+        # SHA fails the certified pin, on ANY machine (a real managed
+        # binary installed by `relinkra cbm setup` must not leak in).
         freshness = mock.Mock(
             return_value={
                 "state": cbm_indexing.UNTRUSTED,
@@ -272,10 +275,16 @@ class CbmStatusTests(CBMCLITestCase):
                 "worktree_drift": None,
             }
         )
-        with mock.patch.object(cbm_indexing, "freshness_state", freshness):
+        with contextlib.ExitStack() as stack:
+            for patch in self.happy_gate_patches(sha=BAD_SHA):
+                stack.enter_context(patch)
+            stack.enter_context(
+                mock.patch.object(cbm_indexing, "freshness_state", freshness)
+            )
             code, out, err = self.run_cli("cbm", "status")
             self.assertEqual(code, EXIT_OK, err)
             self.assertIn("refusing to execute an unverified binary", out)
+            freshness.assert_not_called()
             code, out, err = self.run_cli("cbm", "status", "--json")
         self.assertEqual(code, EXIT_OK, err)
         payload = json.loads(out)

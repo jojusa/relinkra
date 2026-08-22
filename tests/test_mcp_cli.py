@@ -13,7 +13,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from relinkra import cbm_support
 from relinkra.identity import RepositoryIdentity
 from relinkra.mcp_cli import _resolve_cbm_wiring
 from relinkra.registry import Registry
@@ -103,9 +105,19 @@ class CbmWiringCase(unittest.TestCase):
         managed.mkdir(parents=True)
         exe = managed / "codebase-memory-mcp.exe"
         exe.write_bytes(b"fake")
-        cbm_bin, cache_dir, project_name = _resolve_cbm_wiring(
-            str(self.root), None, None, None
-        )
+        # Isolate the per-user managed location: a real binary installed
+        # by `relinkra cbm setup` on this machine would otherwise win the
+        # documented discovery order and make the test machine-dependent.
+        isolated_root = self.root / "isolated-data-root"
+        isolated_root.mkdir()
+        with mock.patch.object(
+            cbm_support,
+            "relinkra_data_root",
+            lambda environ=None: str(isolated_root),
+        ):
+            cbm_bin, cache_dir, project_name = _resolve_cbm_wiring(
+                str(self.root), None, None, None
+            )
         self.assertEqual(cbm_bin, str(exe))
         self.assertIsNone(cache_dir)
         self.assertIsNone(project_name)

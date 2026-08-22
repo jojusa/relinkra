@@ -1,6 +1,9 @@
 # Product CLI (R4A)
 
-The user-facing front door: `init`, `status`, `doctor`, `project`, `version`.
+The user-facing front door: `init`, `status`, `doctor`, `project`,
+`version`, `cbm`, and `connect`. The `cbm` subcommands (code-index setup
+and lifecycle) are documented in [CBM backend](cbm-backend.md); the
+`connect` subcommands (agent hosts) in [Connectors](connectors.md).
 
 **Powerful inside, simple outside.** A developer should get from a fresh
 clone to a working Relinkra without knowing what CBM, Engram, a logical
@@ -52,8 +55,9 @@ Nothing here re-derives identity, re-probes engines, or re-parses git.
 integrity checks on top of the same `health()` call `status` renders.
 
 The subcommand table in `build_parser` is a plain loop over
-`(name, handler, help)`, so `connect`, `context`, `handoff`, and `memory`
-slot in later without restructuring.
+`(name, handler, help)`, so new subcommands slot in without
+restructuring — `connect` and `cbm` already arrived that way, and
+`context`, `handoff`, and `memory` can follow.
 
 ## Exit codes
 
@@ -127,8 +131,8 @@ action when it is not passing:
 ```
 WARN CBM
       no CBM adapter configured
-      Suggested action: Optional. Configure a code-index binary to
-      enable symbol resolution; everything else works without it.
+      Suggested action: Optional. Run 'relinkra cbm setup' to install the
+      certified code-index binary; everything else works without it.
 ```
 
 Checks: Python runtime, git executable, git repository, Relinkra config,
