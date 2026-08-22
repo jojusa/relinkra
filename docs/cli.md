@@ -178,7 +178,7 @@ One file, `.relinkra/config.json`, alongside the registry:
   "project_id": "rlk_...",
   "workspace_id": "ws_...",
   "initialized_at": "...",
-  "relinkra_version": "0.1.0rc2"
+  "relinkra_version": "0.1.0"
 }
 ```
 

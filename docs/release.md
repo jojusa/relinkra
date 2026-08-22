@@ -220,7 +220,7 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 python -m build
 python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
 # explicit paths — PowerShell does not expand the glob:
-# python tools/artifact_checks.py dist/relinkra-0.1.0rc2-py3-none-any.whl dist/relinkra-0.1.0rc2.tar.gz
+# python tools/artifact_checks.py dist/relinkra-0.1.0-py3-none-any.whl dist/relinkra-0.1.0.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -234,14 +234,14 @@ python tools/release_check.py --evidence external.json --require rc
 
 # Focused E2E: install the exact artifact under test (as packaging.yml does)
 # bash:
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0rc2-py3-none-any.whl \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0rc2.tar.gz \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 # PowerShell equivalents:
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0rc2-py3-none-any.whl"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0-py3-none-any.whl"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0rc2.tar.gz"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0.tar.gz"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
@@ -281,7 +281,7 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- Version 0.1.0rc2 (release candidate for 0.1.0), single-sourced in `relinkra/__init__.py`
+- Version 0.1.0, single-sourced in `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by
   `tests/test_packaging.py`.
