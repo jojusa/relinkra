@@ -107,6 +107,30 @@ same-authority value is preferable for current-status questions. Both records
 remain available. Equal or unusable chronology is not treated as
 supersession.
 
+### Resolution status
+
+Every contradiction carries a bounded `resolution_status` derived from the
+conflict class — never a hidden selection of a winner:
+
+| Value | Meaning |
+|---|---|
+| `unresolved` | No authority/freshness evidence picks a side (`identity_conflict`, `status_conflict`, `source_disagreement`, `same_key_different_value`). Both records remain visible with their provenance. |
+| `current_source_preferred` | `revision_mismatch`: evidence is bound to different revisions. Prefer the current-revision-bound evidence for claims about what the code currently does, and treat the divergent records as historical/stale. |
+| `superseded` | `temporal_supersession`: a newer same-authority value exists. Both records remain; the newer one is preferred for current-status questions. |
+
+`resolution_status` states a policy preference. It never deletes, demotes, or
+rewrites evidence, and a non-`unresolved` label still keeps every record.
+
+### Current-source priority
+
+For claims about **current code behavior**, evidence bound to the current Git
+revision outranks stale CBM graphs, older Engram memories, older handoffs, and
+historical commits. The older evidence is preserved as `stale`/`aging`
+freshness with an advisory, recommended-check notice — never deleted and never
+presented as current truth. When no current revision is available to compare
+against, currency is reported as `unknown`, and conflicting records stay
+`unresolved` rather than being resolved by model inference.
+
 ## Authority and autonomy boundaries
 
 - Git owns commit relationships; CBM owns its graph/trust verdict; connector

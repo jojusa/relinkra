@@ -92,6 +92,15 @@ Healthy means: no FAIL entries in `doctor` (WARN entries are typically optional 
 - **CBM unavailable or not certified on this platform** — code intelligence is unavailable; everything else works. See [CBM backend](docs/cbm-backend.md).
 - **Engram unavailable** — memory and handoffs report as unavailable; commands still succeed. See [Installation](docs/installation.md).
 
+## Conflicting and stale context
+
+Relinkra combines evidence from source, Git, CBM graphs, memory, and handoffs.
+When those sources disagree it does not silently collapse them into one truth:
+older evidence stays visible and is marked stale/historical, current-source
+evidence is presented as current for current-code claims, and unresolvable
+conflicts are surfaced as unresolved rather than guessed away. See
+[Freshness, contradictions, and explainability](docs/freshness-explainability.md).
+
 ## Optional external integrations
 
 Both are third-party projects, installed and managed independently. Neither is bundled with Relinkra, and neither is required for the quick start.

@@ -26,6 +26,20 @@ class ContradictionType(str, Enum):
     TEMPORAL_SUPERSESSION = "temporal_supersession"
 
 
+class ResolutionStatus(str, Enum):
+    """How a contradiction resolves, when resolution evidence exists.
+
+    This is a derived policy label, not a hidden winner selector. Every
+    value still keeps both evidence records; a non-``unresolved`` label
+    only states *which* evidence the freshness/chronology policy prefers,
+    and never deletes or demotes the other record.
+    """
+
+    UNRESOLVED = "unresolved"
+    CURRENT_SOURCE_PREFERRED = "current_source_preferred"
+    SUPERSEDED = "superseded"
+
+
 @dataclass(frozen=True)
 class EvidenceFact:
     evidence_id: str
@@ -57,6 +71,7 @@ class Contradiction:
     observed_at: tuple[str, ...]
     explanation: str
     recommended_action: str
+    resolution_status: str = ResolutionStatus.UNRESOLVED.value
     newer_evidence_ref: Optional[str] = None
     newer_value: Any = None
 
@@ -65,6 +80,7 @@ class Contradiction:
             "contradiction_id": self.contradiction_id,
             "type": self.type.value,
             "severity": self.severity,
+            "resolution_status": self.resolution_status,
             "subject": self.subject,
             "key": self.key,
             "evidence_refs": list(self.evidence_refs),
@@ -185,6 +201,7 @@ def _build(
 
     if contradiction_type == ContradictionType.TEMPORAL_SUPERSESSION:
         severity = "info"
+        resolution_status = ResolutionStatus.SUPERSEDED.value
         explanation = (
             "A newer structured value supersedes an older value from the same "
             "authority domain. Both remain available as evidence."
@@ -192,22 +209,27 @@ def _build(
         action = "Prefer the newer same-authority value for current status questions."
     elif contradiction_type == ContradictionType.REVISION_MISMATCH:
         severity = "warning"
+        resolution_status = ResolutionStatus.CURRENT_SOURCE_PREFERRED.value
         explanation = "Evidence for the same subject is bound to different revisions."
         action = "Prefer current revision-bound evidence and inspect code when needed."
     elif contradiction_type == ContradictionType.IDENTITY_CONFLICT:
         severity = "warning"
+        resolution_status = ResolutionStatus.UNRESOLVED.value
         explanation = "Structured evidence disagrees about logical identity."
         action = "Resolve the identity explicitly; preserve both records until confirmed."
     elif contradiction_type == ContradictionType.STATUS_CONFLICT:
         severity = "warning"
+        resolution_status = ResolutionStatus.UNRESOLVED.value
         explanation = "Same-authority structured status values conflict."
         action = "Refresh the source or resolve the status manually."
     elif contradiction_type == ContradictionType.SOURCE_DISAGREEMENT:
         severity = "warning"
+        resolution_status = ResolutionStatus.UNRESOLVED.value
         explanation = "Sources in the same authority domain report different values."
         action = "Refresh both sources and inspect the authoritative system."
     else:
         severity = "warning"
+        resolution_status = ResolutionStatus.UNRESOLVED.value
         explanation = "The same structured key has different values."
         action = "Inspect the underlying sources and resolve manually."
     values = tuple(
@@ -248,6 +270,7 @@ def _build(
         contradiction_id=_stable_id(contradiction_type, subject, key, facts),
         type=contradiction_type,
         severity=severity,
+        resolution_status=resolution_status,
         subject=subject,
         key=key,
         evidence_refs=tuple(f.evidence_id for f in facts),
