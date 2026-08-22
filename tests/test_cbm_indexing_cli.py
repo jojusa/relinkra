@@ -382,11 +382,42 @@ class CbmIndexTests(CBMCLITestCase):
             product_cli.cbm_support,
             "resolve_cbm_binary",
             lambda root=None, environ=None: None,
+        ), mock.patch.object(
+            # Certified-platform semantics: since 888cf740 the acquisition
+            # pointer only prints where a certified release exists, so pin
+            # the scenario to windows-amd64 instead of the host OS.
+            product_cli.cbm_support,
+            "platform_tag",
+            lambda: "windows-amd64",
         ), mock.patch.object(cbm_indexing, "run_index", run_index):
             code, out, err = self.run_cli("cbm", "index")
         self.assertEqual(code, EXIT_ERROR)
         self.assertIn("CBM: UNAVAILABLE", out)
         self.assertIn("docs/cbm-backend.md", out)
+        run_index.assert_not_called()
+
+    def test_no_binary_on_uncertified_platform_is_honest(self):
+        # Uncertified host: setup cannot help, so the gate prints the
+        # optional-backend line instead of the Windows acquisition/docs
+        # pointer, and still exits honestly without executing anything.
+        run_index = mock.Mock()
+        with mock.patch.object(
+            product_cli.cbm_support,
+            "resolve_cbm_binary",
+            lambda root=None, environ=None: None,
+        ), mock.patch.object(
+            product_cli.cbm_support, "platform_tag", lambda: "linux-amd64"
+        ), mock.patch.object(cbm_indexing, "run_index", run_index):
+            code, out, err = self.run_cli("cbm", "index")
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("CBM: UNAVAILABLE", out)
+        self.assertIn(
+            "Optional backend unavailable; native agent tools remain "
+            "available.",
+            out,
+        )
+        self.assertNotIn("docs/cbm-backend.md", out)
+        self.assertNotIn("Next:", out)
         run_index.assert_not_called()
 
     def test_trust_gate_refuses_mismatched_hash_before_exec(self):
