@@ -120,8 +120,22 @@ application service at all.
 
 ### Argument conventions
 
-- `project_id` / `workspace_id` are optional on every tool; they fall
-  back to the server's configured defaults.
+- `project_id` / `workspace_id` are optional on every tool. They fall
+  back to the server's configured defaults (`--project-id` /
+  `--workspace-id`). When `project_id` is omitted and no default is
+  configured, project-scoped tools **auto-resolve** the current project
+  deterministically from the bound workspace context
+  (`--workspace-root` + registry) — the same discovery `project_resolve`
+  performs, narrowed to a strict single-match contract. An explicit
+  `project_id` is always honored verbatim and never silently replaced.
+- Auto-resolution is **fail-closed**. When the workspace cannot be
+  matched to exactly one registered project — no workspace root, no
+  registry, failed identity discovery, an unregistered repository, or a
+  degenerate registry where several projects share one identity — the
+  call returns a typed `not_found` error whose message names the remedy:
+  register the workspace (`relinkra connect`), pass an explicit
+  `project_id`, or call `project_resolve` for diagnostics. It never
+  guesses.
 - **Paths are server-owned.** `--workspace-root` is set at startup and is
   never taken from a tool argument, so an agent cannot point Relinkra at
   an arbitrary directory. `file` arguments are repo-relative POSIX paths

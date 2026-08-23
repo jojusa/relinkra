@@ -305,13 +305,81 @@ class RelinkraServices:
         return context, resolver
 
     def _resolve_project_id(self, project_id: Optional[str]) -> str:
+        """Resolve project identity for one tool call.
+
+        Resolution order: explicit argument -> configured server default
+        -> deterministic discovery from the bound workspace context. An
+        explicit value is honored verbatim and never replaced — even an
+        unregistered one keeps its existing per-tool semantics.
+
+        Auto-resolution applies ONLY when both the argument and the
+        configured default are absent, and fails closed with a typed,
+        actionable ServiceError when the workspace cannot be matched to
+        exactly one registered project.
+        """
         resolved = (project_id or self.config.default_project_id or "").strip()
-        if not resolved:
+        if resolved:
+            return resolved
+        return self._auto_resolve_project_id()
+
+    def _auto_resolve_project_id(self) -> str:
+        """Derive the current project from the bound workspace context.
+
+        Uses the same discovery machinery ``project_resolve`` uses — the
+        server-owned workspace root and registry, never a caller-supplied
+        path — narrowed to a strict single-match contract: zero matches
+        and multiple matches both fail closed instead of guessing, so
+        auto-resolution can never bind another repository's identity.
+        """
+        if not self.config.workspace_root:
             raise ServiceError(
-                ERR_INVALID_INPUT,
-                "project_id is required (no default project is configured)",
+                ERR_NOT_FOUND,
+                "project_id could not be auto-resolved: this server was "
+                "launched without --workspace-root, so there is no "
+                "workspace context; pass an explicit project_id",
             )
-        return resolved
+        if self.registry is None:
+            detail = f": {self._registry_error}" if self._registry_error else ""
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project_id could not be auto-resolved: the project "
+                f"registry is unavailable{detail}; pass an explicit "
+                "project_id or call project_resolve",
+            )
+        discovered, discovery_warning = self._discover_identity()
+        if discovered is None:
+            reason = (
+                discovery_warning.message
+                if discovery_warning is not None
+                else "unknown discovery failure"
+            )
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project_id could not be auto-resolved: repository "
+                f"identity discovery failed ({reason}); pass an explicit "
+                "project_id or call project_resolve",
+            )
+        matches = [
+            project
+            for project in self.registry.projects.values()
+            if project.repository_identity.value == discovered.value
+        ]
+        if len(matches) == 1:
+            return matches[0].project_id
+        if len(matches) > 1:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project_id could not be auto-resolved: "
+                f"{len(matches)} registered projects share this "
+                "repository identity; pass an explicit project_id",
+            )
+        raise ServiceError(
+            ERR_NOT_FOUND,
+            "project_id could not be auto-resolved: the current workspace "
+            "does not match any registered Relinkra project; register it "
+            "(relinkra connect), pass an explicit project_id, or call "
+            "project_resolve for diagnostics",
+        )
 
     def _resolve_workspace_id(
         self, workspace_id: Optional[str]

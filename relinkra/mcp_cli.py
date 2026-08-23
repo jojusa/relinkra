@@ -64,7 +64,8 @@ def _resolve_cbm_wiring(
     workspace root disables CBM rather than forwarding a hostile path.
 
     Identity defaults (``--project-id``/``--workspace-id``) are NOT
-    resolved here: the production project-id requirement is unchanged.
+    resolved here: tool calls resolve identity themselves (explicit
+    argument -> configured default -> workspace auto-resolution).
     """
     from pathlib import Path
 

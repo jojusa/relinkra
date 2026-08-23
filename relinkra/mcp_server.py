@@ -74,7 +74,9 @@ def _string_array(desc: str) -> dict:
 
 
 _PROJECT_ID = _string(
-    "Logical Relinkra project id (rlk_...). Omit to use the server default."
+    "Logical Relinkra project id (rlk_...). Omit to use the server "
+    "default or the project auto-resolved from this server's bound "
+    "workspace."
 )
 _WORKSPACE_ID = _string(
     "Workspace id (ws_...). Omit to use the server default."
