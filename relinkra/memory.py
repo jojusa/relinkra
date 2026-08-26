@@ -474,12 +474,17 @@ class Memory:
 class QueryResult:
     memories: list = field(default_factory=list)
     skipped_malformed: int = 0
+    #: Records the transport itself flagged as cut off (CLI display
+    #: truncation). Counted separately so a degraded read channel is
+    #: reported honestly instead of inflating the malformed counter.
+    skipped_truncated: int = 0
 
     def to_dict(self) -> dict:
         return {
             "memories": [m.to_dict() for m in self.memories],
             "count": len(self.memories),
             "skipped_malformed": self.skipped_malformed,
+            "skipped_truncated": self.skipped_truncated,
         }
 
 
@@ -717,7 +722,9 @@ class MemoryService:
             project=project_id,
             limit=STORE_PAGE_LIMIT,
         )
-        memories, skipped = self._parse_envelopes(records, project_id)
+        memories, skipped_malformed, skipped_truncated = self._parse_envelopes(
+            records, project_id
+        )
         visible = [m for m in memories if m.scope_channel in channels]
         if memory_type:
             storage_type_for(memory_type)
@@ -726,7 +733,11 @@ class MemoryService:
         visible = self._apply_lifecycle(visible, include_history)
         if not include_history:
             visible = visible[-limit:]
-        return QueryResult(memories=visible, skipped_malformed=skipped)
+        return QueryResult(
+            memories=visible,
+            skipped_malformed=skipped_malformed,
+            skipped_truncated=skipped_truncated,
+        )
 
     def get(
         self, *, project_id: str, memory_id: str
@@ -758,20 +769,31 @@ class MemoryService:
 
     def _parse_envelopes(
         self, records: list, project_id: str
-    ) -> tuple[list[Memory], int]:
+    ) -> tuple[list[Memory], int, int]:
+        """Parse raw records into memories plus two honest skip counters.
+
+        ``skipped_malformed`` counts data that is broken on its own
+        terms; ``skipped_truncated`` counts records the transport itself
+        flagged as cut off. Cross-project records are dropped silently —
+        that is policy, not corruption.
+        """
         memories: list[Memory] = []
-        skipped = 0
+        skipped_malformed = 0
+        skipped_truncated = 0
         for record in records:
             try:
                 data = json.loads(record.content)
                 memory = Memory.from_envelope(data)
             except (ValueError, TypeError, MemoryValidationError):
-                skipped += 1
+                if getattr(record, "truncated", False):
+                    skipped_truncated += 1
+                else:
+                    skipped_malformed += 1
                 continue
             if memory.project_id != project_id:
                 continue
             memories.append(memory)
-        return memories, skipped
+        return memories, skipped_malformed, skipped_truncated
 
     def _apply_lifecycle(
         self, memories: list[Memory], include_history: bool
@@ -815,7 +837,7 @@ class MemoryService:
         records = self.store.search_records(
             query=text, project=project_id, limit=STORE_PAGE_LIMIT
         )
-        memories, _ = self._parse_envelopes(records, project_id)
+        memories, _, _ = self._parse_envelopes(records, project_id)
         return memories
 
     def _find_duplicate(

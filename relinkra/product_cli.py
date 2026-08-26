@@ -407,8 +407,15 @@ def check_registry(root: Path) -> Check:
     return Check("Registry", PASS, "readable and valid")
 
 
-def _component_check(name: str, probe: dict, action: str) -> Check:
+def _component_check(
+    name: str, probe: dict, action: str, prefer_detail: bool = False
+) -> Check:
     if probe.get("available"):
+        # A healthy engine that has something to say stays audible: the
+        # Engram probe reports memory-read integrity (skipped counters,
+        # read path) while green, so operators see it without a failure.
+        if prefer_detail and (probe.get("detail") or "").strip():
+            return Check(name, PASS, probe["detail"])
         detail = "available"
         if not probe.get("checked", True):
             detail = "configured (not liveness-checked)"
@@ -447,6 +454,9 @@ def component_checks(health: dict) -> List[Check]:
             components.get("engram") or {},
             "Install Engram and ensure 'engram' is on your PATH. "
             "Memory and handoffs stay unavailable until then.",
+            # The engram probe's detail carries memory integrity info
+            # even when green; surface it instead of a bare "available".
+            prefer_detail=True,
         ),
         _component_check(
             "CBM",

@@ -240,7 +240,10 @@ class ContextBuilder:
             "code_facts": 0,
             "warnings": 0,
         }
-        diagnostics: dict[str, Any] = {"skipped_malformed": 0}
+        diagnostics: dict[str, Any] = {
+            "skipped_malformed": 0,
+            "skipped_truncated": 0,
+        }
 
         project_id = self._validate_project(request.project_id)
         workspace_id = None
@@ -775,6 +778,7 @@ class ContextBuilder:
             )
             candidates.extend(result.memories)
             diagnostics["skipped_malformed"] += result.skipped_malformed
+            diagnostics["skipped_truncated"] += result.skipped_truncated
         except MemoryError as exc:
             warnings.append(
                 PacketWarning(
@@ -795,6 +799,7 @@ class ContextBuilder:
                 )
                 candidates.extend(private.memories)
                 diagnostics["skipped_malformed"] += private.skipped_malformed
+                diagnostics["skipped_truncated"] += private.skipped_truncated
             except MemoryError as exc:
                 warnings.append(
                     PacketWarning(

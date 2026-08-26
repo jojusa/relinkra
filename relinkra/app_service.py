@@ -690,6 +690,7 @@ class RelinkraServices:
             "project_id": project_id,
             "count": len(result.memories),
             "skipped_malformed": result.skipped_malformed,
+            "skipped_truncated": result.skipped_truncated,
             "memories": explained_memories,
             "explainability": {
                 "as_of": freshness_context.as_of,
@@ -1430,7 +1431,19 @@ class RelinkraServices:
             self.store.search_records(
                 query=ENVELOPE_VERSION, project="rlk_" + "0" * 32, limit=1
             )
-            return _Probe(available=True)
+            # One bounded policy query exposes read-path integrity: how
+            # many stored rows were skipped as malformed vs. flagged
+            # truncated by the transport, and which tier actually served
+            # the last read (http / loopback / cli).
+            result = self.memories.query(
+                project_id="rlk_" + "0" * 32, limit=1
+            )
+            detail = (
+                f"memory integrity: skipped_malformed={result.skipped_malformed} "
+                f"skipped_truncated={result.skipped_truncated} "
+                f"read_path={getattr(self.store, 'read_mode', 'unknown')}"
+            )
+            return _Probe(available=True, detail=detail)
         except MemoryError as exc:
             return _Probe(available=False, detail=str(exc))
         except Exception as exc:

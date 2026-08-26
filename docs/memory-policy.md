@@ -149,34 +149,53 @@ not put secrets in memories.
 **no direct SQLite** — so both agents keep using the same physical DB.
 `InMemoryStore` is a deterministic offline store for tests.
 
-### Read path: HTTP first, CLI fallback (truncation resolved)
+### Read path: HTTP first, loopback second, CLI fallback
 
 `engram search` truncates content display at ~300 chars with a trailing
 `...`. A spec-compliant envelope is larger than that, so through the CLI
-text output the truncated envelope cannot be parsed as JSON and is
-skipped (counted in `skipped_malformed`). Resolution: reads try the
-local **Engram HTTP API** first, an *optional read path on the same
-physical backend*:
+text output a truncated envelope cannot be parsed as JSON. Reads
+therefore follow a three-tier path over the SAME physical backend:
 
-- Base URL precedence is explicit `http_url`, then `ENGRAM_URL` (including an
-  empty value), then a non-empty `ENGRAM_DATA_DIR` safety mode that disables
-  HTTP, then the default `http://127.0.0.1:7437`. Set `ENGRAM_URL=""` to
-  disable HTTP explicitly.
+1. **Configured HTTP.** Base URL precedence is explicit `http_url`, then
+   `ENGRAM_URL` (including an empty value), then a non-empty
+   `ENGRAM_DATA_DIR` safety mode that disables external HTTP, then the
+   default `http://127.0.0.1:7437`. Set `ENGRAM_URL=""` to disable HTTP
+   explicitly.
+2. **Loopback server.** When no external endpoint is configured or
+   reachable and HTTP is not explicitly disabled, the adapter starts its
+   own ephemeral `engram serve <free-port>` bound to the SAME data
+   directory the CLI writes to (`ENGRAM_DATA_DIR`, else `~/.engram`).
+   This restores full-fidelity reads whenever the engram binary exists;
+   instances are shared per (binary, data dir) per process and shut down
+   at exit. Loopback failures never break a search — they degrade to
+   tier 3.
+3. **CLI text fallback.** `engram search` output is reassembled into
+   records; content that ends with the truncation marker is flagged
+   `truncated=True`.
+
 - `GET /search?q=<query>&project=<project>` returns a JSON array with
-  **full untruncated `content`**; `GET /observations/{id}` returns a
-  full record. Both are read-only and safe.
+  **full untruncated `content`**; tiers 1 and 2 therefore deliver every
+  envelope whole whenever either is available.
 - Short timeout (2s). Any failure — server down, timeout, malformed
-  payload — falls back transparently to the `engram search` CLI.
+  payload — falls back transparently to the next tier.
 - `--type` filtering and the store page limit are applied client-side
-  on HTTP results.
+  on HTTP/loopback results.
 
-**Writes always go through the `engram save` CLI**; the CLI is also the
-read fallback. Limitation: when the HTTP server is not running, the CLI
-truncation caveat above still applies to full-fidelity retrieval (save,
-project binding, and FTS discoverability are unaffected). Query paging
-is fixed: the store is always asked for a page of 200 records and
-channel/type/lifecycle filtering plus the user `--limit` are applied
-afterwards, so filtering can never starve visible results.
+**Honest accounting in degraded modes.** When only the CLI text path is
+available (explicit `ENGRAM_URL=""` hard-off, or both HTTP tiers
+unreachable), envelopes cut off by the display truncation can no longer
+parse; they are counted separately as `skipped_truncated`, visible in
+`memory_search` responses, ContextPacket diagnostics, and health probe
+detail — while genuinely broken data remains `skipped_malformed` and
+fail-safe. A truncated counter above zero means "the transport lost
+bytes", not "the data was corrupt"; memories affected are simply absent
+from results rather than mis-parsed.
+
+**Writes always go through the `engram save` CLI**; loopback failures
+never affect saves. Query paging is fixed: the store is always asked for
+a page of 200 records and channel/type/lifecycle filtering plus the user
+`--limit` are applied afterwards, so filtering can never starve visible
+results.
 
 All policy behavior is fully validated offline via mocked subprocess
 and mocked `urllib`; no server is required for the normal test suite.

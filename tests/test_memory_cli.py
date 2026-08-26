@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -18,6 +19,7 @@ from relinkra.engram_adapter import (
     DEFAULT_ENGRAM_URL,
     EngramCLIAdapter,
     InMemoryStore,
+    _close_all_loopbacks,
     parse_save_output,
     parse_search_output,
 )
@@ -28,6 +30,26 @@ from relinkra.registry import Registry
 PID = "rlk_" + "a1b2c3d4" * 4
 WID = "ws_" + "1" * 32
 REPO_VALUE = "explicit://cli-test-project"
+
+
+def _cleanup_tmp_dir(tmp) -> None:
+    """Remove a scratch dir, tolerating Windows handle-release races.
+
+    Right after a killed ``engram`` child exits, Windows (and the
+    occasional AV scanner) can still hold one of its SQLite files for a
+    moment, making rmtree fail with "directory not empty". Retry
+    briefly; a PERSISTENT lock still raises, which is exactly the
+    process-leak signal this suite must keep visible.
+    """
+    last_error = None
+    for _ in range(8):
+        try:
+            tmp.cleanup()
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.5)
+    raise last_error
 
 SAMPLE_SEARCH = """Found 2 memories:
 
@@ -85,6 +107,9 @@ class TestParseSearchOutput(unittest.TestCase):
         records = parse_search_output(SAMPLE_SEARCH)
         truncated = records[1]
         self.assertTrue(truncated.content.endswith("..."))
+        # Transport honesty: the parser flags cut-off content so the
+        # policy layer can account for it separately from malformed data.
+        self.assertTrue(truncated.truncated)
         with self.assertRaises(json.JSONDecodeError):
             json.loads(truncated.content)
 
@@ -667,11 +692,21 @@ class TestEngramIntegration(unittest.TestCase):
     """Opt-in roundtrip against the real engram binary, fully isolated.
 
     ENGRAM_DATA_DIR points at a TemporaryDirectory for the subprocess
-    environment, so the global ~/.engram/engram.db is never touched.
-    The HTTP read path is disabled (http_url=""), so the global :7437
-    server is never required or consulted. The test asserts both that
-    writes landed in the scratch dir and that the global DB mtime did
-    not change.
+    environment, so the global ~/.engram/engram.db is never touched and
+    the global :7437 server is never required or consulted.
+
+    Two read-path scenarios are pinned:
+
+    - With only ENGRAM_DATA_DIR isolation (ENGRAM_URL absent), the
+      adapter's loopback server engages over that same data dir, so the
+      saved memory round-trips with FULL content: found by the query,
+      skipped_malformed == 0.
+    - With ENGRAM_URL="" (hard-off), reads degrade to the CLI text
+      output; the truncated envelope cannot parse, so it is reported as
+      skipped_truncated >= 1 while skipped_malformed stays 0 — transport
+      loss counted honestly, not as corruption. The tests assert both
+      that writes landed in the scratch dir and that the global DB mtime
+      did not change.
     """
 
     GLOBAL_DB = os.path.join(os.path.expanduser("~"), ".engram", "engram.db")
@@ -680,13 +715,24 @@ class TestEngramIntegration(unittest.TestCase):
         if shutil.which("engram") is None:
             self.skipTest("engram binary not available on PATH")
         self._scratch = tempfile.TemporaryDirectory()
-        self.addCleanup(self._scratch.cleanup)
+        self.addCleanup(_cleanup_tmp_dir, self._scratch)
+        self.addCleanup(_close_all_loopbacks)
         env_patch = mock.patch.dict(
             os.environ, {"ENGRAM_DATA_DIR": self._scratch.name}
         )
         env_patch.start()
         self.addCleanup(env_patch.stop)
+        # ENGRAM_URL must be absent for the loopback tier to engage;
+        # restore whatever the outer environment had afterwards.
+        self._saved_engram_url = os.environ.pop("ENGRAM_URL", None)
+        self.addCleanup(self._restore_engram_url)
         self._global_mtime_before = self._global_db_mtime()
+
+    def _restore_engram_url(self):
+        if self._saved_engram_url is None:
+            os.environ.pop("ENGRAM_URL", None)
+        else:
+            os.environ["ENGRAM_URL"] = self._saved_engram_url
 
     @classmethod
     def _global_db_mtime(cls):
@@ -694,30 +740,7 @@ class TestEngramIntegration(unittest.TestCase):
             return os.path.getmtime(cls.GLOBAL_DB)
         return None
 
-    def test_roundtrip_against_real_engram(self):
-        store = EngramCLIAdapter(http_url="")
-        code, out, err = cli_save(store, title="Integration probe", content="body")
-        self.assertEqual(code, 0, err)
-        saved = json.loads(out)["memory"]
-        pid = saved["project_id"]
-        records = store.search_records(query="rlkmem1", project=pid, limit=25)
-        self.assertTrue(
-            any(r.title == "Integration probe" for r in records),
-            "saved memory must be findable via engram search",
-        )
-        code, out, _ = run_cli(
-            ["query", "--project-id", pid, "--scope", "project_shared"],
-            store=store,
-        )
-        self.assertEqual(code, 0)
-        payload = json.loads(out)
-        if any(r.content.endswith("...") for r in records):
-            self.assertGreaterEqual(payload["skipped_malformed"], 1)
-        else:
-            self.assertIn(
-                "Integration probe",
-                [m["title"] for m in payload["memories"]],
-            )
+    def _assert_writes_stayed_local(self):
         self.assertTrue(
             os.path.exists(os.path.join(self._scratch.name, "engram.db")),
             "writes must land in the scratch ENGRAM_DATA_DIR",
@@ -727,6 +750,63 @@ class TestEngramIntegration(unittest.TestCase):
             self._global_mtime_before,
             "global ~/.engram/engram.db must not be modified",
         )
+
+    def test_roundtrip_with_loopback_read_path(self):
+        # No explicit http_url + isolated data dir -> loopback engages.
+        store = EngramCLIAdapter()
+        self.assertTrue(store.allow_loopback)
+        code, out, err = cli_save(store, title="Integration probe", content="body")
+        self.assertEqual(code, 0, err)
+        saved = json.loads(out)["memory"]
+        pid = saved["project_id"]
+        records = store.search_records(query="rlkmem1", project=pid, limit=25)
+        self.assertEqual(store.read_mode, "loopback")
+        match = next(
+            (r for r in records if r.title == "Integration probe"), None
+        )
+        self.assertIsNotNone(
+            match, "saved memory must be findable via engram search"
+        )
+        # Full-fidelity proof: the record handed back parses completely.
+        self.assertFalse(match.content.endswith("..."))
+        self.assertEqual(json.loads(match.content)["v"], "rlkmem1")
+        code, out, _ = run_cli(
+            ["query", "--project-id", pid, "--scope", "project_shared"],
+            store=store,
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn(
+            "Integration probe",
+            [m["title"] for m in payload["memories"]],
+        )
+        self.assertEqual(payload["skipped_malformed"], 0)
+        self.assertEqual(payload.get("skipped_truncated"), 0)
+        self._assert_writes_stayed_local()
+
+    def test_roundtrip_hard_off_degrades_honestly(self):
+        env_patch = mock.patch.dict(os.environ, {"ENGRAM_URL": ""})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        store = EngramCLIAdapter(http_url="")
+        self.assertFalse(store.allow_loopback)
+        code, out, err = cli_save(store, title="Integration probe", content="body")
+        self.assertEqual(code, 0, err)
+        pid = json.loads(out)["memory"]["project_id"]
+        code, out, _ = run_cli(
+            ["query", "--project-id", pid, "--scope", "project_shared"],
+            store=store,
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertNotIn(
+            "Integration probe",
+            [m["title"] for m in payload["memories"]],
+        )
+        # Transport loss counted honestly: truncated, not malformed.
+        self.assertGreaterEqual(payload["skipped_truncated"], 1)
+        self.assertEqual(payload["skipped_malformed"], 0)
+        self._assert_writes_stayed_local()
 
 
 if __name__ == "__main__":
