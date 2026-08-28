@@ -6,13 +6,13 @@ evidence, and what remains open before a public release. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: CI-VERIFIED.** The CI workflows below have executed remotely
-> and are green (remote full regression, packaging, and installed-MCP
-> evidence: PASS). Checkable proof: CI run
-> [31815886965](https://github.com/jojusa/relinkra/actions/runs/31815886965)
-> and Packaging run
-> [31815886882](https://github.com/jojusa/relinkra/actions/runs/31815886882),
-> both bound to commit `60062ec0`. What remains open is tracked in
+> **Status: historical evidence only.** The linked CI and packaging runs
+> ([CI run](https://github.com/jojusa/relinkra/actions/runs/31815886965),
+> [Packaging run](https://github.com/jojusa/relinkra/actions/runs/31815886882))
+> are bound to the older ancestor commit `60062ec0`. They must not be read as
+> certification of the current release HEAD. Before public publication,
+> regenerate the exact release-HEAD evidence and evaluate the public-release
+> gates against that evidence. What remains open is tracked in
 > [Remaining evidence debt](#remaining-evidence-debt).
 
 ## Scope
@@ -21,8 +21,11 @@ R5B delivers release *verification*: local test tooling, an artifact
 content contract, an evidence-driven gate model, and three GitHub
 workflows that run it all.
 
-R5B is **not** publication. Nothing here uploads to PyPI, creates a
-GitHub Release, or pushes a git tag. RC tagging is not approved yet;
+R5B is **not** publication. This checkpoint does not publish the package to
+PyPI, create a GitHub Release, or push a git tag. The normal post-publication
+install command is `python -m pip install relinkra` (equivalent to
+`pip install relinkra`); local validation uses built artifacts or a source
+checkout. RC tagging is not approved yet;
 publication requires the blockers in
 [Remaining evidence debt](#remaining-evidence-debt) to be resolved.
 
@@ -41,6 +44,22 @@ is CI-VERIFIED (once CI runs), but it is **never** host or CBM
 certification. Real-host certification requires the real binary on the
 real host. Do not blur these levels — overstating a level is the exact
 failure this document exists to prevent.
+
+## Gate ownership and release policy
+
+Release evidence is interpreted in four distinct classes:
+
+| Class | Gates / evidence | Policy role |
+|---|---|---|
+| **Product/local gates** | `TECHNICAL_CORE`, `PACKAGING`, `DOCUMENTATION`, `LEGAL`, `SECURITY` | Deterministic code, artifact, documentation, legal, and workflow checks. These remain authoritative local product gates. |
+| **Platform certification gates** | `WINDOWS`, `LINUX`, `MACOS`, `CBM_CERTIFICATION`, `HOST_CERTIFICATION` | Evidence about operating systems, the CBM backend, and real agent hosts. Fixture tests do not substitute for certification. |
+| **Hosted-CI/infrastructure gates** | `CI` plus release-HEAD remote evidence and artifact availability | Remote execution and infrastructure prove or supply evidence; stale, missing, or unavailable hosted evidence remains partial/unknown and is not silently treated as PASS. |
+| **Tolerated partial backend certification** | `CBM_CERTIFICATION` and `HOST_CERTIFICATION` only | `PARTIAL` may be carried as documented release debt. This exception does not relax product/local gates, platform regression gates, or hosted-CI requirements. |
+
+These classes are orthogonal: hosted CI can provide evidence for product or
+platform gates, but it does not change their required scope. No corrupted or
+unverifiable external review authority is a product gate; local deterministic
+gates remain authoritative when that authority is unavailable.
 
 ## CI map
 
@@ -104,8 +123,8 @@ into PASS.
 **Honesty notes.** This evidence chain cannot certify CBM on Linux/macOS
 (there is no certified binary) and says nothing about real-HOST
 certification — those gates keep their own evidence requirements. Remote
-generation has happened: the remote CI runs are green and their evidence
-is consumed through exactly this chain.
+generation has happened for the linked historical runs, and their evidence is
+consumed through exactly this chain; it is not current release-HEAD evidence.
 
 ### `packaging.yml` — Packaging
 
@@ -145,7 +164,7 @@ honestly and the integration ladder stops before execution; CI verifies
 the absence/degraded behavior — and a CI fixture passing is **not** CBM
 certification.
 
-**Host connectors** (Claude, OpenCode, Codex, Devin Desktop) are
+**Host connectors** (Claude, OpenCode, Codex, ZCode, Devin Desktop) are
 real-host certified **locally**, as historical recorded evidence — the
 certification is not regenerated per CI run. CI runs fixture/sandbox
 connector tests only. **Devin Cloud is UNSUPPORTED** (roadmap).
@@ -182,7 +201,13 @@ possibly apply is NOT_APPLICABLE, never PASS.
 |---|---|
 | `safe_to_merge` | `TECHNICAL_CORE`, `PACKAGING`, `SECURITY` PASS; `CI` PASS or PARTIAL; no BLOCKED among the four. |
 | `safe_to_tag_rc` | `safe_to_merge`, plus `WINDOWS`, `LINUX`, `MACOS`, `CI` all PASS, `DOCUMENTATION` at least PARTIAL. A `LEGAL` BLOCKED is surfaced but tolerated for an internal RC tag; any other BLOCKED vetoes the tag. |
-| `safe_for_public_release` | Every gate PASS, except `CBM_CERTIFICATION` and `HOST_CERTIFICATION`, which may be PARTIAL as documented evidence debt. `LEGAL` and `DOCUMENTATION` must be PASS. |
+| `safe_for_public_release` | Every gate PASS on evidence bound to the exact release HEAD, except `CBM_CERTIFICATION` and `HOST_CERTIFICATION`, which may be PARTIAL as documented evidence debt. `LEGAL` and `DOCUMENTATION` must be PASS. |
+
+For this checkpoint, public release therefore requires fresh exact
+release-HEAD evidence for `TECHNICAL_CORE`, `PACKAGING`, `WINDOWS`, `LINUX`,
+`MACOS`, `CI`, `DOCUMENTATION`, `LEGAL`, and `SECURITY`. Historical evidence
+from `60062ec0` cannot satisfy those current-release gates. Only the documented
+partial CBM and host-certification debt is tolerated by policy.
 
 ### Reading `release_check.py` output
 
@@ -197,12 +222,13 @@ without `--evidence` it exits 2. The opt-in `--run-packaging` path may acquire b
 dependencies, separately from runtime/offline behavior. An exit 0 therefore means "reported", not "releasable"
 — use `--require` to assert a safety.
 
-Current report (collector evidence only): `TECHNICAL_CORE`, `PACKAGING`,
+At this checkpoint, the collector-only report is: `TECHNICAL_CORE`, `PACKAGING`,
 and the platform gates are PARTIAL (no regression/packaging evidence
 until `--run-regression`/`--run-packaging` runs); `SECURITY` PASS;
 `LEGAL` PASS (LICENSE present, MIT); `CI` PARTIAL (`REMOTE_CI_PENDING`).
 Fed with composed run-scoped remote evidence (`--evidence`), the
-technical, platform, and `CI` gates evaluate to the remote truth.
+technical, platform, and `CI` gates evaluate to the remote truth only when
+that evidence is regenerated and bound to the exact release HEAD.
 
 ## Local verification commands
 
@@ -314,10 +340,9 @@ RC realism rehearsal, not a release.
 
 Pre-existing debt the tooling surfaces honestly rather than hiding:
 
-- ~~**Python 3.9/3.10 machine certification**~~ — **resolved**: verified
-  by the remote CI matrix runs.
-- ~~**Linux/macOS real-run verification**~~ — **resolved**: the remote
-  CI runs are green on Linux and macOS.
+- **Historical remote CI evidence** — the linked runs cover Python 3.9/3.10
+  and Linux/macOS, but are bound to the older ancestor `60062ec0`. Regenerate
+  release-HEAD evidence before treating those public gates as satisfied.
 - **CBM provenance Windows-amd64 only** — no certified Linux/macOS
   binary; honest degradation is the designed behavior. Open.
 - **Host certifications are historical local evidence** — not
@@ -327,15 +352,23 @@ Public-release blockers (must all clear before publication):
 
 1. ~~**LICENSE absent**~~ — **resolved**: MIT LICENSE present; `LEGAL`
    gate PASS.
-2. ~~**Remote CI never run**~~ — **resolved**: remote runs are green on
-   all matrix cells; `CI` gate PASS.
-3. ~~**py3.9/3.10 and Linux/macOS real-machine evidence**~~ —
-   **resolved**: arrived via the remote CI runs; platform gates PASS.
-4. **CBM Windows-only provenance** — PARTIAL is tolerated for public
+2. **Exact release-HEAD CI and packaging evidence** — regenerate the
+   Windows, Linux, macOS, and CI evidence, plus technical, packaging, and
+   installed-MCP evidence, before publication. The linked ancestor evidence
+   is historical and does not clear this blocker.
+3. **CBM Windows-only provenance** — PARTIAL is tolerated for public
    release as documented debt; PASS requires certified Linux/macOS
    binaries. Open.
-5. **Host certification historical** — PARTIAL tolerated for public
+4. **Host certification historical** — PARTIAL tolerated for public
    release as documented debt; PASS requires CI regeneration. Open.
+
+## External and infrastructure blockers
+
+Release-HEAD CI reruns, runner availability, artifact retention, and PyPI
+publication are external or infrastructure concerns. They are blockers to
+release evidence, not product defects by themselves. Product defects remain
+code, test, or gate failures and must be triaged separately. This evidence
+refresh does not reopen R5K.
 
 ## Release checklist ownership
 
@@ -344,9 +377,9 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Before merging release work: run the full regression locally, then
       `python tools/release_check.py --run-regression --run-packaging
       --require merge`.
-- [x] First remote CI run green: verified — remote runs are green on all
-      matrix cells and the run-scoped evidence chain (emit → compose →
-      bind) is exercised by `release-readiness`.
+- [ ] Regenerate exact release-HEAD remote CI and packaging evidence; the
+      existing green runs and run-scoped evidence chain are historical because
+      they are bound to `60062ec0`.
 - [x] LICENSE resolved by the owner: MIT, present at the repository root.
 - [ ] Rehearse with the Release Candidate Dry Run workflow, then
       `python tools/release_check.py --evidence <all-evidence.json>

@@ -5,16 +5,28 @@ Relinkra is a Python package. Installing it gives you two commands —
 agents connect to) — that work from any directory, against any git
 repository.
 
+## What Relinkra does
+
+Relinkra gives connected coding agents shared project context, code
+intelligence, and persistent memory without replacing their native tools.
+
 ## Quick path
 
 1. Check requirements: Python 3.9 or newer, and Git.
-2. From a clone of this repository: `pip install .`
-3. Inside your project's git repository: `relinkra init`
-4. Confirm everything works: `relinkra doctor`
-5. Optionally enable code intelligence: `relinkra cbm setup`, then
-   `relinkra cbm index`
-6. Connect your agent: `relinkra connect plan <host>` then
-   `relinkra connect apply <host>`
+2. Install the published package with `python -m pip install relinkra`.
+   The equivalent user-facing contract is `pip install relinkra`.
+3. Inside your project's Git repository: `relinkra init`
+4. Connect your agent with `relinkra doctor`, then
+   `relinkra connect check <host>`, `relinkra connect plan <host>`, and
+   `relinkra connect apply <host>`.
+5. Restart the host and record host-side proof with
+   `relinkra connect verify <host> --proof <proof-file>` when required.
+6. Use the connected agent for normal project work.
+
+Relinkra is not being published to PyPI in this checkpoint. The PyPI command
+above is the post-publication normal path, not a claim that the package is
+currently publicly available. For local validation, use a built artifact or a
+source checkout as described below.
 
 ## Requirements
 
@@ -33,20 +45,30 @@ unsupported rather than failing the rest of the product.
 
 ## Install
 
-From a clone of the repository:
+### Normal installation (after publication)
 
-```
-pip install .
-```
-
-For development on Relinkra itself, use an editable install so source
-edits take effect immediately:
-
-```
-pip install -e .
+```bash
+python -m pip install relinkra
 ```
 
-Both commands install the same two entry points:
+`pip install relinkra` is the equivalent literal command contract.
+
+### Local validation and unreleased development
+
+The source-checkout path is only for local validation or unreleased
+development, not the normal user installation. Install a locally built wheel
+or sdist with `python -m pip install path/to/relinkra-<version>-py3-none-any.whl`,
+or install from a checkout:
+
+```bash
+git clone https://github.com/jojusa/relinkra.git
+cd relinkra
+python -m pip install .
+```
+
+Use `python -m pip install -e .` only when actively developing Relinkra.
+
+The normal and local installs expose the same two entry points:
 
 | Command | Purpose |
 |---|---|
@@ -78,13 +100,18 @@ Run this sequence inside your project's git repository:
 2. `relinkra doctor` — deep diagnostics. Fix anything marked FAIL;
    WARN entries are optional components you can enable later.
 3. `relinkra connect check <host>` — see the current registration state
-   for your agent host (`codex`, `claude`, `opencode`, `devin-desktop`).
+   for your agent host (`codex`, `claude`, `opencode`, `zcode`,
+   `devin-desktop`).
 4. `relinkra connect plan <host>` — preview exactly what would change.
    Read-only, writes nothing.
 5. `relinkra connect apply <host>` — write the host configuration. A
    timestamped backup (`*.relinkra-backup*`) is created first.
-6. `relinkra connect verify <host> --proof <file>` — record proof that
+6. `relinkra connect verify <host> --proof <proof-file>` — record proof that
    the real host served Relinkra, then use the agent.
+
+OpenCode and Codex use global, bare `relinkra-mcp` registrations; Codex uses
+`args = []`. ZCode uses a workspace-local configuration with the repository
+root as its `cwd`.
 
 ### What `init` does — and never does
 
@@ -106,6 +133,9 @@ agent host configurations, or starts background processes.
 CBM provides code intelligence (symbol-level resolution). It is optional:
 without it, everything else works and `doctor` reports a WARN with an
 explanation.
+
+Direct CBM setup is optional advanced/local configuration, not part of the
+normal public installation path.
 
 - **Certified version: 0.9.0** (supported range: 0.9.x, up to but not
   including 0.10.0).
@@ -137,11 +167,15 @@ full memory read/write and handoffs, install Engram and make sure the
 `engram` executable is on `PATH`. `ENGRAM_URL` may provide the HTTP read
 path, but it does not replace the CLI write path.
 
+Direct Engram use remains supported independently of host binding; connecting
+an agent host does not require Engram.
+
 ## Upgrade and uninstall
 
 | Task | Command / action |
 |---|---|
-| Upgrade | `pip install --upgrade .` from the updated clone (or reinstall) |
+| Upgrade published package | `python -m pip install --upgrade relinkra` |
+| Upgrade a local checkout | `python -m pip install --upgrade .` from the updated clone |
 | Uninstall the package | `pip uninstall relinkra` |
 | Remove project state | Delete `.relinkra/` inside the repository |
 | Remove host-config backups | Delete the `*.relinkra-backup*` files next to each host config |
@@ -160,9 +194,9 @@ Both are inert files; nothing runs or phones home if you leave them.
 
 ## Offline behavior
 
-- **Installing** needs network access only so pip can fetch build
-  dependencies (setuptools). With a warm pip cache, even that works
-  offline.
+- **Installing the published package** needs network access so pip can fetch
+  Relinkra and its metadata. Local source/build validation may also need
+  build dependencies; with a warm pip cache, it can work offline.
 - **Everything after install** — `init`, `doctor`, `status`, `project`,
   `connect`, git intelligence — works fully offline. Optional components
   (Engram, CBM) are local tools, not network services.
@@ -173,8 +207,8 @@ Both are inert files; nothing runs or phones home if you leave them.
 |---|---|
 | Windows | Console scripts land in the environment's `Scripts\` directory. If `relinkra` is not found after install, see [Troubleshooting](troubleshooting.md). |
 | macOS / Linux | Console scripts land in the environment's `bin/` directory. |
-| Virtual environments | Activate the environment first, then `pip install .`; the commands are available while it is active. |
-| Source checkout | Without installing, `python -m relinkra.product_cli` from the checkout is equivalent to `relinkra`. |
+| Virtual environments | Activate the environment first, then install the published package or local checkout; the commands are available while it is active. |
+| Source checkout | For unreleased/local development, `python -m relinkra.product_cli` from the checkout is equivalent to `relinkra`. |
 
 ## Next step
 
