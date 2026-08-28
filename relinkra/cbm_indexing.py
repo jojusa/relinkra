@@ -50,6 +50,7 @@ from .identity import (
 )
 from .memory import sanitize_error
 from .registry import Registry, RegistryError
+from .workspace_resolution import discover_git_root
 
 
 class IndexSetupError(Exception):
@@ -106,17 +107,8 @@ _QUIRK_SUFFIXES = (".db", ".db-wal", ".db-shm")
 
 
 def _workspace_root(start: Optional[str] = None) -> Optional[Path]:
-    """Walk upward for a ``.git`` entry (mirrors product_cli._repo_root).
-
-    Accepts a ``.git`` FILE as well as a directory so worktrees and
-    submodules resolve, and stops at the filesystem root on every
-    platform via the parent-is-self test.
-    """
-    current = Path(start or Path.cwd()).resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    """Compatibility wrapper around the shared Git-root resolver."""
+    return discover_git_root(start)
 
 
 def resolve_workspace(path: Optional[str] = None) -> Tuple[str, str]:

@@ -1144,9 +1144,18 @@ class GitReadOnlyTests(MCPTestCase):
 class DegradedModeTests(unittest.TestCase):
     """One failing subsystem must never break an unrelated tool."""
 
-    def _server(self, *, store=None, git_service=None, workspace_root=None):
+    def _server(
+        self,
+        *,
+        store=None,
+        git_service=None,
+        workspace_root=None,
+        bind_env_workspace=False,
+    ):
         env = Env(seed=True)
         self.addCleanup(env.cleanup)
+        if bind_env_workspace:
+            workspace_root = env.ws_dir
         services = RelinkraServices(
             config=ServiceConfig(
                 registry_path=env.registry_path,
@@ -1182,7 +1191,12 @@ class DegradedModeTests(unittest.TestCase):
 
     def test_engram_down_still_answers_project_resolve(self):
         """Identity comes from the registry, not from memory."""
-        server, env = self._server(store=BrokenStore())
+        # This service-level test supplies an explicit workspace binding;
+        # bare MCP startup outside Git is covered by the resolver probes and
+        # must fail closed before this compatibility path is reached.
+        server, env = self._server(
+            store=BrokenStore(), bind_env_workspace=True
+        )
         result = self._call(server, "project_resolve")
         self.assertFalse(result["isError"])
         self.assertEqual(

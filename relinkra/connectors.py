@@ -25,7 +25,7 @@ import importlib.util
 import shutil
 import sys
 import sysconfig
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -94,6 +94,7 @@ from .host_discovery import (
     find_executable,
     probe,
 )
+from .identity import canonicalize_path
 from .safe_write import (
     ConfigTooLargeError,
     SafeWriteError,
@@ -250,6 +251,60 @@ def resolve_launch(
         module=SERVER_MODULE,
         resolved=bool(command) and server_module_importable(),
         warnings=tuple(warnings),
+    )
+
+
+def resolve_host_launch(
+    connector_id: str,
+    workspace_root,
+    registry_path,
+    *,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    force_source_checkout: Optional[bool] = None,
+) -> LaunchContract:
+    """Resolve the launch contract appropriate for one host binding.
+
+    OpenCode and Codex are configured globally, so their entries must not
+    freeze a repository path. They inherit the host process CWD and let the
+    MCP startup resolver bind it. ZCode is workspace-local and therefore
+    receives an explicit canonical cwd in its config entry. Existing
+    connector callers continue to use :func:`resolve_launch` for pinned
+    compatibility contracts.
+    """
+    key = (connector_id or "").strip().lower()
+    if key in {"opencode", "codex"}:
+        launch = resolve_launch(
+            None,
+            None,
+            which=which,
+            force_source_checkout=force_source_checkout,
+        )
+        if launch.distribution == DISTRIBUTION_CONSOLE_SCRIPT:
+            # A global connector must remain portable across repositories
+            # and machines. The host resolves this bare command through its
+            # PATH; retaining shutil.which's absolute result would quietly
+            # reintroduce a machine-specific binding.
+            launch = replace(launch, command=CONSOLE_SCRIPT)
+        return launch
+    if key == "zcode":
+        launch = resolve_launch(
+            None,
+            None,
+            which=which,
+            force_source_checkout=force_source_checkout,
+        )
+        if launch.distribution == DISTRIBUTION_CONSOLE_SCRIPT:
+            launch = replace(launch, command=CONSOLE_SCRIPT)
+        if workspace_root:
+            launch = replace(
+                launch, cwd=canonicalize_path(str(workspace_root))
+            )
+        return launch
+    return resolve_launch(
+        workspace_root,
+        registry_path,
+        which=which,
+        force_source_checkout=force_source_checkout,
     )
 
 
@@ -444,6 +499,20 @@ def _toml_command_entry(launch: LaunchContract) -> Dict[str, Any]:
     return entry
 
 
+def _zcode_entry(launch: LaunchContract) -> Dict[str, Any]:
+    """ZCode's workspace-local stdio entry with an explicit repository cwd."""
+    entry: Dict[str, Any] = {
+        "type": "stdio",
+        "command": launch.command,
+        "args": list(launch.args),
+        "cwd": launch.cwd,
+        "enabled": True,
+    }
+    if launch.env:
+        entry["env"] = dict(launch.env)
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # Claude Code project keys and dynamic containers
 # ---------------------------------------------------------------------------
@@ -521,6 +590,11 @@ class ConnectorSpec:
     executables: Tuple[str, ...] = ()
     locations: Tuple[LocationSpec, ...] = ()
     container_path: Tuple[str, ...] = ()
+    #: How the generated launch binds to a workspace. ``pinned`` is the
+    #: legacy explicit-argument contract; ``host_cwd`` is the approved
+    #: global host-neutral contract; ``config_cwd`` is a workspace-local
+    #: config entry carrying an absolute cwd.
+    workspace_binding: str = "pinned"
     #: Optional hook resolving the container from the workspace root.
     #: Called with the root (or None outside a repository); a None
     #: result falls back to the static ``container_path``.
@@ -686,6 +760,20 @@ def _codex_locations() -> Tuple[LocationSpec, ...]:
                 env.env_dir("CODEX_HOME", "config.toml")
                 or env.home_path(".codex", "config.toml")
             ),
+        ),
+    )
+
+
+def _zcode_locations() -> Tuple[LocationSpec, ...]:
+    """ZCode's repository-local MCP configuration only."""
+    return (
+        LocationSpec(
+            location_id="zcode_workspace_config",
+            scope=SCOPE_WORKSPACE,
+            config_format=FORMAT_JSON,
+            display_hint="<workspace>/.zcode/config.json",
+            build=lambda env: env.workspace_path(".zcode", "config.json"),
+            mcp_authoritative=True,
         ),
     )
 
@@ -866,6 +954,7 @@ OPENCODE = ConnectorSpec(
     executables=("opencode",),
     locations=_opencode_locations(),
     container_path=("mcp",),
+    workspace_binding="host_cwd",
     config_format=FORMAT_JSON,
     entry_builder=_list_command_entry,
     format_verified=True,
@@ -896,11 +985,9 @@ OPENCODE = ConnectorSpec(
         "An entry of the same name that does not launch Relinkra is treated "
         "as a conflict and never overwritten.",
         "The apply target is the USER-scope 'mcp' container "
-        "(~/.config/opencode/opencode.json). The entry pins "
-        "--workspace-root/--registry to one workspace, so in other "
-        "workspaces it points at this workspace's registry — the same "
-        "documented tradeoff class as the global 'engram' entry already "
-        "present there.",
+        "(~/.config/opencode/opencode.json). The generated entry is bare "
+        "and inherits the host process CWD, so each launch resolves its "
+        "own active Git workspace instead of freezing this repository.",
         "OpenCode deep-merges opencode.json AND opencode.jsonc (jsonc "
         "wins on conflicts, verified against upstream ConfigPaths). Both "
         "are discovered and scanned for direct CBM; only the '.json' user "
@@ -931,6 +1018,7 @@ CODEX = ConnectorSpec(
     executables=("codex",),
     locations=_codex_locations(),
     container_path=("mcp_servers",),
+    workspace_binding="host_cwd",
     config_format=FORMAT_TOML,
     entry_builder=_toml_command_entry,
     format_verified=True,
@@ -955,6 +1043,39 @@ CODEX = ConnectorSpec(
         "Reading and writing require tomllib (Python 3.11+); older "
         "interpreters report the registration state as unknown and refuse "
         "to write, rather than guessing.",
+    ),
+)
+
+ZCODE = ConnectorSpec(
+    connector_id="zcode",
+    display_name="ZCode",
+    host_type="cli_agent",
+    aliases=(),
+    support_status=SUPPORT_EXPERIMENTAL,
+    executables=("zcode",),
+    locations=_zcode_locations(),
+    container_path=("mcp", "servers"),
+    workspace_binding="config_cwd",
+    config_format=FORMAT_JSON,
+    entry_builder=_zcode_entry,
+    format_verified=True,
+    format_evidence=(
+        "Workspace-local .zcode/config.json uses the documented nested "
+        "mcp.servers container with stdio command/args/cwd/enabled fields. "
+        "The connector writes only this repository-local file and does not "
+        "create a global ZCode registration."
+    ),
+    apply_available=True,
+    apply_unavailable_reason="",
+    restart_instruction="Restart ZCode so it re-reads the workspace configuration.",
+    security_notes=(
+        "The generated cwd is the canonical active Git root, so the server "
+        "binds deterministically even when ZCode starts it from a nested "
+        "directory.",
+        "Existing .zcode configuration members and unrelated MCP servers are "
+        "preserved; repeated apply is idempotent.",
+        "The configuration is workspace-local only. No global ZCode file is "
+        "read or written, and no direct CBM server is exposed.",
     ),
 )
 
@@ -1066,6 +1187,7 @@ CONNECTORS: Tuple[ConnectorSpec, ...] = (
     CLAUDE,
     OPENCODE,
     CODEX,
+    ZCODE,
     DEVIN_DESKTOP,
     DEVIN_CLOUD,
 )
@@ -1505,6 +1627,31 @@ def build_plan(
         if inspection.document is not None and location is inspection.location
         else {}
     )
+    existing_container = _read_container(document, inspection.container_path or spec.container_path)
+    existing_entry = (
+        existing_container.get(MANAGED_SERVER_NAME)
+        if isinstance(existing_container, Mapping)
+        else None
+    )
+    if (
+        spec.workspace_binding == "host_cwd"
+        and isinstance(existing_entry, Mapping)
+        and "cwd" in existing_entry
+    ):
+        plan.status = PLAN_BLOCKED
+        plan.registration_state = REGISTRATION_NEEDS_UPDATE
+        plan.conflicts.append(
+            f"{container_label(inspection.container_path or spec.container_path)}."
+            f"{MANAGED_SERVER_NAME} contains a workspace cwd"
+        )
+        plan.warnings.append(
+            ConnectorWarning(
+                "host_neutral_binding",
+                "a global host-neutral registration must not contain a cwd; "
+                "Relinkra will not silently preserve that binding",
+            )
+        )
+        return plan
     is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     container_path = inspection.container_path or spec.container_path
 
@@ -1801,7 +1948,36 @@ def check_registration(
             recorded_root = tokens[index + 1]
             break
 
-    if desired_root and recorded_root:
+    if spec.workspace_binding == "host_cwd":
+        # A global OpenCode/Codex entry is intentionally bare. Its process
+        # CWD is the binding input, so the absence of --workspace-root is a
+        # success condition rather than an invalid unbound registration.
+        result.matches_workspace = not recorded_root
+        if recorded_root:
+            result.findings.append(
+                "the global registration must be bare and must not pin a "
+                "workspace root."
+            )
+        if isinstance(entry, Mapping) and "cwd" in entry:
+            result.findings.append(
+                "the global registration must not configure a workspace cwd."
+            )
+    elif spec.workspace_binding == "config_cwd":
+        desired_root = launch.cwd
+        recorded_cwd = entry.get("cwd") if isinstance(entry, Mapping) else None
+        if desired_root and isinstance(recorded_cwd, str):
+            result.matches_workspace = _same_path(recorded_cwd, desired_root)
+            if not result.matches_workspace:
+                result.findings.append(
+                    "the registration points at a different workspace than this one."
+                )
+        else:
+            result.matches_workspace = False
+            result.findings.append(
+                "the workspace-local registration does not contain the "
+                "required repository cwd."
+            )
+    elif desired_root and recorded_root:
         result.matches_workspace = _same_path(recorded_root, desired_root)
         if not result.matches_workspace:
             result.findings.append(

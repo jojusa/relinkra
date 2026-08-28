@@ -66,6 +66,7 @@ from .identity import (
     git_head_sha,
 )
 from .registry import Registry, RegistryError
+from .workspace_resolution import discover_git_root
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -238,21 +239,14 @@ def registry_path(root: Path) -> Path:
 
 
 def _repo_root(start: Optional[str] = None) -> Optional[Path]:
-    """Walk upward for a .git entry. pathlib only — no separator literals.
-
-    Accepts a .git FILE as well as a directory so worktrees and
-    submodules resolve, and stops at the filesystem root on every
-    platform via the parent-is-self test.
-    """
-    current = Path(start or Path.cwd()).resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    """Compatibility wrapper around the shared Git-root resolver."""
+    return discover_git_root(start)
 
 
 def _workspace_cbm_record(
-    root: Path, config: Optional[WorkspaceConfig]
+    root: Path,
+    config: Optional[WorkspaceConfig],
+    registry_file: Optional[Path] = None,
 ) -> Optional[dict]:
     """The CBM identity record the registry holds for this workspace.
 
@@ -262,7 +256,7 @@ def _workspace_cbm_record(
     if config is None or not config.workspace_id:
         return None
     try:
-        registry = Registry(str(registry_path(root)))
+        registry = Registry(str(registry_file or registry_path(root)))
     except RegistryError:
         return None
     workspace = registry.get_workspace(config.workspace_id)

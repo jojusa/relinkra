@@ -1,4 +1,4 @@
-# Connectors (R4B)
+# Connectors (R5K.1 / R4B)
 
 Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
 Code, OpenCode, Codex, Devin Desktop (formerly Windsurf), or anything else that speaks MCP — to launch
@@ -10,6 +10,7 @@ The user-facing shape is meant to stay this small:
 relinkra connect list
 relinkra connect inspect claude
 relinkra connect plan claude
+relinkra connect apply claude
 relinkra connect check claude
 relinkra connect routing
 relinkra connect generic
@@ -17,17 +18,18 @@ relinkra connect generic
 
 Powerful inside, simple outside. Everything below is the "inside".
 
-> **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), and
-> Devin Desktop (R4C.1E) have gated write paths (`connect apply` / `rollback`
-> / `verify`). Devin Desktop has a real Cascade launch proof; other hosts
-> remain independently assessed. See [Capability honesty](#capability-honesty).
+> **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), Devin
+> Desktop (R4C.1E), and ZCode (R5K.1) have gated write paths (`connect apply`
+> / `rollback` / `verify`). Devin Desktop has a real Cascade launch proof;
+> R5K.1 host bindings remain independently assessed. See
+> [Capability honesty](#capability-honesty).
 
 ---
 
 ## Connector lifecycle
 
-Every connector mutation — when writing is eventually enabled — follows one
-fixed sequence. Read-only commands stop partway through it.
+Every connector mutation follows one fixed sequence. Read-only commands stop
+partway through it.
 
 ```
 discover → inspect → plan → validate plan → dry-run
@@ -41,10 +43,10 @@ discover → inspect → plan → validate plan → dry-run
 | plan | `connectors.build_plan` | yes | `connect plan` |
 | validate plan | `config_merge.decide_member` | yes | `connect plan` |
 | dry-run | planning *is* the dry run | yes | `connect plan --dry-run` |
-| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
-| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
-| validate result | `config_formats.adapter_for(...).validate` | yes | `connect apply` (claude, opencode, codex, devin-desktop) |
-| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode, codex, devin-desktop) |
+| backup | `safe_write.create_backup` | yes | `connect apply` (claude, opencode, codex, zcode, devin-desktop) |
+| atomic merge | `safe_write.safe_replace` | yes | `connect apply` (claude, opencode, codex, zcode, devin-desktop) |
+| validate result | `config_formats.adapter_for(...).validate` | yes | `connect apply` (claude, opencode, codex, zcode, devin-desktop) |
+| rollback | `safe_write.safe_replace` | yes | `connect rollback` (claude, opencode, codex, zcode, devin-desktop) |
 
 The last four rows are wired only for the connectors whose write gate is
 open; every other connector still stops at `plan` — see
@@ -57,6 +59,7 @@ open; every other connector still stops at `plan` — see
 | Module | Responsibility |
 | --- | --- |
 | `relinkra/connector.py` | Domain vocabulary: states, launch contract, plan, capability matrix. No I/O. |
+| `relinkra/workspace_resolution.py` | Central MCP startup resolver for explicit/env/CWD workspace roots and root-derived registries; read-only and fail-closed. |
 | `relinkra/host_discovery.py` | Bounded, declared candidate locations; pure path resolution; probing. |
 | `relinkra/config_merge.py` | Non-destructive structured merge and deterministic serialization. |
 | `relinkra/config_formats.py` | Per-format adapter seam (parse / validate / serialize_member) keyed off `spec.config_format`; JSON and TOML adapters. |
@@ -78,8 +81,10 @@ applies.
 
 ## Generic MCP contract
 
-`relinkra connect generic` emits the host-neutral way to start the server over
-stdio. It is derived from the running environment, never hardcoded.
+`relinkra connect generic` emits the compatibility, workspace-pinned way to
+start the server over stdio. Host-specific `connect apply <host>` uses the
+R5K.1 binding policy described below instead of copying those explicit paths
+into every host registration.
 
 Resolution order:
 
@@ -108,6 +113,56 @@ is still reviewable without disclosing where anything lives. Every payload
 rendered without `--reveal-paths` is audited for absolute paths immediately
 before printing; a leak fails the command rather than reaching the terminal.
 
+## R5K.1 host-neutral HYBRID binding
+
+The normal flow is:
+
+```text
+install Relinkra → relinkra init → relinkra connect apply <host>
+```
+
+Run `relinkra init` from the target Git repository before applying a host
+connector. It records the workspace-local Relinkra state under `.relinkra/`.
+The host connector then writes only the host configuration it owns; it does not
+start the host or claim that the host launched the MCP server.
+
+| Host | Registration scope | Binding written by Relinkra |
+| --- | --- | --- |
+| OpenCode | Global user config | Bare `relinkra-mcp` launch with no `--workspace-root`, `--registry`, or config `cwd`; the MCP process derives the active Git root from its process CWD. |
+| Codex | Global user config | Same bare launch contract as OpenCode; the process CWD determines the active Git root. |
+| ZCode | Workspace-local `.zcode/config.json` | `mcp.servers.relinkra` stdio entry with an absolute canonical repository-root `cwd`. |
+
+For OpenCode and Codex, a single global registration is intentionally
+repository-neutral. When the host starts the MCP process from a nested project
+directory, Relinkra walks upward to the enclosing Git root; `.git` directories
+and linked-worktree `.git` files are supported. The default registry is then
+`<resolved-root>/.relinkra/registry.json`.
+
+ZCode is intentionally not global: only `<workspace>/.zcode/config.json` is
+read or written, and its entry carries the absolute resolved Git root so a
+nested launch does not change the binding.
+
+### Compatibility options
+
+The explicit `--workspace-root`, `--registry`, `--project-id`, and
+`--workspace-id` options remain supported for compatibility and controlled
+manual launches. `RELINKRA_*` environment variables remain supported as well.
+The older `connect generic` contract continues to emit explicit workspace and
+registry arguments; it is not the host-neutral OpenCode/Codex registration.
+
+### Fail-closed states
+
+Root and registry resolution is read-only. Outside a Git repository, or before
+`relinkra init` has registered the workspace, automatic binding fails closed:
+it does not guess another repository and does not create `.relinkra`. Corrupt,
+missing, or ambiguous registry state is also reported as an actionable failure.
+MCP liveness methods such as `initialize`, `ping`, `tools/list`, and `health`
+may still be available without a project binding; project-scoped operations do
+not invent one.
+
+Engram remains an independent optional path. Host binding does not require
+Engram, and these connector instructions do not configure a direct CBM server.
+
 ---
 
 ## Support and proof matrix
@@ -121,6 +176,7 @@ machine — not from documentation.
 | `claude` | experimental | yes | `mcpServers` with `{command, args}` | yes | yes (R4C.1B) | **no** |
 | `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | yes (R4C.1C) | **no** |
 | `codex` | experimental | yes | `[mcp_servers.<name>]` TOML tables | yes | yes (R4C.1D) | **no** |
+| `zcode` | experimental | yes | workspace-local `mcp.servers` with `{type, command, args, cwd, enabled}` | yes | yes (R5K.1) | **no** |
 | `devin-desktop` | experimental | yes (current Devin file) | `mcpServers` with `{command, args}` | yes | **yes (R4C.1E)** | **yes (Cascade)** |
 | `devin-cloud` | unsupported | no | — | no | no | no |
 
@@ -186,6 +242,7 @@ Nothing is globbed and no directory is walked.
 | `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
 | `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`) — the only apply target, plus `opencode.jsonc` siblings at user and workspace scope and `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` (discoverable and scanned for direct CBM, never the apply target) |
 | `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| `zcode` | `<workspace>/.zcode/config.json` only |
 | `devin-desktop` | `.devin/mcp_config.local.json` → `.devin/mcp_config.json` → `%APPDATA%/Devin/mcp_config.json` → `~/.config/devin/mcp_config.json`; legacy `~/.codeium/windsurf/mcp_config.json` and `~/.codeium/windsurf-next/mcp_config.json` are discovery/import evidence only and are never preferred write targets |
 
 A host is reported `not_installed` only when **none** of its candidates exist
@@ -437,6 +494,19 @@ assertions and symlink refusal are skipped on Windows and vice versa; the
 environments rather than on real Linux and macOS hosts. Real host launches
 are recorded only for Devin Desktop (the R4C.1E Cascade proof, local
 Windows); no host launch has been recorded on Linux or macOS.
+
+### Windows, paths, and console scripts
+
+The installed `relinkra` and `relinkra-mcp` console scripts live in the
+environment's `Scripts` directory, which must be on `PATH`. If the scripts are
+not available, use `python -m relinkra.product_cli` or
+`python -m relinkra.mcp_cli` from the active environment. Launch commands keep
+the executable and argument list separate, so Windows paths containing spaces,
+`&`, or quotes are passed as data rather than through a shell.
+
+Relinkra configures its product and MCP streams for UTF-8; the MCP stream uses
+newline-delimited JSON-RPC framing and sends diagnostics to `stderr`. These
+settings avoid Windows console encoding and `CRLF` framing surprises.
 
 ---
 

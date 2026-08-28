@@ -15,7 +15,7 @@ from typing import Optional
 
 from .app_service import RelinkraServices, ServiceConfig
 from .mcp_server import MCPServer
-from .registry import DEFAULT_REGISTRY_PATH
+from .workspace_resolution import resolve_registry_path, resolve_workspace_root
 
 ENV_PREFIX = "RELINKRA_"
 
@@ -30,13 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--workspace-root",
-        default=_env("WORKSPACE_ROOT"),
+        default=None,
         help="repository root this server is bound to (server-owned; "
         "tool callers can never point Relinkra at another path)",
     )
-    parser.add_argument(
-        "--registry", default=_env("REGISTRY", DEFAULT_REGISTRY_PATH)
-    )
+    parser.add_argument("--registry", default=None)
     parser.add_argument("--engram-bin", default=_env("ENGRAM_BIN", "engram"))
     parser.add_argument(
         "--engram-project-alias", default=_env("ENGRAM_PROJECT_ALIAS")
@@ -54,6 +52,8 @@ def _resolve_cbm_wiring(
     cbm_bin: Optional[str],
     cbm_cache_dir: Optional[str],
     cbm_project_name: Optional[str],
+    *,
+    registry_path: Optional[str] = None,
 ) -> tuple:
     """Resolve CBM wiring the same way the product CLI does.
 
@@ -81,7 +81,11 @@ def _resolve_cbm_wiring(
     # the workspace config only supplies that key, never tool defaults.
     from .product_cli import WorkspaceConfig, _workspace_cbm_record
 
-    record = _workspace_cbm_record(root, WorkspaceConfig.load(root))
+    record = _workspace_cbm_record(
+        root,
+        WorkspaceConfig.load(root),
+        registry_file=Path(registry_path) if registry_path else None,
+    )
     if record:
         if not cbm_project_name:
             raw_project_name = record.get("project_name")
@@ -107,16 +111,35 @@ def _resolve_cbm_wiring(
     return cbm_bin, cbm_cache_dir, cbm_project_name
 
 
-def build_services(args) -> RelinkraServices:
-    cbm_bin, cbm_cache_dir, cbm_project_name = _resolve_cbm_wiring(
+def build_services(args, *, environ=None, cwd=None) -> RelinkraServices:
+    """Build services from one deterministic startup binding.
+
+    The parser deliberately leaves workspace and registry unset. Resolving
+    them together here prevents the registry default from drifting with the
+    MCP process CWD when the process was launched from a nested directory.
+    ``environ`` and ``cwd`` are injectable only for deterministic tests.
+    """
+    workspace = resolve_workspace_root(
         args.workspace_root,
+        environ=environ,
+        cwd=cwd,
+    )
+    registry = resolve_registry_path(
+        args.registry,
+        workspace.root,
+        environ=environ,
+        cwd=cwd,
+    )
+    cbm_bin, cbm_cache_dir, cbm_project_name = _resolve_cbm_wiring(
+        workspace.root,
         args.cbm_bin,
         args.cbm_cache_dir,
         args.cbm_project_name,
+        registry_path=registry,
     )
     config = ServiceConfig(
-        workspace_root=args.workspace_root,
-        registry_path=args.registry,
+        workspace_root=workspace.root,
+        registry_path=registry,
         engram_bin=args.engram_bin,
         engram_project_alias=args.engram_project_alias,
         cbm_bin=cbm_bin,
@@ -124,6 +147,7 @@ def build_services(args) -> RelinkraServices:
         cbm_project_name=cbm_project_name,
         default_project_id=args.project_id,
         default_workspace_id=args.workspace_id,
+        workspace_resolution_error=workspace.error or None,
     )
     return RelinkraServices(config=config)
 

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from relinkra import connect_cli
 from relinkra.connector import MANAGED_SERVER_NAME, iter_strings
+from relinkra.identity import canonicalize_path
 from relinkra.connectors import (
     CLAUDE,
     SERVER_MODULE,
@@ -208,7 +209,7 @@ class ListTests(ConnectCLICase):
         ids = [entry["connector_id"] for entry in payload["connectors"]]
         self.assertEqual(
             ids,
-            ["generic", "claude", "opencode", "codex", "devin-desktop", "devin-cloud"],
+            ["generic", "claude", "opencode", "codex", "zcode", "devin-desktop", "devin-cloud"],
         )
 
     def test_reports_that_nothing_is_host_proven(self):
@@ -341,6 +342,95 @@ class PlanTests(ConnectCLICase):
         self.claude_config({"mcpServers": {}})
         code, out, _ = self.run_cli("plan", "claude")
         self.assertIn("wrote nothing", out)
+
+
+class HostNeutralConnectorTests(ConnectCLICase):
+    """R5K.1 host bindings: global bare entries and local ZCode cwd."""
+
+    def test_opencode_apply_is_bare_and_preserves_engram_and_context7(self):
+        self.write_config(
+            ".config",
+            "opencode",
+            "opencode.json",
+            content={
+                "mcp": {
+                    "engram": {
+                        "type": "local",
+                        "command": ["engram", "mcp"],
+                    },
+                    "context7": {"type": "remote", "url": "https://example.invalid"},
+                },
+                "$schema": "https://example.invalid/schema.json",
+            },
+        )
+        code, payload, _ = self.run_json("apply", "opencode")
+        self.assertEqual(code, EXIT_OK)
+        document = json.loads(
+            (self.home / ".config" / "opencode" / "opencode.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        entry = document["mcp"][MANAGED_SERVER_NAME]
+        tokens = entry["command"]
+        self.assertNotIn("--workspace-root", tokens)
+        self.assertNotIn("--registry", tokens)
+        self.assertEqual(document["mcp"]["engram"]["command"], ["engram", "mcp"])
+        self.assertEqual(document["mcp"]["context7"]["type"], "remote")
+        self.assertEqual(document["$schema"], "https://example.invalid/schema.json")
+
+    def test_codex_apply_is_bare_and_preserves_unrelated_table(self):
+        self.write_config(
+            ".codex",
+            "config.toml",
+            content=(
+                '[mcp_servers.engram]\n'
+                'command = "engram"\n'
+                'args = ["mcp"]\n\n'
+                '[mcp_servers.context7]\n'
+                'url = "https://example.invalid"\n'
+            ),
+        )
+        code, payload, _ = self.run_json("apply", "codex")
+        self.assertEqual(code, EXIT_OK)
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - this suite needs Python 3.11+
+            self.skipTest("tomllib unavailable")
+        document = tomllib.loads(
+            (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        )
+        entry = document["mcp_servers"][MANAGED_SERVER_NAME]
+        self.assertNotIn("--workspace-root", entry["args"])
+        self.assertNotIn("--registry", entry["args"])
+        self.assertEqual(document["mcp_servers"]["engram"]["args"], ["mcp"])
+        self.assertEqual(document["mcp_servers"]["context7"]["url"], "https://example.invalid")
+
+    def test_zcode_apply_is_workspace_local_absolute_and_idempotent(self):
+        path = self.repo / ".zcode" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "mcp": {"servers": {"context7": {"type": "remote"}}},
+                    "theme": "dark",
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, first, _ = self.run_json("apply", "zcode")
+        self.assertEqual(code, EXIT_OK)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        entry = document["mcp"]["servers"][MANAGED_SERVER_NAME]
+        self.assertEqual(entry["args"], [])
+        self.assertEqual(entry["cwd"], canonicalize_path(str(self.repo)))
+        self.assertEqual(document["mcp"]["servers"]["context7"]["type"], "remote")
+        self.assertEqual(document["theme"], "dark")
+
+        before = path.read_bytes()
+        code, second, _ = self.run_json("apply", "zcode")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(second["change_required"])
 
 
 class CheckTests(ConnectCLICase):

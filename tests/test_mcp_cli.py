@@ -16,9 +16,17 @@ from pathlib import Path
 from unittest import mock
 
 from relinkra import cbm_support
-from relinkra.identity import RepositoryIdentity
-from relinkra.mcp_cli import _resolve_cbm_wiring
+from relinkra.identity import RepositoryIdentity, canonicalize_path
+from relinkra.mcp_cli import (
+    _resolve_cbm_wiring,
+    build_parser,
+    build_services,
+)
 from relinkra.registry import Registry
+from relinkra.workspace_resolution import (
+    resolve_registry_path,
+    resolve_workspace_root,
+)
 
 REALISTIC_RECORD = {
     "binary": {"sha256": "0" * 64, "version": "0.9.0"},
@@ -131,6 +139,141 @@ class CbmWiringCase(unittest.TestCase):
         self.assertIsNone(cache_dir)
         self.assertIsNone(project_name)
 
+
+class RuntimeBindingResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="relinkra-binding-")
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.explicit = base / "explicit"
+        self.env_root = base / "environment"
+        self.cwd_root = base / "cwd"
+        for root in (self.explicit, self.env_root, self.cwd_root):
+            (root / ".git").mkdir(parents=True)
+
+    def test_workspace_precedence_is_explicit_then_environment_then_cwd(self):
+        nested = self.explicit / "src" / "deep"
+        nested.mkdir(parents=True)
+        result = resolve_workspace_root(
+            str(nested),
+            environ={"RELINKRA_WORKSPACE_ROOT": str(self.env_root)},
+            cwd=str(self.cwd_root),
+        )
+        self.assertEqual(result.root, canonicalize_path(str(self.explicit)))
+        self.assertEqual(result.source, "explicit")
+
+        result = resolve_workspace_root(
+            None,
+            environ={"RELINKRA_WORKSPACE_ROOT": str(self.env_root)},
+            cwd=str(self.cwd_root),
+        )
+        self.assertEqual(result.root, canonicalize_path(str(self.env_root)))
+        self.assertEqual(result.source, "environment")
+
+        result = resolve_workspace_root(None, environ={}, cwd=str(self.cwd_root))
+        self.assertEqual(result.root, canonicalize_path(str(self.cwd_root)))
+        self.assertEqual(result.source, "cwd")
+
+    def test_git_file_and_outside_git_are_fail_closed(self):
+        worktree = Path(self.tmp.name) / "worktree"
+        (worktree / ".git").parent.mkdir(parents=True)
+        (worktree / ".git").write_text(
+            "gitdir: /shared/main/.git/worktrees/worktree\n",
+            encoding="utf-8",
+        )
+        nested = worktree / "src"
+        nested.mkdir()
+        result = resolve_workspace_root(None, environ={}, cwd=str(nested))
+        self.assertEqual(result.root, canonicalize_path(str(worktree)))
+
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        result = resolve_workspace_root(None, environ={}, cwd=str(outside))
+        self.assertIsNone(result.root)
+        self.assertEqual(result.source, "cwd")
+        self.assertIn("git", result.error.lower())
+
+        invalid_explicit = Path(self.tmp.name) / "not-a-repository"
+        result = resolve_workspace_root(
+            str(invalid_explicit),
+            environ={"RELINKRA_WORKSPACE_ROOT": str(self.cwd_root)},
+            cwd=str(self.cwd_root),
+        )
+        self.assertIsNone(result.root)
+        self.assertEqual(result.source, "explicit")
+        self.assertIn("workspace root", result.error.lower())
+
+    def test_registry_precedence_and_root_relative_default(self):
+        explicit = Path(self.tmp.name) / "explicit-registry.json"
+        env = Path(self.tmp.name) / "environment-registry.json"
+        cwd = Path(self.tmp.name) / "unrelated-cwd"
+        cwd.mkdir()
+
+        self.assertEqual(
+            resolve_registry_path(
+                str(explicit),
+                str(self.explicit),
+                environ={"RELINKRA_REGISTRY": str(env)},
+                cwd=str(cwd),
+            ),
+            canonicalize_path(str(explicit)),
+        )
+        self.assertEqual(
+            resolve_registry_path(
+                None,
+                str(self.explicit),
+                environ={"RELINKRA_REGISTRY": str(env)},
+                cwd=str(cwd),
+            ),
+            canonicalize_path(str(env)),
+        )
+        self.assertEqual(
+            resolve_registry_path(
+                None, str(self.explicit), environ={}, cwd=str(cwd)
+            ),
+            os.path.join(
+                canonicalize_path(str(self.explicit)),
+                ".relinkra",
+                "registry.json",
+            ),
+        )
+        self.assertIsNone(resolve_registry_path(None, None, environ={}, cwd=str(cwd)))
+
+    def test_build_services_uses_resolved_root_and_registry(self):
+        nested = self.explicit / "src"
+        nested.mkdir()
+        args = build_parser().parse_args(["--workspace-root", str(nested)])
+        with mock.patch.object(
+            __import__("relinkra.mcp_cli", fromlist=["_resolve_cbm_wiring"]),
+            "_resolve_cbm_wiring",
+            return_value=(None, None, None),
+        ):
+            services = build_services(args)
+        self.assertEqual(
+            services.config.workspace_root, canonicalize_path(str(self.explicit))
+        )
+        self.assertEqual(
+            services.config.registry_path,
+            os.path.join(
+                canonicalize_path(str(self.explicit)),
+                ".relinkra",
+                "registry.json",
+            ),
+        )
+
+    def test_outside_git_keeps_server_binding_unresolved_without_creating_state(self):
+        outside = Path(self.tmp.name) / "outside-server"
+        outside.mkdir()
+        args = build_parser().parse_args([])
+        module = __import__("relinkra.mcp_cli", fromlist=["_resolve_cbm_wiring"])
+        with mock.patch.object(
+            module, "_resolve_cbm_wiring", return_value=(None, None, None)
+        ):
+            services = build_services(args, environ={}, cwd=str(outside))
+        self.assertIsNone(services.config.workspace_root)
+        self.assertIsNone(services.config.registry_path)
+        self.assertTrue(services.config.workspace_resolution_error)
+        self.assertFalse((outside / ".relinkra").exists())
 
 if __name__ == "__main__":
     unittest.main()

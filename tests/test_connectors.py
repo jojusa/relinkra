@@ -64,6 +64,7 @@ from relinkra.connectors import (
     DEVIN_CLOUD,
     GENERIC,
     OPENCODE,
+    ZCODE,
     SERVER_MODULE,
     DEVIN_DESKTOP,
     build_plan,
@@ -77,10 +78,12 @@ from relinkra.connectors import (
     launch_contract_document,
     launches_relinkra,
     resolve_connector,
+    resolve_host_launch,
     resolve_launch,
     server_module_importable,
 )
 from relinkra.handoff import contains_absolute_path
+from relinkra.identity import canonicalize_path
 from relinkra.host_discovery import SYSTEM_LINUX, SYSTEM_WINDOWS, DiscoveryEnvironment
 from relinkra.safe_write import MAX_CONFIG_BYTES
 from relinkra.toml_edit import toml_parser_available
@@ -111,7 +114,7 @@ class RegistryTests(unittest.TestCase):
     def test_every_expected_connector_is_registered(self):
         self.assertEqual(
             connector_ids(),
-            ["generic", "claude", "opencode", "codex", "devin-desktop", "devin-cloud"],
+            ["generic", "claude", "opencode", "codex", "zcode", "devin-desktop", "devin-cloud"],
         )
 
     def test_ids_and_aliases_are_globally_unique(self):
@@ -163,14 +166,14 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(DEVIN_CLOUD.format_verified)
         self.assertEqual(DEVIN_CLOUD.locations, ())
 
-    def test_only_claude_opencode_codex_and_devin_desktop_may_write_in_this_phase(self):
+    def test_writable_connectors_are_explicitly_declared(self):
         # R4C.1B opened the write path for Claude Code; R4C.1C extended
         # it to OpenCode; R4C.1D extended it to Codex via a scoped
         # textual TOML editor; R4C.1E Gate B extended it to Devin
         # Desktop after Gate B1 proved the mirror semantics. Every other
         # connector keeps the structural guarantee behind "live host
         # configs unmodified".
-        writable = {"claude", "opencode", "codex", "devin-desktop"}
+        writable = {"claude", "opencode", "codex", "zcode", "devin-desktop"}
         for spec in CONNECTORS:
             with self.subTest(connector=spec.connector_id):
                 if spec.connector_id in writable:
@@ -238,6 +241,30 @@ class LaunchContractTests(unittest.TestCase):
         self.assertEqual(launch.args[1], SERVER_MODULE)
         self.assertIn("--workspace-root", launch.args)
         self.assertIn("--registry", launch.args)
+
+    def test_global_host_contracts_are_bare(self):
+        for connector_id in ("opencode", "codex"):
+            with self.subTest(connector=connector_id):
+                launch = resolve_host_launch(
+                    connector_id,
+                    WORKSPACE,
+                    "reg.json",
+                    which=lambda name: "/opt/bin/" + name,
+                )
+                self.assertEqual(launch.command, "relinkra-mcp")
+                self.assertEqual(launch.args, ())
+                self.assertIsNone(launch.cwd)
+
+    def test_zcode_contract_is_bare_with_workspace_cwd(self):
+        launch = resolve_host_launch(
+            "zcode",
+            WORKSPACE,
+            "reg.json",
+            which=lambda name: "/opt/bin/" + name,
+        )
+        self.assertEqual(launch.command, "relinkra-mcp")
+        self.assertEqual(launch.args, ())
+        self.assertEqual(launch.cwd, canonicalize_path(WORKSPACE))
 
     def test_arguments_are_never_joined_into_a_shell_string(self):
         with tempfile.TemporaryDirectory(prefix="rel kra space&") as workspace:
@@ -664,6 +691,25 @@ class PlanTests(HostFixtureCase):
             op.detail for op in plan.operations if op.op == OP_ADD_OBJECT_MEMBER
         )
         self.assertIn("mcp.relinkra", detail)
+
+    def test_zcode_uses_workspace_local_nested_entry_and_cwd(self):
+        self.write_config(
+            ".zcode",
+            "config.json",
+            content={"mcp": {"servers": {"context7": {"type": "remote"}}}},
+        )
+        launch = resolve_host_launch(
+            "zcode", self.workspace, "reg.json", which=lambda name: "/opt/bin/" + name
+        )
+        inspection = self.inspect(ZCODE)
+        plan = build_plan(ZCODE, inspection, launch)
+        self.assertEqual(plan.status, PLAN_READY)
+        self.assertEqual(plan.target_ref, "zcode:zcode_workspace_config")
+        desired = ZCODE.entry_builder(launch)
+        self.assertEqual(desired["type"], "stdio")
+        self.assertEqual(desired["args"], [])
+        self.assertEqual(desired["cwd"], canonicalize_path(str(self.workspace)))
+        self.assertEqual(desired["enabled"], True)
 
     def test_devin_desktop_never_plans_against_a_legacy_file(self):
         # R4C.1E Gate A declares the current-product locations. A

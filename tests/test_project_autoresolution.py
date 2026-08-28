@@ -27,6 +27,7 @@ import os
 import re
 import tempfile
 import unittest
+from copy import copy
 
 from relinkra.app_service import RelinkraServices, ServiceConfig
 from relinkra.engram_adapter import InMemoryStore
@@ -85,6 +86,7 @@ class WorkspaceCase(unittest.TestCase):
         # Reload from disk so services see only persisted state.
         self.registry = Registry(self.registry_path)
         self.project_id_a = ws_a.project_id
+        self.workspace_id_a = ws_a.workspace_id
         self.project_id_b = next(
             pid for pid in self.registry.projects if pid != self.project_id_a
         )
@@ -186,6 +188,14 @@ class PublicSurfaceTests(unittest.TestCase):
 
 class AutoResolutionTests(WorkspaceCase):
     """A — omitted project_id over a valid bound workspace resolves."""
+
+    def test_project_resolve_auto_resolves_exact_canonical_workspace(self):
+        payload = self.ok("project_resolve")
+        self.assertEqual(payload["project_id"], self.project_id_a)
+        self.assertEqual(payload["workspace_id"], self.workspace_id_a)
+        self.assertEqual(
+            payload["workspace"]["workspace_id"], self.workspace_id_a
+        )
 
     def test_r5i1_shape_no_project_id_context_get_auto_resolves(self):
         payload = self.ok("context_get", task="probe")
@@ -303,6 +313,14 @@ class FailClosedTests(WorkspaceCase):
         self.assertIn("2 registered projects", error["message"])
         self.assertNotIn(self.project_id_a, error["message"])
         self.assertNotIn(PID_UNREGISTERED, error["message"])
+
+    def test_ambiguous_canonical_workspace_fails_closed(self):
+        duplicate = copy(self.registry.workspaces[self.workspace_id_a])
+        duplicate.workspace_id = "ws_" + "e" * 32
+        self.services.registry.workspaces[duplicate.workspace_id] = duplicate
+        error = self.err("project_resolve")
+        self.assertEqual(error["code"], "not_found")
+        self.assertIn("multiple registered workspaces", error["message"])
 
     def test_missing_workspace_root_fails_closed_actionably(self):
         services = self._services_for(workspace_root=None)

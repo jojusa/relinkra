@@ -54,6 +54,7 @@ from relinkra.connectors import (
     claude_project_key,
     entry_tokens,
     launches_relinkra,
+    resolve_host_launch,
     resolve_launch,
 )
 from relinkra.handoff import contains_absolute_path
@@ -200,10 +201,17 @@ class ConnectApplyOpenCodeCase(unittest.TestCase):
         return OPENCODE.entry_builder(self.launch())
 
     def registered_claude_entry(self):
-        return CLAUDE.entry_builder(self.launch())
+        return CLAUDE.entry_builder(self.pinned_launch())
 
     def launch(self):
+        return resolve_host_launch("opencode", self.repo, registry_path(self.repo))
+
+    def pinned_launch(self):
         return resolve_launch(self.repo, registry_path(self.repo))
+
+    def foreign_pinned_launch(self):
+        foreign_root = self.root.parent / "other-workspace"
+        return resolve_launch(foreign_root, registry_path(foreign_root))
 
     def snapshot(self, root):
         return {
@@ -367,14 +375,7 @@ class OpenCodeApplyBasicsTests(ConnectApplyOpenCodeCase):
 
     def test_a_registration_for_another_workspace_is_updated_not_corrupted(self):
         desired = self.registered_opencode_entry()
-        stale = dict(desired)
-        stale["command"] = [
-            desired["command"][0],
-            "-m",
-            SERVER_MODULE,
-            "--workspace-root",
-            "/old/other-workspace",
-        ]
+        stale = OPENCODE.entry_builder(self.foreign_pinned_launch())
         path = self.opencode_config({"mcp": {MANAGED_SERVER_NAME: stale}})
         code, payload, _ = self.run_json("apply", "opencode")
         # The engine must not silently accept a foreign-workspace entry
@@ -386,10 +387,10 @@ class OpenCodeApplyBasicsTests(ConnectApplyOpenCodeCase):
         document = json.loads(path.read_text(encoding="utf-8"))
         entry = self.mcp_container(document)[MANAGED_SERVER_NAME]
         self.assertTrue(launches_relinkra(entry))
+        self.assertEqual(entry, desired)
         tokens = entry_tokens(entry)
-        index = tokens.index("--workspace-root")
-        self.assertEqual(Path(tokens[index + 1]).resolve(), self.root)
-        self.assertNotIn("/old/other-workspace", tokens)
+        self.assertNotIn("--workspace-root", tokens)
+        self.assertNotIn("--registry", tokens)
         self.assertTrue(payload["registration_matches_expected"])
 
 

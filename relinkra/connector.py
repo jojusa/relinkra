@@ -228,6 +228,7 @@ class LaunchContract:
     command: str = ""
     args: Sequence[str] = field(default_factory=tuple)
     env: Mapping[str, str] = field(default_factory=dict)
+    cwd: Optional[str] = None
     distribution: str = DISTRIBUTION_UNRESOLVED
     module: str = "relinkra.mcp_cli"
     resolved: bool = False
@@ -253,6 +254,7 @@ class LaunchContract:
             "command": "<interpreter>" if self.command else "",
             "args": [_portable_token(token) for token in self.args],
             "env_keys": self.env_keys,
+            "cwd_configured": bool(self.cwd),
             "warnings": list(self.warnings),
         }
 
@@ -266,6 +268,7 @@ class LaunchContract:
             "command": self.command,
             "args": list(self.args),
             "env": dict(self.env),
+            "cwd": self.cwd,
             "env_keys": self.env_keys,
             "warnings": list(self.warnings),
         }

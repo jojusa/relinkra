@@ -395,3 +395,17 @@ class Registry:
 
     def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
         return self.workspaces.get(workspace_id)
+
+    def find_workspaces_by_canonical_path(self, path: str) -> list[Workspace]:
+        """Return every workspace registered for one canonical root.
+
+        The caller owns ambiguity handling. Keeping this as a collection
+        lookup is deliberate: auto-binding must never silently choose the
+        first record when malformed or legacy registries contain duplicates.
+        """
+        canonical = canonicalize_path(path)
+        return [
+            workspace
+            for workspace in self.workspaces.values()
+            if canonicalize_path(workspace.canonical_path) == canonical
+        ]

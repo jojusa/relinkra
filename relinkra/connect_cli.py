@@ -90,6 +90,7 @@ from .connectors import (
     inspect_connector,
     launch_contract_document,
     resolve_connector,
+    resolve_host_launch,
     resolve_launch,
 )
 from .handoff import contains_absolute_path
@@ -150,7 +151,19 @@ def _environment(args) -> Tuple[Optional[Any], Optional[DiscoveryEnvironment]]:
     return root, DiscoveryEnvironment.current(workspace_root=root)
 
 
-def _launch_for(root) -> Any:
+def _launch_for(root, connector_id: Optional[str] = None) -> Any:
+    """Resolve the launch policy for one connector.
+
+    The generic contract remains pinned for compatibility. Host-specific
+    connectors opt into the approved binding policy: OpenCode/Codex are
+    bare global entries, while ZCode carries the workspace-local cwd.
+    """
+    if connector_id:
+        return resolve_host_launch(
+            connector_id,
+            root,
+            registry_path(root) if root else None,
+        )
     return resolve_launch(root, registry_path(root) if root else None)
 
 
@@ -171,8 +184,11 @@ def cmd_list(args) -> int:
         # "registration planned" capability could never be true and the
         # column would be decorative. Planning is free — the config was
         # already read for the inspection.
-        plan = build_plan(spec, inspection, launch) if launch else None
-        reports.append(build_report(spec, inspection, launch, plan))
+        spec_launch = (
+            _launch_for(root, spec.connector_id) if root is not None else None
+        )
+        plan = build_plan(spec, inspection, spec_launch) if spec_launch else None
+        reports.append(build_report(spec, inspection, spec_launch, plan))
 
     payload = {
         "connectors": [report.to_dict() for report in reports],
@@ -194,7 +210,9 @@ def cmd_inspect(args) -> int:
         return EXIT_ERROR
 
     root, env = _environment(args)
-    launch = _launch_for(root) if root is not None else None
+    launch = (
+        _launch_for(root, spec.connector_id) if root is not None else None
+    )
     inspection = inspect_connector(spec, env)
     plan = build_plan(spec, inspection, launch) if launch else None
     report = build_report(spec, inspection, launch, plan)
@@ -234,7 +252,7 @@ def cmd_plan(args) -> int:
         )
         return EXIT_ERROR
 
-    launch = _launch_for(root)
+    launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
     plan = build_plan(spec, inspection, launch)
 
@@ -321,7 +339,7 @@ def cmd_check(args) -> int:
         )
         return EXIT_ERROR
 
-    launch = _launch_for(root)
+    launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
     unreadable_scope_finding, shadow_hints = authoritative_scope_status(
         spec,
@@ -396,7 +414,7 @@ def cmd_apply(args) -> int:
         )
         return EXIT_ERROR
 
-    launch = _launch_for(root)
+    launch = _launch_for(root, spec.connector_id)
     result = apply_connector(spec, launch, env)
 
     reveal = bool(getattr(args, "reveal_paths", False))
@@ -493,7 +511,7 @@ def cmd_verify(args) -> int:
         )
         return EXIT_ACTION_REQUIRED
 
-    launch = _launch_for(root)
+    launch = _launch_for(root, spec.connector_id)
     try:
         record = build_proof_from_payload(
             spec.connector_id,

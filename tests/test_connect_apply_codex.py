@@ -54,6 +54,7 @@ from relinkra.connectors import (
     claude_project_key,
     entry_tokens,
     launches_relinkra,
+    resolve_host_launch,
     resolve_launch,
 )
 from relinkra.handoff import contains_absolute_path
@@ -175,7 +176,14 @@ class ConnectApplyCodexCase(unittest.TestCase):
         return self.repo / ".relinkra" / "connect-verification" / "codex.json"
 
     def launch(self):
+        return resolve_host_launch("codex", self.repo, registry_path(self.repo))
+
+    def pinned_launch(self):
         return resolve_launch(self.repo, registry_path(self.repo))
+
+    def foreign_pinned_launch(self):
+        foreign_root = self.root.parent / "other-workspace"
+        return resolve_launch(foreign_root, registry_path(foreign_root))
 
     def registered_codex_entry(self):
         return CODEX.entry_builder(self.launch())
@@ -367,13 +375,7 @@ class CodexApplyBasicsTests(ConnectApplyCodexCase):
 
     def test_a_registration_for_another_workspace_is_updated_not_corrupted(self):
         desired = self.registered_codex_entry()
-        stale = dict(desired)
-        stale["args"] = [
-            "-m",
-            SERVER_MODULE,
-            "--workspace-root",
-            "/old/other-workspace",
-        ]
+        stale = CODEX.entry_builder(self.foreign_pinned_launch())
         original = (
             "# header comment\n"
             + self.registered_toml(stale)
@@ -392,10 +394,10 @@ class CodexApplyBasicsTests(ConnectApplyCodexCase):
         document = self.parsed(path)
         entry = document["mcp_servers"][MANAGED_SERVER_NAME]
         self.assertTrue(launches_relinkra(entry))
+        self.assertEqual(entry, desired)
         tokens = entry_tokens(entry)
-        index = tokens.index("--workspace-root")
-        self.assertEqual(Path(tokens[index + 1]).resolve(), self.root)
-        self.assertNotIn("/old/other-workspace", tokens)
+        self.assertNotIn("--workspace-root", tokens)
+        self.assertNotIn("--registry", tokens)
         self.assertTrue(payload["registration_matches_expected"])
         # Everything outside the managed region survived byte-for-byte.
         after = path.read_text(encoding="utf-8")
@@ -896,9 +898,12 @@ class CodexScopedEditorRobustnessTests(ConnectApplyCodexCase):
         document = self.parsed(path)
         entry = document["mcp_servers"][MANAGED_SERVER_NAME]
         self.assertEqual(entry["note"], "first line\nsecond " + chr(92))
+        desired = self.registered_codex_entry()
+        self.assertEqual(entry["command"], desired["command"])
+        self.assertEqual(entry["args"], desired["args"])
         tokens = entry_tokens(entry)
-        index = tokens.index("--workspace-root")
-        self.assertEqual(Path(tokens[index + 1]).resolve(), self.root)
+        self.assertNotIn("--workspace-root", tokens)
+        self.assertNotIn("--registry", tokens)
 
     def test_a_scanner_parse_disagreement_refuses_the_write(self):
         # Discriminating for the candidate-reparse equality check: force
@@ -1303,7 +1308,12 @@ class CodexDoctorPerHostTests(ConnectApplyCodexCase):
     def test_doctor_preserves_null_workspace_identity_as_local_operational(self):
         self.codex_config(_ENGRAM_TABLE)
         self.record_codex_proof()
-        payload = self.run_doctor()
+        # The doctor route currently reaches its launch seam through the
+        # generic resolver; bind that seam to the approved Codex contract so
+        # this fixture exercises host-neutral verification rather than a
+        # pinned compatibility fingerprint.
+        with mock.patch.object(product_cli, "resolve_launch", return_value=self.launch()):
+            payload = self.run_doctor()
         rows = {
             row["connector_id"]: row
             for row in payload["routing"]["host_verification"]
@@ -1314,7 +1324,7 @@ class CodexDoctorPerHostTests(ConnectApplyCodexCase):
         self.assertFalse(codex["independently_attested"])
 
     def test_doctor_shows_codex_verification_independently(self):
-        self.claude_config({MANAGED_SERVER_NAME: CLAUDE.entry_builder(self.launch())})
+        self.claude_config({MANAGED_SERVER_NAME: CLAUDE.entry_builder(self.pinned_launch())})
         self.opencode_config({})
         self.codex_config(_ENGRAM_TABLE)
         code, _, _ = self.run_json("apply", "codex")

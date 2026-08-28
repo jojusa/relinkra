@@ -70,7 +70,7 @@ from .handoff import (
     HandoffValidationError,
     scrub_absolute_paths,
 )
-from .identity import AmbiguousIdentityError
+from .identity import AmbiguousIdentityError, canonicalize_path
 from .identity import GitError as IdentityGitError
 from .identity import discover_repository_identity
 from .memory import (
@@ -83,7 +83,7 @@ from .memory import (
     sanitize_error,
 )
 from .linkage import LinkageService
-from .registry import DEFAULT_REGISTRY_PATH, Registry, RegistryError
+from .registry import Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
 
 CONTRACT_VERSION = "relinkra.mcp/v1"
@@ -147,7 +147,7 @@ class ServiceConfig:
     """
 
     workspace_root: Optional[str] = None
-    registry_path: str = DEFAULT_REGISTRY_PATH
+    registry_path: Optional[str] = None
     engram_bin: str = "engram"
     engram_project_alias: Optional[str] = None
     cbm_bin: Optional[str] = None
@@ -155,6 +155,7 @@ class ServiceConfig:
     cbm_project_name: Optional[str] = None
     default_project_id: Optional[str] = None
     default_workspace_id: Optional[str] = None
+    workspace_resolution_error: Optional[str] = None
     git_history_limit: int = GIT_DEFAULT_COMMITS
 
 
@@ -252,6 +253,14 @@ class RelinkraServices:
             self._registry_error = sanitize_wire_text(str(exc))
             return None
 
+    def _workspace_binding_error(self) -> Optional[str]:
+        """Return the startup binding failure, if one was recorded."""
+        if self.config.workspace_resolution_error:
+            return self.config.workspace_resolution_error
+        if not self.config.workspace_root:
+            return "no Git workspace root was resolved"
+        return None
+
     def _now(self) -> str:
         return (self.clock or _utcnow)()
 
@@ -317,6 +326,17 @@ class RelinkraServices:
         actionable ServiceError when the workspace cannot be matched to
         exactly one registered project.
         """
+        # A startup resolver can explicitly record that the MCP process was
+        # outside Git or was given an invalid binding. Do not let an explicit
+        # id bypass that failed-closed process binding: the id is compatible
+        # input, not permission to operate without a workspace boundary.
+        if self.config.workspace_resolution_error:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project/workspace resolution is unavailable: "
+                f"{self.config.workspace_resolution_error}; run from an "
+                "initialized Git workspace",
+            )
         resolved = (project_id or self.config.default_project_id or "").strip()
         if resolved:
             return resolved
@@ -331,12 +351,15 @@ class RelinkraServices:
         and multiple matches both fail closed instead of guessing, so
         auto-resolution can never bind another repository's identity.
         """
-        if not self.config.workspace_root:
+        binding_error = self._workspace_binding_error()
+        if binding_error:
             raise ServiceError(
                 ERR_NOT_FOUND,
                 "project_id could not be auto-resolved: this server was "
-                "launched without --workspace-root, so there is no "
-                "workspace context; pass an explicit project_id",
+                f"not bound to a Git workspace ({binding_error}); configure "
+                "--workspace-root or run from a Git workspace; pass an "
+                "explicit project_id only when using an explicitly supplied "
+                "registry",
             )
         if self.registry is None:
             detail = f": {self._registry_error}" if self._registry_error else ""
@@ -382,11 +405,40 @@ class RelinkraServices:
         )
 
     def _resolve_workspace_id(
-        self, workspace_id: Optional[str]
+        self,
+        workspace_id: Optional[str],
+        project_id: Optional[str] = None,
+        *,
+        auto: bool = True,
     ) -> Optional[str]:
-        return (
-            workspace_id or self.config.default_workspace_id or ""
-        ).strip() or None
+        """Resolve an explicit/default workspace or the current root match."""
+        resolved = (workspace_id or self.config.default_workspace_id or "").strip()
+        if resolved:
+            return resolved
+        if not auto:
+            return None
+        binding_error = self._workspace_binding_error()
+        if binding_error or self.registry is None:
+            return None
+        matches = self.registry.find_workspaces_by_canonical_path(
+            self.config.workspace_root or ""
+        )
+        if len(matches) == 1:
+            workspace = matches[0]
+            if project_id and workspace.project_id != project_id:
+                raise ServiceError(
+                    ERR_PROJECT_MISMATCH,
+                    "the workspace at the active Git root belongs to a different project",
+                )
+            return workspace.workspace_id
+        if len(matches) > 1:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "workspace_id could not be auto-resolved: multiple registered "
+                "workspaces have the active canonical root; pass an explicit "
+                "workspace_id",
+            )
+        return None
 
     def _repository_identity(self, project_id: str) -> dict:
         """The repository identity a write must be bound to.
@@ -419,31 +471,55 @@ class RelinkraServices:
         accepts a caller-supplied path.
         """
         warnings: List[ServiceWarning] = []
+        binding_error = self._workspace_binding_error()
+        if binding_error:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project/workspace resolution is unavailable: "
+                f"{binding_error}; run from an initialized Git workspace",
+            )
         if self._registry_error:
             warnings.append(
                 ServiceWarning("registry_unavailable", self._registry_error)
             )
 
         wanted = (project_id or self.config.default_project_id or "").strip()
-        workspace_id = self._resolve_workspace_id(workspace_id)
-
         project = None
-        if self.registry is not None and wanted:
-            project = self.registry.projects.get(wanted)
-
         discovered = None
-        if project is None and self.registry is not None:
+        if wanted:
+            if self.registry is not None:
+                project = self.registry.projects.get(wanted)
+            if project is None:
+                raise ServiceError(
+                    ERR_NOT_FOUND,
+                    f"project_id is not registered: {wanted}",
+                )
+        elif self.registry is not None:
             discovered, discovery_warning = self._discover_identity()
             if discovery_warning is not None:
                 warnings.append(discovery_warning)
             if discovered is not None:
-                project = self.registry.find_project_by_identity(discovered)
+                matches = [
+                    candidate
+                    for candidate in self.registry.projects.values()
+                    if candidate.repository_identity.value == discovered.value
+                ]
+                if len(matches) > 1:
+                    raise ServiceError(
+                        ERR_NOT_FOUND,
+                        "project_id could not be auto-resolved: "
+                        f"{len(matches)} registered projects share this "
+                        "repository identity; pass an explicit project_id",
+                    )
+                project = matches[0] if matches else None
 
         if project is None:
             raise ServiceError(
                 ERR_NOT_FOUND,
                 "no registered project resolved; register a workspace first",
             )
+
+        workspace_id = self._resolve_workspace_id(workspace_id, project.project_id)
 
         workspace = None
         if workspace_id and self.registry is not None:
@@ -460,6 +536,13 @@ class RelinkraServices:
                     ERR_PROJECT_MISMATCH,
                     "workspace_id belongs to a different project",
                 )
+
+        if not workspace_id:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "workspace_id could not be auto-resolved: the active canonical "
+                "Git root is not registered; initialize this workspace first",
+            )
 
         payload = {
             "project_id": project.project_id,
@@ -517,8 +600,11 @@ class RelinkraServices:
         memory type uses, because a handoff is persisted as a handoff
         memory. Nothing about handoffs is special-cased here.
         """
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         if format not in ("json", "markdown"):
             raise ServiceError(
                 ERR_INVALID_INPUT, "format must be 'json' or 'markdown'"
@@ -642,8 +728,11 @@ class RelinkraServices:
         limit: int = 20,
     ) -> dict:
         """Search shared project memory under the R1C scope policy."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         if memory_type and memory_type not in MEMORY_TYPES:
             raise ServiceError(
                 ERR_INVALID_INPUT, f"unsupported memory_type: {memory_type}"
@@ -713,8 +802,11 @@ class RelinkraServices:
         code_refs: Any = None,
     ) -> dict:
         """Save one memory through the R1C policy layer."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         if memory_type not in MEMORY_TYPES:
             raise ServiceError(
                 ERR_INVALID_INPUT, f"unsupported memory_type: {memory_type}"
@@ -769,8 +861,11 @@ class RelinkraServices:
         symbol: Optional[str] = None,
     ) -> dict:
         """Resolve a file/symbol to a portable CodeReference via R1D."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         if not (file or symbol):
             raise ServiceError(
                 ERR_INVALID_INPUT, "one of file or symbol is required"
@@ -836,8 +931,9 @@ class RelinkraServices:
         path: Optional[str] = None,
     ) -> dict:
         """Return compact optional architecture evidence, never raw CBM."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        self._resolve_workspace_id(workspace_id)
+        self._resolve_workspace_id(workspace_id, auto=auto_workspace)
         normalized_path = None
         if path:
             try:
@@ -862,8 +958,9 @@ class RelinkraServices:
         limit: int = 20,
     ) -> dict:
         """Return high-level callers/dependencies for one resolved symbol."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        self._resolve_workspace_id(workspace_id)
+        self._resolve_workspace_id(workspace_id, auto=auto_workspace)
         symbol = str(symbol or "").strip()
         if not symbol:
             raise ServiceError(ERR_INVALID_INPUT, "symbol is required")
@@ -1131,8 +1228,11 @@ class RelinkraServices:
         include_git_state: bool = True,
     ) -> dict:
         """Create a deterministic, portable, PROJECT_SHARED handoff."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         repository_identity = self._repository_identity(project_id)
 
         service_warnings: List[ServiceWarning] = []
@@ -1206,8 +1306,11 @@ class RelinkraServices:
         limit: int = 10,
     ) -> dict:
         """Fetch one handoff by id, or list the most recent ones."""
+        auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
-        workspace_id = self._resolve_workspace_id(workspace_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
         try:
             if handoff_id:
                 handoff = self.handoffs.get(
@@ -1335,7 +1438,11 @@ class RelinkraServices:
                 "git": git.to_dict(),
                 "registry": _Probe(
                     available=self.registry is not None,
-                    detail=self._registry_error or "",
+                    detail=(
+                        self._registry_error
+                        or self._workspace_binding_error()
+                        or ""
+                    ),
                 ).to_dict(),
             },
             "degraded": sorted(set(degraded)),

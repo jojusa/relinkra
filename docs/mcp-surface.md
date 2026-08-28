@@ -24,6 +24,13 @@ Relinkra exposes. Relinkra owns logical project identity, memory policy,
 memory↔code linkage, context packets, budgeting, relevance, git
 intelligence, and handoffs. CBM, Engram, and git stay engines.
 
+R5K.1 adds host-neutral HYBRID binding around this same MCP surface. The
+normal user flow is **install → `relinkra init` → `relinkra connect apply
+<host>`**. OpenCode and Codex use global bare `relinkra-mcp` registrations;
+the MCP process derives the active Git root from its process CWD. ZCode uses a
+workspace-local `.zcode/config.json` entry with an absolute repository-root
+`cwd`.
+
 ## Layering rules
 
 Two rules keep the layering honest, and both are enforced by tests:
@@ -124,16 +131,16 @@ application service at all.
   back to the server's configured defaults (`--project-id` /
   `--workspace-id`). When `project_id` is omitted and no default is
   configured, project-scoped tools **auto-resolve** the current project
-  deterministically from the bound workspace context
-  (`--workspace-root` + registry) — the same discovery `project_resolve`
-  performs, narrowed to a strict single-match contract. An explicit
-  `project_id` is always honored verbatim and never silently replaced.
+  deterministically from the bound workspace root and registry — the same
+  discovery `project_resolve` performs, narrowed to a strict single-match
+  contract. An explicit `project_id` is always honored verbatim and never
+  silently replaced.
 - Auto-resolution is **fail-closed**. When the workspace cannot be
   matched to exactly one registered project — no workspace root, no
   registry, failed identity discovery, an unregistered repository, or a
   degenerate registry where several projects share one identity — the
   call returns a typed `not_found` error whose message names the remedy:
-  register the workspace (`relinkra connect`), pass an explicit
+  initialize/register the workspace (`relinkra init`), pass an explicit
   `project_id`, or call `project_resolve` for diagnostics. It never
   guesses.
 - **Paths are server-owned.** `--workspace-root` is set at startup and is
@@ -168,6 +175,31 @@ returned with its embedded packet stripped — the response already carries
 that packet once, and shipping it twice would be self-defeating on a
 surface whose whole purpose is respecting a token budget.
 
+## R5K.1 binding and fail-closed behavior
+
+The MCP startup resolver uses this precedence for the workspace root:
+
+1. explicit `--workspace-root`;
+2. `RELINKRA_WORKSPACE_ROOT`;
+3. the enclosing Git root discovered from the MCP process CWD.
+
+The registry uses explicit `--registry`, then `RELINKRA_REGISTRY`, then
+`<resolved-root>/.relinkra/registry.json`. The resolver accepts a `.git`
+directory or linked-worktree `.git` file and never creates files or directories.
+
+Outside Git, or inside an uninitialized repository, project binding fails
+closed: Relinkra does not guess a repository and does not create `.relinkra`.
+Run `relinkra init` first. A bare MCP process may still answer liveness and
+surface-discovery methods such as `initialize`, `ping`, `tools/list`, and
+`health`; project-scoped operations return typed errors until a valid binding
+exists.
+
+The explicit `--workspace-root`, `--registry`, `--project-id`, and
+`--workspace-id` options remain compatibility controls for manual or pinned
+launches. Direct Engram use remains independently available; it is not part of
+workspace binding, and users should not configure a direct CBM server for this
+flow.
+
 ## Degraded mode
 
 R3 preserves the R1E philosophy: **a partial result plus a typed warning
@@ -178,9 +210,9 @@ tool.
 |---------|-----------|
 | Engram down | `project_resolve`, `git_context`, `health` still answer. `memory_search` returns a typed `unavailable` error. |
 | CBM absent | Memory and git tools unaffected; `code_resolve` degrades to an unresolved reference plus a warning. |
-| Git unavailable | Code/memory context still usable; `git_context` reports `available: false` with warnings; `handoff_create` still succeeds with an empty `git_state`. |
+| Git unavailable or no Git root | Bare MCP liveness and discovery can still answer; project-scoped operations fail closed with typed errors and no `.relinkra` creation. |
 | Registry missing | `health` reports `registry` degraded; writes fail typed (`not_found`) because a write needs a registered identity. |
-| No workspace root | Only git degrades. |
+| No workspace root | Project binding is unavailable; the server does not guess a root. |
 
 `health` is the tool an operator reaches for when things are *already*
 broken, so it never fails itself — a project-resolution error is reported
@@ -242,6 +274,23 @@ Re-proven by tests in this delta:
 
 ## Running the server
 
+For the host-neutral OpenCode/Codex registration, the installed console script
+is intentionally bare:
+
+```text
+command = "relinkra-mcp"
+args = []
+```
+
+When `relinkra-mcp` is not on `PATH`, the equivalent module launch is
+`python -m relinkra.mcp_cli` with no workspace or registry arguments. The
+installed console scripts live in the active environment's `Scripts` directory
+on Windows. Source checkouts can use the module form from the active
+environment.
+
+For compatibility or a controlled pinned launch, explicit arguments remain
+supported:
+
 ```bash
 python -m relinkra.mcp_cli \
   --workspace-root . \
@@ -284,20 +333,49 @@ Tools then appear as `mcp__relinkra__context_get`, etc.
   "mcp": {
     "relinkra": {
       "type": "local",
-      "command": ["python", "-m", "relinkra.mcp_cli", "--workspace-root", "."],
+      "command": ["relinkra-mcp"],
       "enabled": true
     }
   }
 }
 ```
 
+This is a global, bare registration. The MCP process derives the active Git
+root from its process CWD; it does not carry a repository path or registry path.
+
 **Codex** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.relinkra]
-command = "python"
-args = ["-m", "relinkra.mcp_cli", "--workspace-root", "."]
+command = "relinkra-mcp"
+args = []
 ```
+
+Codex uses the same global, bare binding and CWD-derived root behavior.
+
+**ZCode** (`<workspace>/.zcode/config.json`):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "relinkra": {
+        "type": "stdio",
+        "command": "relinkra-mcp",
+        "args": [],
+        "cwd": "<absolute-repository-root>",
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+ZCode is workspace-local and receives an absolute repository-root `cwd`.
+
+These examples describe configuration shape, not real-host launch proof. Use
+`relinkra connect verify <host> --proof <file>` only after independently
+observing the host launch and an MCP interaction.
 
 ### Agent guidance
 
