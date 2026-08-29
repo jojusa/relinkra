@@ -293,7 +293,7 @@ class CleanInstallTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(
-            result.stdout.startswith(f"relinkra {relinkra.__version__}"),
+            result.stdout == f"relinkra {relinkra.__version__}\n",
             result.stdout,
         )
 
@@ -310,6 +310,7 @@ class CleanInstallTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
+        self.assertEqual(payload["relinkra_version"], relinkra.__version__)
         self.assertEqual(payload["install_mode"], "installed")
 
     def test_step_e_help_lists_all_commands(self):
@@ -324,8 +325,25 @@ class CleanInstallTests(unittest.TestCase):
             env=cls._clean_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ("init", "status", "doctor", "project", "version"):
+        for command in (
+            "init", "status", "doctor", "project", "cbm", "connect", "version"
+        ):
             self.assertIn(command, result.stdout)
+
+    def test_step_e_mcp_help_flag_runs_installed_entry_point(self):
+        self._installed()
+        cls = type(self)
+        result = subprocess.run(
+            [str(cls._script("relinkra-mcp")), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            cwd=str(cls._fresh_dir("cwd-e-mcp")),
+            env=cls._clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage: relinkra-mcp", result.stdout)
+        self.assertIn("--workspace-root", result.stdout)
 
     def test_step_f_import_resolves_inside_the_venv_not_the_checkout(self):
         self._installed()

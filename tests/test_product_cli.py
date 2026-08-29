@@ -891,6 +891,62 @@ class CrossPlatformTests(unittest.TestCase):
             )
 
 
+class TopLevelCliTests(unittest.TestCase):
+    """Direct regressions for root argparse behavior."""
+
+    @staticmethod
+    def run_cli(argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = product_cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_version_flag_exits_zero_with_canonical_version(self):
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                product_cli.main(["--version"])
+        self.assertEqual(caught.exception.code, EXIT_OK)
+        self.assertEqual(
+            out.getvalue(), f"relinkra {product_cli.__version__}\n"
+        )
+        self.assertEqual(err.getvalue(), "")
+
+    def test_help_flag_exits_zero_with_usage_and_commands(self):
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                product_cli.main(["--help"])
+        self.assertEqual(caught.exception.code, EXIT_OK)
+        self.assertIn("usage: relinkra", out.getvalue())
+        for command in ("init", "status", "doctor", "project", "cbm", "connect"):
+            self.assertIn(command, out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_bare_invocation_prints_help_and_returns_error(self):
+        code, out, err = self.run_cli([])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("usage: relinkra", out)
+        self.assertIn("init", out)
+        self.assertEqual(err, "")
+
+    def test_existing_version_command_dispatches(self):
+        code, out, err = self.run_cli(["version"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(out.startswith(f"relinkra {product_cli.__version__}\n"))
+        self.assertEqual(err, "")
+
+    def test_invalid_command_exits_one_with_argparse_error(self):
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                product_cli.main(["not-a-command"])
+        self.assertEqual(caught.exception.code, EXIT_ERROR)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("usage: relinkra", err.getvalue())
+        self.assertIn("invalid choice", err.getvalue())
+
+
 class ExitCodeContractTests(CLITestCase):
     """The documented exit-code contract, asserted end to end."""
 
@@ -925,7 +981,7 @@ class ExitCodeContractTests(CLITestCase):
 
     def test_usage_errors_exit_one_not_two(self):
         """A typo must not look like 'needs a human decision' (2)."""
-        for argv in (["nonsense"], ["status", "--bogus"], ["--bad"], []):
+        for argv in (["nonsense"], ["status", "--bogus"], ["--bad"]):
             with self.assertRaises(SystemExit) as caught:
                 with contextlib.redirect_stderr(io.StringIO()):
                     with contextlib.redirect_stdout(io.StringIO()):
@@ -933,6 +989,13 @@ class ExitCodeContractTests(CLITestCase):
             self.assertEqual(
                 caught.exception.code, EXIT_ERROR, f"argv={argv}"
             )
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = product_cli.main([])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("usage: relinkra", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":

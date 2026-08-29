@@ -2246,7 +2246,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="version", version=f"relinkra {__version__}"
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     for name, handler, help_text in (
         ("init", cmd_init, "initialize Relinkra for this repository"),
@@ -2356,7 +2356,11 @@ def _use_utf8(*streams) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     # Before parse_args so --help and argparse errors are UTF-8 too.
     _use_utf8(sys.stdout, sys.stderr)
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return EXIT_ERROR
     try:
         return args.func(args)
     except KeyboardInterrupt:
