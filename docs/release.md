@@ -1,18 +1,24 @@
 # Release verification for Relinkra
 
 How a maintainer verifies that a Relinkra release is releasable: what the CI
-workflows prove, what they do not, how the eleven release gates read
+workflows prove, what they do not, how the twelve release gates read
 evidence, and what remains open before a public release. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: historical evidence only.** The linked CI and packaging runs
+> **Status: release policy.** Windows is currently certified. Linux/macOS
+> exact-SHA certification and hosted-CI exact-SHA evidence are pending;
+> runner quota/billing availability is infrastructure evidence, not a product
+> defect. Public 0.1.0 policy carries those external results as visible
+> `PARTIAL` debt, together with broader CBM and host/ZCode certification, but
+> never accepts `BLOCKED` or a missing deterministic product gate.
+>
+> The linked CI and packaging runs
 > ([CI run](https://github.com/jojusa/relinkra/actions/runs/31815886965),
 > [Packaging run](https://github.com/jojusa/relinkra/actions/runs/31815886882))
 > are bound to the older ancestor commit `60062ec0`. They must not be read as
-> certification of the current release HEAD. Before public publication,
-> regenerate the exact release-HEAD evidence and evaluate the public-release
-> gates against that evidence. What remains open is tracked in
+> certification of the current release HEAD. Evaluate the public-release
+> gates against exact-SHA evidence; tolerated external debt remains visible in
 > [Remaining evidence debt](#remaining-evidence-debt).
 
 ## Scope
@@ -25,9 +31,11 @@ R5B is **not** publication. This checkpoint does not publish the package to
 PyPI, create a GitHub Release, or push a git tag. The normal post-publication
 install command is `python -m pip install relinkra` (equivalent to
 `pip install relinkra`); local validation uses built artifacts or a source
-checkout. RC tagging is not approved yet;
-publication requires the blockers in
-[Remaining evidence debt](#remaining-evidence-debt) to be resolved.
+checkout. RC tagging remains governed by its stricter existing gates.
+Publication still requires all deterministic product/package/documentation/
+legal/security gates and a PASS from the mandatory installed-artifact gate,
+supplied through the external `installed` mapping;
+specified external certification debt may remain `PARTIAL`.
 
 ## Verification levels
 
@@ -52,9 +60,10 @@ Release evidence is interpreted in four distinct classes:
 | Class | Gates / evidence | Policy role |
 |---|---|---|
 | **Product/local gates** | `TECHNICAL_CORE`, `PACKAGING`, `DOCUMENTATION`, `LEGAL`, `SECURITY` | Deterministic code, artifact, documentation, legal, and workflow checks. These remain authoritative local product gates. |
+| **Installed-artifact gate** | `INSTALLED_CLI_MCP` | Exact wheel and sdist CLI/MCP E2E results are supplied externally; missing/indeterminate evidence is PARTIAL but is not tolerated by the public rollup. |
 | **Platform certification gates** | `WINDOWS`, `LINUX`, `MACOS`, `CBM_CERTIFICATION`, `HOST_CERTIFICATION` | Evidence about operating systems, the CBM backend, and real agent hosts. Fixture tests do not substitute for certification. |
 | **Hosted-CI/infrastructure gates** | `CI` plus release-HEAD remote evidence and artifact availability | Remote execution and infrastructure prove or supply evidence; stale, missing, or unavailable hosted evidence remains partial/unknown and is not silently treated as PASS. |
-| **Tolerated partial backend certification** | `CBM_CERTIFICATION` and `HOST_CERTIFICATION` only | `PARTIAL` may be carried as documented release debt. This exception does not relax product/local gates, platform regression gates, or hosted-CI requirements. |
+| **Public-release external debt** | `LINUX`, `MACOS`, `CI`, `CBM_CERTIFICATION`, `HOST_CERTIFICATION` | `PARTIAL` may be carried as documented release debt. `BLOCKED` always vetoes public release; deterministic local gates remain mandatory. |
 
 These classes are orthogonal: hosted CI can provide evidence for product or
 platform gates, but it does not change their required scope. No corrupted or
@@ -152,6 +161,10 @@ ubuntu/windows/macos × py3.14. Never publishes, never tags. See
   3.9/3.10 the connector reports the capability as unsupported
   (`FAIL_HONEST`); the rest of the product works. The 3.9/3.10 CI cells
   verify this path through the existing suite.
+- **Package installability:** Relinkra is pure Python with zero runtime
+  dependencies. The wheel and sdist installation checks pass on the covered
+  artifact matrix; that proves artifact installability, not certification of
+  unsupported operating systems.
 
 ## Platform honesty
 
@@ -165,9 +178,10 @@ the absence/degraded behavior — and a CI fixture passing is **not** CBM
 certification.
 
 **Host connectors** (Claude, OpenCode, Codex, ZCode, Devin Desktop) are
-real-host certified **locally**, as historical recorded evidence — the
-certification is not regenerated per CI run. CI runs fixture/sandbox
-connector tests only. **Devin Cloud is UNSUPPORTED** (roadmap).
+represented by structural or historical local evidence; CI runs
+fixture/sandbox connector tests only. The ZCode connector is structurally
+validated, but runtime certification is pending. **Devin Cloud is
+UNSUPPORTED** (roadmap).
 
 **Engram** is optional: a third-party project (Gentleman Programming,
 MIT), external and never bundled with Relinkra. Relinkra talks to it via
@@ -176,7 +190,7 @@ graceful degradation when absent.
 
 ## Release gates
 
-`tools/release_gates.py` maps an evidence mapping to eleven gate
+`tools/release_gates.py` maps an evidence mapping to twelve gate
 verdicts. Statuses: `PASS`, `PARTIAL`, `BLOCKED`, `NOT_APPLICABLE`.
 
 **The critical semantic: absence of evidence is never PASS.** A gate
@@ -187,27 +201,56 @@ possibly apply is NOT_APPLICABLE, never PASS.
 |---|---|---|
 | `TECHNICAL_CORE` | `regression` (passed/tests/failures/errors/resource_warnings) | Full suite passed with 0 failures, 0 errors, 0 ResourceWarnings. |
 | `PACKAGING` | `packaging` (wheel_ok/sdist_ok) | Both artifacts satisfy the content contract. |
-| `WINDOWS` / `LINUX` / `MACOS` | `platforms.<os>` | Passing regression evidence on that OS. |
+| `INSTALLED_CLI_MCP` | `installed` (`cli`, `mcp`, `details`) | Both `cli` and `mcp` are explicitly `true`, backed by retained exact wheel and sdist E2E results. Missing/indeterminate evidence is PARTIAL; either explicit `false` is BLOCKED. |
+| `WINDOWS` / `LINUX` / `MACOS` | `platforms.<os>` | Passing exact-SHA regression evidence on that OS. Windows is currently certified; Linux/macOS `PARTIAL` evidence is pending and tolerated only by the public rollup. |
 | `CBM_CERTIFICATION` | `cbm.certified_platforms` | All desktop platforms certified. Windows-only is PARTIAL; claiming a non-Windows platform without evidence is BLOCKED. |
-| `HOST_CERTIFICATION` | `hosts.certified_hosts` + `regenerated_in_ci` | Certified hosts **and** certification regenerated in CI; historical local certification is PARTIAL. |
+| `HOST_CERTIFICATION` | `hosts.certified_hosts` + `regenerated_in_ci` | Certified hosts **and** certification regenerated in CI; broader host/ZCode runtime certification is pending, so historical/structural evidence is PARTIAL. |
 | `DOCUMENTATION` | `docs` (release_doc, readme_sections, installation_doc) | This document, the README sections, and the installation guide all present. |
 | `LEGAL` | `legal.license_present`, `notice_complete` | LICENSE file exists. No LICENSE is BLOCKED — distribution rights undefined. |
 | `SECURITY` | Workflow hygiene scan | Minimal permissions, no untrusted triggers, actions pinned. |
-| `CI` | `ci.workflows_present`, `remote_runs_passed` | Workflows present **and** remote runs green. Present-but-unrun is PARTIAL (`REMOTE_CI_PENDING`). |
+| `CI` | `ci.workflows_present`, `remote_runs_passed` | Workflows present **and** remote runs green. Present-but-unrun is PARTIAL (`REMOTE_CI_PENDING`); runner quota/billing unavailability is infrastructure debt, not a product PASS or defect. |
+
+The mandatory installed evidence is supplied in the external mapping, for
+example:
+
+```json
+{
+  "installed": {
+    "cli": true,
+    "mcp": true,
+    "details": [
+      "wheel: exact artifact CLI and MCP E2E results retained",
+      "sdist: exact artifact CLI and MCP E2E results retained"
+    ]
+  }
+}
+```
+
+The booleans must be literal JSON booleans. `details` identifies the retained
+proof; it does not turn missing or indeterminate booleans into PASS.
 
 ### Rollup decisions
 
 | Safety | Requirements |
 |---|---|
-| `safe_to_merge` | `TECHNICAL_CORE`, `PACKAGING`, `SECURITY` PASS; `CI` PASS or PARTIAL; no BLOCKED among the four. |
+| `safe_to_merge` | `TECHNICAL_CORE`, `PACKAGING`, `SECURITY` PASS; `CI` PASS or PARTIAL; no BLOCKED among the four. An explicit `INSTALLED_CLI_MCP` BLOCKED result also vetoes merge; missing/partial installed evidence does not otherwise change this safety. |
 | `safe_to_tag_rc` | `safe_to_merge`, plus `WINDOWS`, `LINUX`, `MACOS`, `CI` all PASS, `DOCUMENTATION` at least PARTIAL. A `LEGAL` BLOCKED is surfaced but tolerated for an internal RC tag; any other BLOCKED vetoes the tag. |
-| `safe_for_public_release` | Every gate PASS on evidence bound to the exact release HEAD, except `CBM_CERTIFICATION` and `HOST_CERTIFICATION`, which may be PARTIAL as documented evidence debt. `LEGAL` and `DOCUMENTATION` must be PASS. |
+| `safe_for_public_release` | `TECHNICAL_CORE`, `PACKAGING`, `INSTALLED_CLI_MCP`, `WINDOWS`, `DOCUMENTATION`, `LEGAL`, and `SECURITY` must be PASS. Only `LINUX`, `MACOS`, `CI`, `CBM_CERTIFICATION`, and `HOST_CERTIFICATION` may be PARTIAL; any BLOCKED gate vetoes. |
 
-For this checkpoint, public release therefore requires fresh exact
-release-HEAD evidence for `TECHNICAL_CORE`, `PACKAGING`, `WINDOWS`, `LINUX`,
-`MACOS`, `CI`, `DOCUMENTATION`, `LEGAL`, and `SECURITY`. Historical evidence
-from `60062ec0` cannot satisfy those current-release gates. Only the documented
-partial CBM and host-certification debt is tolerated by policy.
+The public rollup therefore requires exact release-HEAD evidence for every
+deterministic gate, installed CLI/MCP evidence, and Windows. Linux, macOS,
+hosted CI, broader CBM, and host/ZCode certification may remain visibly
+`PARTIAL`/pending. Historical evidence from `60062ec0` cannot be presented as
+current PASS, and any explicit failure remains `BLOCKED`.
+
+### Machine-readable pending debt
+
+`ReleaseReport` JSON and the text report expose
+`public_release_external_certification_status` (`CLEAR`, `PENDING`, or
+`BLOCKED`) plus `pending_public_release_external_certifications`. Each pending
+entry includes its gate and retains `status: "PARTIAL"`; pending evidence is
+never converted to PASS. The normal `gates` list and `blockers` list remain the
+authoritative view of missing, unknown, or failing evidence.
 
 ### Reading `release_check.py` output
 
@@ -222,13 +265,36 @@ without `--evidence` it exits 2. The opt-in `--run-packaging` path may acquire b
 dependencies, separately from runtime/offline behavior. An exit 0 therefore means "reported", not "releasable"
 — use `--require` to assert a safety.
 
-At this checkpoint, the collector-only report is: `TECHNICAL_CORE`, `PACKAGING`,
-and the platform gates are PARTIAL (no regression/packaging evidence
-until `--run-regression`/`--run-packaging` runs); `SECURITY` PASS;
-`LEGAL` PASS (LICENSE present, MIT); `CI` PARTIAL (`REMOTE_CI_PENDING`).
-Fed with composed run-scoped remote evidence (`--evidence`), the
-technical, platform, and `CI` gates evaluate to the remote truth only when
-that evidence is regenerated and bound to the exact release HEAD.
+For the public check, collect the mandatory local evidence and bind any
+external mapping to the exact release SHA:
+
+```bash
+RELEASE_SHA="$(git rev-parse HEAD)"
+python tools/release_check.py --run-regression --run-packaging \
+  --evidence exact-release-head-evidence.json \
+  --require-sha "$RELEASE_SHA" --require public
+```
+
+Run this on the certified Windows release environment, or provide exact-SHA
+Windows PASS evidence in the external mapping. The command's regression and
+packaging flags are required for local `TECHNICAL_CORE` and `PACKAGING` PASS;
+the evidence file supplies exact-SHA external results. `release_check` does
+not collect installed CLI/MCP proof. Supply an `installed` mapping with
+explicit `cli: true` and `mcp: true` plus details naming the retained exact
+wheel and sdist E2E results; without it the mandatory `INSTALLED_CLI_MCP`
+gate remains PARTIAL and `--require public` fails. Never infer that proof
+from a successful build or from a `PARTIAL` gate.
+
+At this checkpoint, the collector-only report is: `TECHNICAL_CORE` and
+`PACKAGING` PARTIAL until their opt-in collectors run; `SECURITY` PASS;
+`LEGAL` PASS (LICENSE present, MIT); and external Linux/macOS/CI/CBM/host
+results PARTIAL and visible as pending debt; `INSTALLED_CLI_MCP` is also
+PARTIAL until its external exact-artifact evidence is supplied, but it is not
+tolerated pending external debt. Fed with composed run-scoped
+remote evidence (`--evidence`), gates evaluate to the remote truth only when
+that evidence is regenerated and bound to the exact release HEAD. A runner
+quota/billing failure should remain pending infrastructure evidence; a real
+failed test or other failed external gate remains BLOCKED.
 
 ## Local verification commands
 
@@ -258,7 +324,9 @@ python tools/release_check.py --run-regression --run-packaging --json
 python tools/release_check.py --require merge
 python tools/release_check.py --evidence external.json --require rc
 
-# Focused E2E: install the exact artifact under test (as packaging.yml does)
+# Mandatory input: install and exercise both exact release artifacts, then
+# retain and supply their CLI/MCP results under the external `installed` key.
+# release_check does not collect installed CLI/MCP evidence.
 # bash:
 RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
@@ -274,7 +342,9 @@ RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0.tar.gz \
 Without `RELINKRA_E2E_ARTIFACT`, the E2E suites build their own artifact
 (with network) inside their venv sandbox. With it, they install exactly
 the given wheel or sdist — which is how CI proves the shipped artifact,
-never a rebuild.
+never a rebuild. Run both exact-artifact journeys before publication and
+retain their results in the external evidence mapping; they are the required
+input for the `INSTALLED_CLI_MCP` gate, not a hidden PASS in the report.
 
 One environment prerequisite, verified while writing this document:
 
@@ -340,27 +410,33 @@ RC realism rehearsal, not a release.
 
 Pre-existing debt the tooling surfaces honestly rather than hiding:
 
-- **Historical remote CI evidence** — the linked runs cover Python 3.9/3.10
-  and Linux/macOS, but are bound to the older ancestor `60062ec0`. Regenerate
-  release-HEAD evidence before treating those public gates as satisfied.
-- **CBM provenance Windows-amd64 only** — no certified Linux/macOS
-  binary; honest degradation is the designed behavior. Open.
-- **Host certifications are historical local evidence** — not
-  regenerated per CI run. Open.
+- **Linux/macOS exact-SHA certification** — pending. Windows is currently
+  certified; unsupported platforms remain uncertified even though the pure
+  Python wheel and sdist install successfully on the covered matrix.
+- **Hosted CI exact-SHA evidence** — pending because runner quota/billing
+  availability is infrastructure evidence, not a product defect.
+- **CBM managed certification** — Windows-focused; broader platform coverage
+  remains PARTIAL by design.
+- **ZCode/host runtime certification** — the ZCode connector is structurally
+  validated, but runtime certification is pending.
+- **Installed CLI/MCP evidence** — a first-class mandatory gate. `release_check`
+  does not collect it; successful exact wheel and sdist E2E runs must be
+  retained and supplied in the external `installed` mapping.
 
-Public-release blockers (must all clear before publication):
+Public-release blockers (must clear before publication):
 
 1. ~~**LICENSE absent**~~ — **resolved**: MIT LICENSE present; `LEGAL`
    gate PASS.
-2. **Exact release-HEAD CI and packaging evidence** — regenerate the
-   Windows, Linux, macOS, and CI evidence, plus technical, packaging, and
-   installed-MCP evidence, before publication. The linked ancestor evidence
-   is historical and does not clear this blocker.
-3. **CBM Windows-only provenance** — PARTIAL is tolerated for public
-   release as documented debt; PASS requires certified Linux/macOS
-   binaries. Open.
-4. **Host certification historical** — PARTIAL tolerated for public
-   release as documented debt; PASS requires CI regeneration. Open.
+2. **Deterministic release gates** — exact release-HEAD
+   `TECHNICAL_CORE`, `PACKAGING`, `WINDOWS`, `DOCUMENTATION`, `LEGAL`, and
+   `SECURITY` must be PASS. Any explicit failure remains BLOCKED.
+3. **Installed artifact journey** — both exact wheel and sdist CLI/MCP E2E
+   checks must pass and their retained results must make
+   `INSTALLED_CLI_MCP` PASS through the external mapping.
+
+Linux, macOS, hosted CI, broader CBM, and ZCode/host certification may remain
+visible as PARTIAL/pending debt for this public policy; they must not be
+reported as PASS, and any BLOCKED result still blocks publication.
 
 ## External and infrastructure blockers
 
@@ -377,12 +453,16 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Before merging release work: run the full regression locally, then
       `python tools/release_check.py --run-regression --run-packaging
       --require merge`.
-- [ ] Regenerate exact release-HEAD remote CI and packaging evidence; the
-      existing green runs and run-scoped evidence chain are historical because
-      they are bound to `60062ec0`.
+- [ ] Run the public check with exact-SHA evidence:
+      `RELEASE_SHA="$(git rev-parse HEAD)" && python
+      tools/release_check.py --run-regression --run-packaging --evidence
+      exact-release-head-evidence.json --require-sha "$RELEASE_SHA" --require
+      public`.
 - [x] LICENSE resolved by the owner: MIT, present at the repository root.
-- [ ] Rehearse with the Release Candidate Dry Run workflow, then
-      `python tools/release_check.py --evidence <all-evidence.json>
-      --require public`.
+- [ ] Run and retain both exact wheel and sdist installed CLI/MCP E2E results;
+      supply them under the external `installed` mapping because
+      `release_check` does not collect this proof.
+- [ ] Rehearse with the Release Candidate Dry Run workflow; its report must
+      keep pending external debt visible rather than relabeling it PASS.
 - [ ] Version bumps only in a dedicated release commit; RC names are
       `0.1.0rcN`; nothing in R5B/R5C/R5D tags or publishes.

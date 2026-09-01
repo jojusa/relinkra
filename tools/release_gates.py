@@ -15,8 +15,13 @@ Evidence keys consumed (all optional; missing means PARTIAL):
   are all 0 and tests is positive; a failed, empty, or dirty run is BLOCKED.
 - ``packaging``: ``{"wheel_ok": bool, "sdist_ok": bool, "details": [str]}``
   → PACKAGING. PASS iff both artifacts satisfy the content contract.
-- ``platforms``: ``{"windows": "pass|partial|fail|pending", "linux": ...,
-  "macos": ...}`` → the WINDOWS / LINUX / MACOS gates.
+- ``installed``: ``{"cli": bool, "mcp": bool, "details": [str]}``
+  → INSTALLED_CLI_MCP. PASS only when both booleans are explicitly ``True``;
+  missing or indeterminate evidence is PARTIAL, and an explicit ``False`` is
+  BLOCKED. The details identify the retained exact wheel and sdist E2E runs.
+- ``platforms``: ``{"windows": "pass|partial|fail|pending|blocked", ...}``
+  → the WINDOWS / LINUX / MACOS gates. ``fail`` and explicit ``blocked``
+  values both produce BLOCKED.
 - ``cbm``: ``{"certified_platforms": [str], "notes": [str],
   "claims": [{"platform": str, "certified": bool, "evidence": str}]}``
   → CBM_CERTIFICATION. PASS only when every desktop platform
@@ -40,6 +45,13 @@ Evidence keys consumed (all optional; missing means PARTIAL):
   → CI. Present + remote green → PASS; present without remote evidence →
   PARTIAL ("REMOTE_CI_PENDING"); present + failed remote runs → BLOCKED;
   absent → BLOCKED.
+
+Public release requires PASS for deterministic product, packaging, installed
+CLI/MCP, Windows, documentation, legal, and security gates. It tolerates
+PARTIAL external evidence only for Linux, macOS, CI, CBM, and host
+certification; BLOCKED and NOT_APPLICABLE remain vetoes. The report exposes
+pending external debt separately, without changing any gate status. Installed
+CLI/MCP evidence is mandatory and is never external-debt-tolerated.
 """
 
 from __future__ import annotations
@@ -51,6 +63,7 @@ from typing import Any, List, Mapping
 
 TECHNICAL_CORE = "TECHNICAL_CORE"
 PACKAGING = "PACKAGING"
+INSTALLED_CLI_MCP = "INSTALLED_CLI_MCP"
 WINDOWS = "WINDOWS"
 LINUX = "LINUX"
 MACOS = "MACOS"
@@ -65,6 +78,7 @@ CI = "CI"
 GATE_ORDER = (
     TECHNICAL_CORE,
     PACKAGING,
+    INSTALLED_CLI_MCP,
     WINDOWS,
     LINUX,
     MACOS,
@@ -74,6 +88,16 @@ GATE_ORDER = (
     LEGAL,
     SECURITY,
     CI,
+)
+
+# Public release may carry external certification debt, but only as an
+# explicit PARTIAL/PENDING result. BLOCKED always remains a veto.
+PUBLIC_RELEASE_EXTERNAL_GATES = (
+    LINUX,
+    MACOS,
+    CI,
+    CBM_CERTIFICATION,
+    HOST_CERTIFICATION,
 )
 
 #: Desktop CBM platform tags that must all be certified for a full PASS.
@@ -171,15 +195,68 @@ def _eval_packaging(evidence: Mapping[str, Any]) -> Gate:
                  blockers=blockers)
 
 
+def _eval_installed(evidence: Mapping[str, Any]) -> Gate:
+    """Evaluate retained exact-artifact installed CLI/MCP evidence."""
+    data = evidence.get("installed")
+    if not isinstance(data, Mapping):
+        return _gate(
+            INSTALLED_CLI_MCP,
+            GateStatus.PARTIAL,
+            notes=["no installed CLI/MCP evidence"],
+        )
+
+    details = [str(item) for item in data.get("details") or []]
+    values = {"cli": data.get("cli"), "mcp": data.get("mcp")}
+    failures = [surface for surface, value in values.items() if value is False]
+    unknown = [surface for surface, value in values.items() if value is not True]
+    evidence_items = list(details)
+    evidence_items.extend(
+        f"installed {surface}: {value!r}"
+        for surface, value in values.items()
+        if value is not None
+    )
+
+    if failures:
+        return _gate(
+            INSTALLED_CLI_MCP,
+            GateStatus.BLOCKED,
+            evidence=evidence_items,
+            blockers=[
+                f"installed {surface} E2E check failed (expected True)"
+                for surface in failures
+            ],
+        )
+    if unknown:
+        return _gate(
+            INSTALLED_CLI_MCP,
+            GateStatus.PARTIAL,
+            evidence=evidence_items,
+            notes=[
+                f"installed {surface} E2E evidence is missing or indeterminate"
+                for surface in unknown
+            ],
+        )
+    return _gate(
+        INSTALLED_CLI_MCP,
+        GateStatus.PASS,
+        evidence=evidence_items,
+    )
+
+
 def _eval_platform(name: str, key: str, evidence: Mapping[str, Any]) -> Gate:
     data = evidence.get("platforms")
     value = data.get(key) if isinstance(data, Mapping) else None
     ev = [f"platform {key}: {value}"] if value else []
     if value == "pass":
         return _gate(name, GateStatus.PASS, evidence=ev)
-    if value == "fail":
+    if isinstance(value, str) and value.lower() in ("fail", "blocked"):
+        blocker = (
+            f"{key} regression failed"
+            if value.lower() == "fail"
+            else f"{key} evidence is BLOCKED"
+        )
         return _gate(name, GateStatus.BLOCKED, evidence=ev,
-                     blockers=[f"{key} regression failed"])
+                     blockers=[blocker])
     return _gate(name, GateStatus.PARTIAL, evidence=ev,
                  notes=[f"no passing {key} evidence"])
 
@@ -337,6 +414,7 @@ def _eval_ci(evidence: Mapping[str, Any]) -> Gate:
 _EVALUATORS = {
     TECHNICAL_CORE: _eval_technical_core,
     PACKAGING: _eval_packaging,
+    INSTALLED_CLI_MCP: _eval_installed,
     WINDOWS: lambda ev: _eval_platform(WINDOWS, "windows", ev),
     LINUX: lambda ev: _eval_platform(LINUX, "linux", ev),
     MACOS: lambda ev: _eval_platform(MACOS, "macos", ev),
@@ -387,6 +465,8 @@ class ReleaseReport:
         core = (TECHNICAL_CORE, PACKAGING, SECURITY, CI)
         if any(self._status(name) is GateStatus.BLOCKED for name in core):
             return False
+        if self._status(INSTALLED_CLI_MCP) is GateStatus.BLOCKED:
+            return False
         if any(
             self._status(name) is not GateStatus.PASS
             for name in (TECHNICAL_CORE, PACKAGING, SECURITY)
@@ -420,8 +500,9 @@ class ReleaseReport:
         for gate in self.gates:
             if gate.status is GateStatus.BLOCKED:
                 return False
-            if gate.name in (CBM_CERTIFICATION, HOST_CERTIFICATION):
-                # Documented evidence debt: PARTIAL is acceptable.
+            if gate.name in PUBLIC_RELEASE_EXTERNAL_GATES:
+                # Documented external evidence debt: PARTIAL is acceptable,
+                # but it must never be rendered as PASS.
                 if gate.status not in (GateStatus.PASS, GateStatus.PARTIAL):
                     return False
             elif gate.status is not GateStatus.PASS:
@@ -431,6 +512,36 @@ class ReleaseReport:
             and self._status(LEGAL) is GateStatus.PASS
         )
 
+    @property
+    def pending_public_release_external_certifications(self) -> List[dict]:
+        """Return external certification debt without changing gate status."""
+        by_name = {gate.name: gate for gate in self.gates}
+        return [
+            {
+                "gate": name,
+                "status": by_name[name].status.value,
+                "notes": list(by_name[name].notes),
+            }
+            for name in PUBLIC_RELEASE_EXTERNAL_GATES
+            if by_name[name].status is GateStatus.PARTIAL
+        ]
+
+    @property
+    def public_release_external_certification_status(self) -> str:
+        """Summarize external certification debt as CLEAR/PENDING/BLOCKED."""
+        external = [
+            gate
+            for gate in self.gates
+            if gate.name in PUBLIC_RELEASE_EXTERNAL_GATES
+        ]
+        if any(gate.status is GateStatus.BLOCKED for gate in external):
+            return "BLOCKED"
+        if any(gate.status is GateStatus.PARTIAL for gate in external):
+            return "PENDING"
+        if any(gate.status is not GateStatus.PASS for gate in external):
+            return "BLOCKED"
+        return "CLEAR"
+
     def to_dict(self) -> dict:
         return {
             "gates": [gate.to_dict() for gate in self.gates],
@@ -439,6 +550,12 @@ class ReleaseReport:
             "safe_to_tag_rc": self.safe_to_tag_rc,
             "safe_for_public_release": self.safe_for_public_release,
             "blockers": self.blockers,
+            "public_release_external_certification_status": (
+                self.public_release_external_certification_status
+            ),
+            "pending_public_release_external_certifications": (
+                self.pending_public_release_external_certifications
+            ),
         }
 
     @classmethod

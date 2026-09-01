@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools import release_check
+from tools import release_check, release_gates
 
 SHA = "d818b8c20d38557ab6624a9a3e4fe66a11532261"
 OTHER_SHA = "5cfbc37e0000000000000000000000000000dead"
@@ -50,6 +50,14 @@ class RequireShaTests(unittest.TestCase):
             "meta": {"sha": SHA, "run_id": "31760708465",
                      "source": "github-actions"},
             "ci": {"workflows_present": True, "remote_runs_passed": True},
+            "installed": {
+                "cli": True,
+                "mcp": True,
+                "details": [
+                    "wheel exact-artifact CLI/MCP E2E retained",
+                    "sdist exact-artifact CLI/MCP E2E retained",
+                ],
+            },
         }
 
     def test_matching_sha_proceeds_and_merges(self):
@@ -62,6 +70,40 @@ class RequireShaTests(unittest.TestCase):
         report = json.loads(stdout)
         ci_gate = next(g for g in report["gates"] if g["name"] == "CI")
         self.assertEqual(ci_gate["status"], "PASS")
+        installed_gate = next(
+            g for g in report["gates"] if g["name"] == "INSTALLED_CLI_MCP"
+        )
+        self.assertEqual(installed_gate["status"], "PASS")
+
+    def test_external_installed_cli_failure_is_blocked(self):
+        evidence = self._good_evidence()
+        evidence["installed"]["cli"] = False
+        self._write_evidence(evidence)
+        code, stdout, _ = self._run(
+            ["--evidence", str(self.evidence_path), "--json"]
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)
+        installed_gate = next(
+            g for g in report["gates"] if g["name"] == "INSTALLED_CLI_MCP"
+        )
+        self.assertEqual(installed_gate["status"], "BLOCKED")
+        self.assertFalse(report["safe_for_public_release"])
+
+    def test_external_installed_mcp_failure_is_blocked(self):
+        evidence = self._good_evidence()
+        evidence["installed"]["mcp"] = False
+        self._write_evidence(evidence)
+        code, stdout, _ = self._run(
+            ["--evidence", str(self.evidence_path), "--json"]
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)
+        installed_gate = next(
+            g for g in report["gates"] if g["name"] == "INSTALLED_CLI_MCP"
+        )
+        self.assertEqual(installed_gate["status"], "BLOCKED")
+        self.assertFalse(report["safe_for_public_release"])
 
     def test_mismatching_sha_exits_2(self):
         self._write_evidence(self._good_evidence())
@@ -198,6 +240,30 @@ class RequireShaFormatTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("evidence sha validation failed", stderr)
         self.assertEqual(calls, [])
+
+
+class ReportTextTests(unittest.TestCase):
+    def test_text_surfaces_pending_external_certification_fields(self):
+        report = release_gates.evaluate_gates({})
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            release_check._print_text(
+                report,
+                {
+                    "metadata": {"version": "0.1.0"},
+                    "workspace": {"git_clean": True},
+                },
+            )
+
+        text = stdout.getvalue()
+        self.assertIn(
+            "public_release_external_certification_status: PENDING", text
+        )
+        self.assertIn(
+            "pending_public_release_external_certification: LINUX=PARTIAL",
+            text,
+        )
+        self.assertIn("INSTALLED_CLI_MCP: PARTIAL", text)
 
 
 if __name__ == "__main__":

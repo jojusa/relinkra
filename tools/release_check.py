@@ -5,6 +5,13 @@ evaluates the release gates from tools/release_gates.py, and prints a text
 summary or a JSON report. The opt-in packaging collector may acquire build
 dependencies; every such subprocess is explicitly time-bounded.
 
+``--require public`` requires PASS for local deterministic product,
+packaging, installed CLI/MCP, documentation, legal, security, and Windows
+evidence. It allows only PARTIAL external evidence for Linux, macOS, hosted
+CI, CBM, and host certification; BLOCKED remains a veto. Installed CLI/MCP
+checks are not collected by this command: supply their retained exact
+wheel/sdist E2E result mapping through ``--evidence``.
+
     python tools/release_check.py [--json] [--evidence file.json]
                                   [--require-sha SHA]
                                   [--run-regression] [--run-packaging]
@@ -452,7 +459,11 @@ def validate_evidence_sha(external_path: str, require_sha: str) -> None:
 def merge_evidence(
     local: Dict[str, Any], external_path: Optional[str]
 ) -> Dict[str, Any]:
-    """Merge an external evidence JSON object; external wins per key."""
+    """Merge an external evidence JSON object; external wins per key.
+
+    This is also the input path for the mandatory ``installed`` gate because
+    this collector cannot run installed-artifact E2E checks itself.
+    """
     if not external_path:
         return local
     with open(external_path, "r", encoding="utf-8") as handle:
@@ -479,6 +490,15 @@ def _print_text(report: "release_gates.ReleaseReport", evidence: Dict[str, Any])
     print(f"safe_to_merge: {report.safe_to_merge}")
     print(f"safe_to_tag_rc: {report.safe_to_tag_rc}")
     print(f"safe_for_public_release: {report.safe_for_public_release}")
+    print(
+        "public_release_external_certification_status: "
+        f"{report.public_release_external_certification_status}"
+    )
+    for pending in report.pending_public_release_external_certifications:
+        print(
+            "pending_public_release_external_certification: "
+            f"{pending['gate']}={pending['status']}"
+        )
 
 
 def main(argv=None) -> int:
@@ -490,7 +510,8 @@ def main(argv=None) -> int:
     parser.add_argument("--json", action="store_true",
                         help="print the ReleaseReport as JSON")
     parser.add_argument("--evidence", metavar="FILE.json",
-                        help="external evidence mapping (wins per key)")
+                        help="external evidence mapping (wins per key), "
+                             "including retained installed E2E evidence")
     parser.add_argument(
         "--require-sha", metavar="SHA",
         help="commit the external evidence must be bound to; requires "

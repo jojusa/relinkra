@@ -17,8 +17,14 @@ from tools.release_gates import (
     CI,
     DOCUMENTATION,
     HOST_CERTIFICATION,
+    INSTALLED_CLI_MCP,
     LEGAL,
+    LINUX,
+    MACOS,
+    PACKAGING,
+    SECURITY,
     TECHNICAL_CORE,
+    WINDOWS,
     GateStatus,
 )
 
@@ -36,6 +42,14 @@ def full_positive_evidence():
             "where": "ci",
         },
         "packaging": {"wheel_ok": True, "sdist_ok": True, "details": []},
+        "installed": {
+            "cli": True,
+            "mcp": True,
+            "details": [
+                "wheel exact-artifact CLI/MCP E2E retained",
+                "sdist exact-artifact CLI/MCP E2E retained",
+            ],
+        },
         "platforms": {"windows": "pass", "linux": "pass", "macos": "pass"},
         "cbm": {
             "certified_platforms": ["windows-amd64"],
@@ -95,6 +109,27 @@ class FullPositiveTests(unittest.TestCase):
     def test_overall_is_partial_when_any_gate_is_partial(self):
         self.assertIs(self.report.overall, GateStatus.PARTIAL)
 
+    def test_pending_external_certification_fields_keep_partial_status(self):
+        pending = self.report.pending_public_release_external_certifications
+        self.assertEqual(
+            {item["gate"] for item in pending},
+            {CBM_CERTIFICATION, HOST_CERTIFICATION},
+        )
+        self.assertTrue(all(item["status"] == "PARTIAL" for item in pending))
+        self.assertEqual(
+            self.report.public_release_external_certification_status,
+            "PENDING",
+        )
+
+    def test_installed_gate_pass_is_not_pending_external_debt(self):
+        gate = self.report._by_name(INSTALLED_CLI_MCP)
+        self.assertIs(gate.status, GateStatus.PASS)
+        self.assertNotIn(
+            INSTALLED_CLI_MCP,
+            {item["gate"] for item in
+             self.report.pending_public_release_external_certifications},
+        )
+
 
 class AntiFalseGreenTests(unittest.TestCase):
     def test_missing_evidence_never_yields_pass(self):
@@ -141,6 +176,74 @@ class BlockedGateTests(unittest.TestCase):
             report.blockers,
         )
 
+    def test_packaging_failure_blocks_public_release(self):
+        evidence = full_positive_evidence()
+        evidence["packaging"] = {
+            "wheel_ok": False,
+            "sdist_ok": True,
+            "details": ["wheel missing required metadata"],
+        }
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(PACKAGING).status, GateStatus.BLOCKED)
+        self.assertFalse(report.safe_to_merge)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_security_failure_blocks_public_release(self):
+        evidence = full_positive_evidence()
+        evidence["security"]["actions_pinned"] = False
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(SECURITY).status, GateStatus.BLOCKED)
+        self.assertFalse(report.safe_to_merge)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_windows_failure_blocks_public_release(self):
+        evidence = full_positive_evidence()
+        evidence["platforms"]["windows"] = "fail"
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(report._by_name(WINDOWS).status, GateStatus.BLOCKED)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_installed_cli_failure_blocks_release_safeties(self):
+        evidence = full_positive_evidence()
+        evidence["installed"]["cli"] = False
+        report = release_gates.evaluate_gates(evidence)
+        gate = report._by_name(INSTALLED_CLI_MCP)
+        self.assertIs(gate.status, GateStatus.BLOCKED)
+        self.assertTrue(any("installed cli" in item for item in gate.blockers))
+        self.assertFalse(report.safe_to_merge)
+        self.assertFalse(report.safe_to_tag_rc)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_installed_mcp_failure_blocks_release_safeties(self):
+        evidence = full_positive_evidence()
+        evidence["installed"]["mcp"] = False
+        report = release_gates.evaluate_gates(evidence)
+        gate = report._by_name(INSTALLED_CLI_MCP)
+        self.assertIs(gate.status, GateStatus.BLOCKED)
+        self.assertTrue(any("installed mcp" in item for item in gate.blockers))
+        self.assertFalse(report.safe_to_merge)
+        self.assertFalse(report.safe_to_tag_rc)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_missing_installed_evidence_is_partial_and_not_public_safe(self):
+        evidence = full_positive_evidence()
+        del evidence["installed"]
+        report = release_gates.evaluate_gates(evidence)
+        self.assertIs(
+            report._by_name(INSTALLED_CLI_MCP).status, GateStatus.PARTIAL
+        )
+        self.assertTrue(report.safe_to_merge)
+        self.assertTrue(report.safe_to_tag_rc)
+        self.assertFalse(report.safe_for_public_release)
+
+    def test_indeterminate_installed_evidence_is_not_pass_or_public_safe(self):
+        evidence = full_positive_evidence()
+        evidence["installed"]["mcp"] = None
+        report = release_gates.evaluate_gates(evidence)
+        gate = report._by_name(INSTALLED_CLI_MCP)
+        self.assertIs(gate.status, GateStatus.PARTIAL)
+        self.assertFalse(report.safe_for_public_release)
+
 
 class LegalGateTests(unittest.TestCase):
     def test_legal_blocked_allows_rc_but_vetoes_public(self):
@@ -178,6 +281,66 @@ class CiGateTests(unittest.TestCase):
             gate.blockers,
         )
         self.assertFalse(report.safe_to_merge)
+
+
+class PublicExternalPolicyTests(unittest.TestCase):
+    def test_linux_macos_ci_partial_is_visible_but_public_non_blocking(self):
+        evidence = full_positive_evidence()
+        evidence["platforms"] = {
+            "windows": "pass",
+            "linux": "pending",
+            "macos": "partial",
+        }
+        evidence["ci"] = {
+            "workflows_present": True,
+            "remote_runs_passed": None,
+        }
+        report = release_gates.evaluate_gates(evidence)
+
+        for name in (LINUX, MACOS, CI):
+            self.assertIs(
+                report._by_name(name).status, GateStatus.PARTIAL, name
+            )
+        self.assertTrue(report.safe_for_public_release)
+        self.assertTrue(report.safe_to_merge)
+        self.assertFalse(report.safe_to_tag_rc)
+        self.assertEqual(
+            {item["gate"] for item in
+             report.pending_public_release_external_certifications},
+            {LINUX, MACOS, CI, CBM_CERTIFICATION, HOST_CERTIFICATION},
+        )
+        self.assertNotIn(
+            INSTALLED_CLI_MCP,
+            {item["gate"] for item in
+             report.pending_public_release_external_certifications},
+        )
+
+    def test_blocked_external_result_still_blocks_public_release(self):
+        cases = {
+            LINUX: lambda evidence: evidence["platforms"].update(
+                {"linux": "fail"}
+            ),
+            MACOS: lambda evidence: evidence["platforms"].update(
+                {"macos": "BLOCKED"}
+            ),
+            CI: lambda evidence: evidence.update(
+                {"ci": {"workflows_present": True,
+                         "remote_runs_passed": False}}
+            ),
+        }
+        for name, make_blocked in cases.items():
+            with self.subTest(name=name):
+                evidence = full_positive_evidence()
+                make_blocked(evidence)
+                report = release_gates.evaluate_gates(evidence)
+                self.assertIs(
+                    report._by_name(name).status, GateStatus.BLOCKED
+                )
+                self.assertEqual(
+                    report.public_release_external_certification_status,
+                    "BLOCKED",
+                )
+                self.assertFalse(report.safe_for_public_release)
 
 
 class TechnicalCoreGateTests(unittest.TestCase):
@@ -233,6 +396,8 @@ class SerializationTests(unittest.TestCase):
                 "safe_to_tag_rc",
                 "safe_for_public_release",
                 "blockers",
+                "public_release_external_certification_status",
+                "pending_public_release_external_certifications",
             },
         )
         self.assertEqual(len(decoded["gates"]), len(release_gates.GATE_ORDER))
@@ -240,6 +405,18 @@ class SerializationTests(unittest.TestCase):
             self.assertEqual(
                 set(gate), {"name", "status", "evidence", "blockers", "notes"}
             )
+        self.assertEqual(
+            decoded["public_release_external_certification_status"],
+            "PENDING",
+        )
+        self.assertTrue(
+            all(
+                item["status"] == "PARTIAL"
+                for item in decoded[
+                    "pending_public_release_external_certifications"
+                ]
+            )
+        )
 
     def test_from_evidence_json_matches_direct_evaluation(self):
         evidence = full_positive_evidence()
