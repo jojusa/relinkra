@@ -26,6 +26,7 @@ from relinkra.connectors import (
     CLAUDE,
     SERVER_MODULE,
     claude_project_key,
+    resolve_host_launch,
     resolve_launch,
 )
 from relinkra.handoff import contains_absolute_path
@@ -41,6 +42,7 @@ from relinkra.product_cli import (
     main,
     registry_path,
 )
+from relinkra.toml_edit import toml_parser_available
 
 _SECRET = "sk-live-DO-NOT-LEAK-0123456789"
 
@@ -379,7 +381,7 @@ class HostNeutralConnectorTests(ConnectCLICase):
         self.assertEqual(document["$schema"], "https://example.invalid/schema.json")
 
     def test_codex_apply_is_bare_and_preserves_unrelated_table(self):
-        self.write_config(
+        config_path = self.write_config(
             ".codex",
             "config.toml",
             content=(
@@ -390,15 +392,21 @@ class HostNeutralConnectorTests(ConnectCLICase):
                 'url = "https://example.invalid"\n'
             ),
         )
+        if not toml_parser_available():
+            # On interpreters without tomllib (Python 3.9/3.10) apply must
+            # FAIL_HONEST: refuse with EXIT_ACTION_REQUIRED, name the
+            # interpreter gap, and leave the file byte-for-byte untouched.
+            before = config_path.read_bytes()
+            code, payload, _ = self.run_json("apply", "codex")
+            self.assertEqual(code, EXIT_ACTION_REQUIRED)
+            self.assertFalse(payload["write_attempted"])
+            self.assertIn("Python 3.11", payload["refusal_reason"])
+            self.assertEqual(config_path.read_bytes(), before)
+            return
         code, payload, _ = self.run_json("apply", "codex")
         self.assertEqual(code, EXIT_OK)
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover - this suite needs Python 3.11+
-            self.skipTest("tomllib unavailable")
-        document = tomllib.loads(
-            (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
-        )
+        import tomllib
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
         entry = document["mcp_servers"][MANAGED_SERVER_NAME]
         self.assertNotIn("--workspace-root", entry["args"])
         self.assertNotIn("--registry", entry["args"])
@@ -421,7 +429,17 @@ class HostNeutralConnectorTests(ConnectCLICase):
         self.assertEqual(code, EXIT_OK)
         document = json.loads(path.read_text(encoding="utf-8"))
         entry = document["mcp"]["servers"][MANAGED_SERVER_NAME]
-        self.assertEqual(entry["args"], [])
+        # The registered shape is distribution-mode dependent: an installed
+        # Relinkra registers its bare console script, while a source checkout
+        # or installed-module launch runs ``-m relinkra.mcp_cli``. Both are
+        # valid registrations, so resolve the expectation exactly the way
+        # apply does instead of pinning one mode's shape.
+        expected = resolve_host_launch(
+            "zcode", self.repo, registry_path(self.repo)
+        )
+        self.assertEqual(entry["command"], expected.command)
+        self.assertEqual(entry["args"], list(expected.args))
+        self.assertEqual(entry.get("env", {}), dict(expected.env))
         self.assertEqual(entry["cwd"], canonicalize_path(str(self.repo)))
         self.assertEqual(document["mcp"]["servers"]["context7"]["type"], "remote")
         self.assertEqual(document["theme"], "dark")
