@@ -158,8 +158,44 @@ detached state. No absolute paths.
 
 Version and compatibility, deliberately path-free: Relinkra version, the
 Python it runs on (with the minimum supported), the MCP contract version,
-and whether it runs from an installed package or a source checkout. Takes
-`--json` but no `--path` — it answers about the tool, not a workspace.
+whether it runs from an installed package or a source checkout, and the
+installed wheel metadata check. Takes `--json` but no `--path` — it answers
+about the tool, not a workspace.
+
+The JSON contract is:
+
+| Field | Meaning |
+|---|---|
+| `relinkra_version` | Canonical product version from `relinkra.__version__`. |
+| `contract_version` | MCP/application contract version. |
+| `python_version` / `min_python_version` | Running interpreter and supported floor. |
+| `install_mode` | `installed` only for matching nearby `.dist-info` wheel metadata; `source` for `.egg-info`, no distribution, or unrelated metadata. |
+| `installed_metadata_version` | The `importlib.metadata` version for an installed wheel; otherwise `null`. |
+| `metadata_version_consistent` | Whether installed metadata matches `relinkra_version`; otherwise `null`. |
+| `build_provenance` | External release evidence boundary; runtime values are never fabricated. |
+
+Example shape:
+
+```json
+{
+  "relinkra_version": "<version>",
+  "contract_version": "<contract-version>",
+  "python_version": "<python-version>",
+  "min_python_version": "3.9",
+  "install_mode": "installed",
+  "installed_metadata_version": "<version>",
+  "metadata_version_consistent": true,
+  "build_provenance": {
+    "source_commit": null,
+    "artifact_sha256": null,
+    "statement": "Source commit and archive SHA-256 are intentionally external release-report evidence; runtime metadata does not claim either."
+  }
+}
+```
+
+The command has no runtime Git or current-working-directory dependency and
+never embeds a source commit or archive digest. Those values belong in the
+maintainer's exact-release-head artifact report.
 
 ## `--json`
 
@@ -178,7 +214,7 @@ One file, `.relinkra/config.json`, alongside the registry:
   "project_id": "rlk_...",
   "workspace_id": "ws_...",
   "initialized_at": "...",
-  "relinkra_version": "0.1.0"
+  "relinkra_version": "<version>"
 }
 ```
 

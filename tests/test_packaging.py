@@ -18,6 +18,7 @@ import json
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import tomllib
@@ -79,6 +80,7 @@ class PyprojectTests(unittest.TestCase):
     def test_version_is_dynamic_and_single_sourced(self):
         dynamic = self.data["tool"]["setuptools"]["dynamic"]["version"]
         self.assertEqual(dynamic, {"attr": "relinkra.__version__"})
+        self.assertEqual(relinkra.__version__, "0.1.1")
         self.assertRegex(relinkra.__version__, VERSION_PATTERN)
 
     def test_version_pattern_policy_table(self):
@@ -162,6 +164,9 @@ class VersionCommandTests(unittest.TestCase):
         "python_version",
         "min_python_version",
         "install_mode",
+        "installed_metadata_version",
+        "metadata_version_consistent",
+        "build_provenance",
     }
 
     def assert_no_local_paths(self, text: str) -> None:
@@ -181,8 +186,90 @@ class VersionCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
         self.assertEqual(set(payload), self.EXPECTED_KEYS)
-        self.assertEqual(payload["relinkra_version"], relinkra.__version__)
+        self.assertEqual(payload["relinkra_version"], "0.1.1")
+        self.assertEqual(payload["install_mode"], "source")
+        self.assertIsNone(payload["installed_metadata_version"])
+        self.assertIsNone(payload["metadata_version_consistent"])
+        provenance = payload["build_provenance"]
+        self.assertIsNone(provenance["source_commit"])
+        self.assertIsNone(provenance["artifact_sha256"])
+        self.assertIn("external release-report evidence", provenance["statement"])
         self.assert_no_local_paths(out)
+
+    def test_wheel_metadata_is_reported_and_checked_for_consistency(self):
+        class FakeDistribution:
+            files = (
+                Path("relinkra/product_cli.py"),
+                Path("relinkra-0.1.1.dist-info/METADATA"),
+            )
+            version = "0.1.1"
+
+            @staticmethod
+            def locate_file(name):
+                return REPO_ROOT / Path(str(name))
+
+        with mock.patch.object(
+            product_cli.importlib_metadata,
+            "distribution",
+            return_value=FakeDistribution(),
+        ):
+            code, out, err = run_cli(["version", "--json"])
+
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["install_mode"], "installed")
+        self.assertEqual(payload["installed_metadata_version"], "0.1.1")
+        self.assertTrue(payload["metadata_version_consistent"])
+
+    def test_wheel_metadata_mismatch_is_explicit(self):
+        class FakeDistribution:
+            files = (
+                Path("relinkra/product_cli.py"),
+                Path("relinkra-0.1.1.dist-info/METADATA"),
+            )
+            version = "9.9.9"
+
+            @staticmethod
+            def locate_file(name):
+                return REPO_ROOT / Path(str(name))
+
+        with mock.patch.object(
+            product_cli.importlib_metadata,
+            "distribution",
+            return_value=FakeDistribution(),
+        ):
+            code, out, err = run_cli(["version", "--json"])
+
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["install_mode"], "installed")
+        self.assertEqual(payload["installed_metadata_version"], "9.9.9")
+        self.assertFalse(payload["metadata_version_consistent"])
+
+    def test_egg_info_metadata_remains_source_mode(self):
+        class FakeDistribution:
+            files = (
+                Path("relinkra/product_cli.py"),
+                Path("relinkra.egg-info/PKG-INFO"),
+            )
+            version = "0.1.1"
+
+            @staticmethod
+            def locate_file(name):
+                return REPO_ROOT / Path(str(name))
+
+        with mock.patch.object(
+            product_cli.importlib_metadata,
+            "distribution",
+            return_value=FakeDistribution(),
+        ):
+            code, out, err = run_cli(["version", "--json"])
+
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["install_mode"], "source")
+        self.assertIsNone(payload["installed_metadata_version"])
+        self.assertIsNone(payload["metadata_version_consistent"])
 
     def test_dash_dash_version_flag_exits_zero(self):
         out = io.StringIO()

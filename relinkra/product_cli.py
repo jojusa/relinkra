@@ -41,6 +41,7 @@ import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -85,6 +86,62 @@ MIN_PYTHON = (3, 9)
 PASS = "PASS"
 WARN = "WARN"
 FAIL = "FAIL"
+
+_BUILD_PROVENANCE_STATEMENT = (
+    "Source commit and archive SHA-256 are intentionally external "
+    "release-report evidence; runtime metadata does not claim either."
+)
+
+
+def _distribution_shape(distribution: Any) -> Optional[str]:
+    """Return the importlib.metadata shape for a distribution."""
+    for entry in distribution.files or ():
+        parts = Path(str(entry)).parts
+        if any(part.endswith(".dist-info") for part in parts):
+            return "dist-info"
+        if any(part.endswith(".egg-info") for part in parts):
+            return "egg-info"
+
+    # ``files`` may be unavailable for an unusual distribution. The path is
+    # still importlib.metadata-owned; use it only as a shape fallback.
+    metadata_path = getattr(distribution, "_path", None)
+    if metadata_path is not None:
+        name = Path(str(metadata_path)).name
+        if name.endswith(".dist-info"):
+            return "dist-info"
+        if name.endswith(".egg-info"):
+            return "egg-info"
+    return None
+
+
+def _distribution_matches_imported_package(distribution: Any) -> bool:
+    """Avoid reporting unrelated installed metadata for a source import."""
+    locate_file = getattr(distribution, "locate_file", None)
+    if not callable(locate_file):
+        return False
+    try:
+        distribution_root = Path(locate_file("")).resolve()
+        imported_root = Path(__file__).resolve().parent.parent
+    except (OSError, TypeError, ValueError):
+        return False
+    return distribution_root == imported_root
+
+
+def _runtime_version_metadata() -> Tuple[str, Optional[str], Optional[bool]]:
+    """Read wheel metadata without consulting Git or the current directory."""
+    try:
+        distribution = importlib_metadata.distribution("relinkra")
+    except importlib_metadata.PackageNotFoundError:
+        return "source", None, None
+
+    if (
+        _distribution_shape(distribution) != "dist-info"
+        or not _distribution_matches_imported_package(distribution)
+    ):
+        return "source", None, None
+
+    metadata_version = str(distribution.version)
+    return "installed", metadata_version, metadata_version == __version__
 
 
 @dataclass
@@ -2190,16 +2247,22 @@ def cmd_version(args) -> int:
     Deliberately path-free: a version answer must never leak local
     directories into bug reports or screenshots.
     """
-    package_parts = Path(__file__).resolve().parts
-    installed = any(
-        part in ("site-packages", "dist-packages") for part in package_parts
+    install_mode, metadata_version, metadata_consistent = (
+        _runtime_version_metadata()
     )
     payload = {
         "relinkra_version": __version__,
         "contract_version": CONTRACT_VERSION,
         "python_version": platform.python_version(),
         "min_python_version": ".".join(str(part) for part in MIN_PYTHON),
-        "install_mode": "installed" if installed else "source",
+        "install_mode": install_mode,
+        "installed_metadata_version": metadata_version,
+        "metadata_version_consistent": metadata_consistent,
+        "build_provenance": {
+            "source_commit": None,
+            "artifact_sha256": None,
+            "statement": _BUILD_PROVENANCE_STATEMENT,
+        },
     }
     text = (
         f"relinkra {payload['relinkra_version']}\n"

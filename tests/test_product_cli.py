@@ -936,6 +936,20 @@ class TopLevelCliTests(unittest.TestCase):
         self.assertTrue(out.startswith(f"relinkra {product_cli.__version__}\n"))
         self.assertEqual(err, "")
 
+    def test_version_json_reports_external_provenance_boundary(self):
+        code, out, err = self.run_cli(["version", "--json"])
+        self.assertEqual(code, EXIT_OK, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["relinkra_version"], "0.1.1")
+        self.assertEqual(payload["install_mode"], "source")
+        self.assertIsNone(payload["installed_metadata_version"])
+        self.assertIsNone(payload["metadata_version_consistent"])
+        provenance = payload["build_provenance"]
+        self.assertIsNone(provenance["source_commit"])
+        self.assertIsNone(provenance["artifact_sha256"])
+        self.assertIn("external release-report evidence", provenance["statement"])
+        self.assertNotIn(str(Path(__file__).resolve().parents[1]), out)
+
     def test_invalid_command_exits_one_with_argparse_error(self):
         out, err = io.StringIO(), io.StringIO()
         with self.assertRaises(SystemExit) as caught:

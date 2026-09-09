@@ -29,8 +29,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import relinkra
-
 try:
     from tests import git_fixtures as gf
 except ImportError:  # pragma: no cover - discover vs module invocation
@@ -43,6 +41,7 @@ IS_NT = os.name == "nt"
 #: When set to an existing artifact path, the suites install THAT artifact
 #: instead of building one (CI reuses a certified build across cells).
 ENV_ARTIFACT = "RELINKRA_E2E_ARTIFACT"
+RELEASE_VERSION = "0.1.1"
 
 # Variables the sandbox environment keeps from the real one so git and the
 # interpreter still resolve; everything home- or config-related is replaced.
@@ -292,10 +291,7 @@ class CleanInstallTests(unittest.TestCase):
             env=cls._clean_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(
-            result.stdout == f"relinkra {relinkra.__version__}\n",
-            result.stdout,
-        )
+        self.assertEqual(result.stdout, f"relinkra {RELEASE_VERSION}\n")
 
     def test_step_d_version_json_reports_installed(self):
         self._installed()
@@ -310,8 +306,13 @@ class CleanInstallTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["relinkra_version"], relinkra.__version__)
+        self.assertEqual(payload["relinkra_version"], RELEASE_VERSION)
         self.assertEqual(payload["install_mode"], "installed")
+        self.assertEqual(payload["installed_metadata_version"], RELEASE_VERSION)
+        self.assertTrue(payload["metadata_version_consistent"])
+        self.assertIsNone(payload["build_provenance"]["source_commit"])
+        self.assertIsNone(payload["build_provenance"]["artifact_sha256"])
+        self.assertNotIn(str(REPO_ROOT), result.stdout)
 
     def test_step_e_help_lists_all_commands(self):
         self._installed()
@@ -536,7 +537,7 @@ class CleanInstallTests(unittest.TestCase):
         )
         self.assertEqual(version.returncode, 0, version.stderr)
         self.assertTrue(
-            version.stdout.startswith(f"relinkra {relinkra.__version__}"),
+            version.stdout.startswith(f"relinkra {RELEASE_VERSION}"),
             version.stdout,
         )
 

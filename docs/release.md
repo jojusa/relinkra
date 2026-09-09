@@ -6,10 +6,10 @@ evidence, and what remains open before a public release. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: release policy.** Windows is currently certified. Linux/macOS
+> **Status: 0.1.1 release policy.** Windows is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
-> defect. Public 0.1.0 policy carries those external results as visible
+> defect. Public 0.1.1 policy carries those external results as visible
 > `PARTIAL` debt, together with broader CBM and host/ZCode certification, but
 > never accepts `BLOCKED` or a missing deterministic product gate.
 >
@@ -36,6 +36,26 @@ Publication still requires all deterministic product/package/documentation/
 legal/security gates and a PASS from the mandatory installed-artifact gate,
 supplied through the external `installed` mapping;
 specified external certification debt may remain `PARTIAL`.
+
+## 0.1.1 artifact and provenance boundary
+
+Build and inspect the current release artifacts, then retain the exact
+release-HEAD report and its digests as external evidence:
+
+```bash
+python -m build
+python tools/artifact_checks.py \
+  dist/relinkra-0.1.1-py3-none-any.whl dist/relinkra-0.1.1.tar.gz
+cd dist && sha256sum relinkra-0.1.1-py3-none-any.whl relinkra-0.1.1.tar.gz
+```
+
+The provenance boundary is the artifact SHA-256 plus the exact release Git
+HEAD recorded in that build report. `relinkra version --json` deliberately
+reports `source_commit: null` and `artifact_sha256: null`: an installed
+package cannot recover its original archive digest or source commit without
+fragile custom build metadata, and Relinkra uses no custom build backend.
+The runtime report therefore states that both values are external
+release-report evidence instead of fabricating them.
 
 ## Verification levels
 
@@ -312,7 +332,7 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 python -m build
 python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
 # explicit paths — PowerShell does not expand the glob:
-# python tools/artifact_checks.py dist/relinkra-0.1.0-py3-none-any.whl dist/relinkra-0.1.0.tar.gz
+# python tools/artifact_checks.py dist/relinkra-0.1.1-py3-none-any.whl dist/relinkra-0.1.1.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -328,14 +348,14 @@ python tools/release_check.py --evidence external.json --require rc
 # retain and supply their CLI/MCP results under the external `installed` key.
 # release_check does not collect installed CLI/MCP evidence.
 # bash:
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0-py3-none-any.whl \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.1-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.0.tar.gz \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.1.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 # PowerShell equivalents:
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0-py3-none-any.whl"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.1-py3-none-any.whl"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.0.tar.gz"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.1.tar.gz"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
@@ -377,7 +397,7 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- Version 0.1.0, single-sourced in `relinkra/__init__.py`
+- Version 0.1.1, single-sourced in `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by
   `tests/test_packaging.py`.
@@ -385,7 +405,7 @@ RC realism rehearsal, not a release.
   **patch** bumps are fixes only.
 - The bump happens **only** in a dedicated release commit by the
   maintainer — never mixed into feature work.
-- RC naming is `0.1.0rcN`, only if and when tagging is approved. R5B
+- RC naming is `0.1.1rcN`, only if and when tagging is approved. R5B
   does not tag.
 
 ## Legal and NOTICE readiness
@@ -465,4 +485,4 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Rehearse with the Release Candidate Dry Run workflow; its report must
       keep pending external debt visible rather than relabeling it PASS.
 - [ ] Version bumps only in a dedicated release commit; RC names are
-      `0.1.0rcN`; nothing in R5B/R5C/R5D tags or publishes.
+      `0.1.1rcN`; nothing in R5B/R5C/R5D tags or publishes.

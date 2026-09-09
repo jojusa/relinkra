@@ -41,6 +41,38 @@ different installations.
 `python -m pip install .`. The `python -m pip` form always targets the
 Python that runs it, unlike a bare `pip`.
 
+## Source-tree import shadowing
+
+**Symptom:** an installed verification reports `install_mode: "source"`,
+missing installed metadata, or a version different from the package you just
+installed.
+
+**Cause:** Python imported the checkout before the installed package. This
+usually happens when running from the source tree, leaving `PYTHONPATH` set,
+or invoking `python -m relinkra.product_cli` while validating an install.
+An editable/source distribution is correctly reported as `source`; a wheel
+must have nearby `.dist-info` metadata.
+
+**Fix:** run the installed console script from an unrelated directory with
+`PYTHONPATH` cleared, and verify the JSON fields:
+
+```bash
+relinkra version --json
+```
+
+For an installed wheel, expect `install_mode: "installed"`,
+`installed_metadata_version` equal to `relinkra_version`, and
+`metadata_version_consistent: true`. The package location can be checked
+without importing from the checkout:
+
+```bash
+python -c "import relinkra; print(relinkra.__file__)"
+```
+
+The command intentionally does not recover the original archive SHA-256 or
+source commit; those are exact-release-head report evidence, not runtime
+package metadata.
+
 ## Git is not installed
 
 **Symptom:** `doctor` FAILs on the git executable check, or `init`
