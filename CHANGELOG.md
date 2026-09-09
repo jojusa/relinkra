@@ -3,6 +3,15 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.1.2
+
+First intended public PyPI release candidate. No product source change
+since 0.1.1: that version was consumed as the TestPyPI-only candidate with
+immutable version/build identity, and the only code change between the two
+candidates was environment-aware connector-test hardening for CI. 0.1.2
+exists to preserve that immutable identity; PyPI publication has not
+happened yet.
+
 ## 0.1.0
 
 First Relinkra release: shared code intelligence, persistent memory, and
