@@ -20,9 +20,10 @@ Powerful inside, simple outside. Everything below is the "inside".
 
 > **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), Devin
 > Desktop (R4C.1E), and ZCode (R5K.1) have gated write paths (`connect apply`
-> / `rollback` / `verify`). Devin Desktop has a real Cascade launch proof;
-> R5K.1 host bindings remain independently assessed. See
-> [Capability honesty](#capability-honesty).
+> / `rollback` / `verify`). Historical/local Devin Desktop evidence exists, but
+> the published 0.1.2 CLI currently reports `real_host_launch_proven=false` for
+> Devin Desktop and overall. Actual host proof is separate and must be recorded
+> through the published verify flow. See [Capability honesty](#capability-honesty).
 
 ---
 
@@ -177,7 +178,7 @@ machine — not from documentation.
 | `opencode` | experimental | yes | `mcp` with `{type: local, command: [...]}` | yes | yes (R4C.1C) | **no** |
 | `codex` | experimental | yes | `[mcp_servers.<name>]` TOML tables | yes | yes (R4C.1D) | **no** |
 | `zcode` | experimental | yes | workspace-local `mcp.servers` with `{type, command, args, cwd, enabled}` | yes | yes (R5K.1) | **no** |
-| `devin-desktop` | experimental | yes (current Devin file) | `mcpServers` with `{command, args}` | yes | **yes (R4C.1E)** | **yes (Cascade)** |
+| `devin-desktop` | experimental | yes (current Devin file) | `mcpServers` with `{command, args}` | yes | **yes (R4C.1E write path)** | **no (published CLI)** |
 | `devin-cloud` | unsupported | no | — | no | no | no |
 
 Codex writes use a **scoped textual TOML editor**: only the byte extent of the
@@ -203,11 +204,14 @@ connector; they do not create separate proof identities or writable targets.
 Bare `devin` remains ambiguous with the distinct, unsupported `devin-cloud`
 connector. Devin Cloud is outside the scope of R4C.1E.
 
-R4C.1E verified a real Devin Desktop/Cascade launch, the expected eleven-tool
-Relinkra roster, six successful tool calls, project binding, handoff retrieval,
-and an explicit null `workspace_id`. The evidence is local-operational and
-does not independently attest the host. Doctor trust may therefore remain
-`PARTIAL`; this proof does not promote the ecosystem to `READY` by itself.
+R4C.1E recorded historical/local Devin Desktop/Cascade evidence, including the
+expected eleven-tool Relinkra roster, six successful tool calls, project
+binding, handoff retrieval, and an explicit null `workspace_id`. Preserve that
+record as historical/local evidence only: it is not current host certification.
+The published 0.1.2 CLI reports `real_host_launch_proven=false` for Devin
+Desktop and overall. Actual host proof is separate and must be recorded after
+the host launch with the published flow, for example:
+`relinkra connect verify devin-desktop --proof <proof-file>`.
 
 When only a legacy file is discoverable, read-only inspection may display that
 file as the observed evidence location. This is not the writable target:
@@ -233,13 +237,16 @@ identity evidence is unusable rather than partially trusted.
 
 ### Config locations
 
-Each connector declares a finite, ordered list. Declaration order is
-precedence: the first candidate that **exists** becomes the active config.
-Nothing is globbed and no directory is walked.
+Each connector declares a finite, ordered list. For connectors other than
+Claude, declaration order is precedence: the first candidate that **exists**
+becomes the active config. Claude is the explicit exception in the published
+CLI: project-scoped `~/.claude.json` is the active/apply target, while
+`~/.claude/settings.json` is legacy/discovery-only. Nothing is globbed and no
+directory is walked.
 
 | Connector | Candidates |
 | --- | --- |
-| `claude` | `~/.claude/settings.json`, `~/.claude.json`, `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
+| `claude` | `~/.claude.json` (project-scoped active/apply target), `~/.claude/settings.json` (legacy/discovery-only), `<workspace>/.mcp.json`, `<workspace>/.claude/settings.local.json` |
 | `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json` (default `~/.config/...`) — the only apply target, plus `opencode.jsonc` siblings at user and workspace scope and `%APPDATA%/opencode/opencode.json`, `<workspace>/opencode.json` (discoverable and scanned for direct CBM, never the apply target) |
 | `codex` | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
 | `zcode` | `<workspace>/.zcode/config.json` only |
@@ -455,12 +462,13 @@ left to right — a later one is never implied by an earlier one.
 | `mcp_process_contract_validated` | The launch contract resolves and the server module imports. |
 | `real_host_launch_proven` | **A real host actually started this server.** |
 
-The last one is only `true` where a real launch is on record: Devin
-Desktop carries the R4C.1E Cascade proof (see
-[Devin Desktop](#devin-desktop)). For every other connector it remains
-`false` and cannot be set by planning. Producing a plan proves a file
-could be edited; it says nothing about a host starting the server
-afterwards.
+The published 0.1.2 CLI currently reports the last one as `false` for Devin
+Desktop and overall. Historical/local R4C.1E Cascade evidence (see [Devin
+Desktop](#devin-desktop)) is not current certification. The value cannot be
+set by planning: producing a plan proves a file could be edited, not that a
+host started the server afterwards. Actual host proof is separate and must be
+recorded after the real launch through the published verify flow,
+`relinkra connect verify <host> --proof <proof-file>`.
 
 ### Apply and host proof are separate
 
@@ -491,9 +499,11 @@ Windows, Linux and macOS are all first-class.
 **Still requiring CI certification on real machines:** POSIX permission
 assertions and symlink refusal are skipped on Windows and vice versa; the
 `%APPDATA%` and `$XDG_CONFIG_HOME` branches are asserted through injected
-environments rather than on real Linux and macOS hosts. Real host launches
-are recorded only for Devin Desktop (the R4C.1E Cascade proof, local
-Windows); no host launch has been recorded on Linux or macOS.
+environments rather than on real Linux and macOS hosts. The published 0.1.2
+CLI currently records no certified real-host launch for Devin Desktop or
+overall. The R4C.1E Cascade record is historical/local evidence only; actual
+host proof remains separate and must be recorded through
+`relinkra connect verify <host> --proof <proof-file>`.
 
 ### Windows, paths, and console scripts
 
@@ -558,7 +568,9 @@ Required before any connector may claim `real_host_launch_proven`:
 2. Start that host and confirm it launches `relinkra.mcp_cli` over stdio.
 3. Confirm the MCP handshake and at least one tool call succeed.
 4. Confirm unrelated MCP servers in the same config still work.
-5. Only then set `real_host_launch_proven=True` for that connector, and only
+5. Record the proof with the published flow:
+   `relinkra connect verify <host> --proof <proof-file>`.
+6. Only then set `real_host_launch_proven=True` for that connector, and only
    for that one.
 
 Enabling `apply_available` does not establish `real_host_launch_proven`; keep

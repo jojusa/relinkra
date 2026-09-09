@@ -121,12 +121,15 @@ unlocked if the primitive is unavailable). Loads are strictly validated
 `RegistryError` on any malformed content. No server, no runtime dependencies
 — Python 3.14 stdlib only.
 
-## CLI
+## Internal/legacy implementation detail
+
+The registry API and module-level CLI below are retained for internal and
+legacy compatibility. They are not public product commands. Public users
+initialize the workspace with `relinkra init` and build the CBM index with
+`relinkra cbm index`; those commands are the supported entry points for the
+current product workflow.
 
 ```
-python -m relinkra.cli register PATH [--registry PATH] [--display-name NAME]
-    [--remote-url URL] [--allow-weak-merge]
-    [--cbm-project-name NAME --cbm-cache-dir DIR [--cbm-version V] [--cbm-sha256 H]]
 python -m relinkra.cli list [--registry PATH]
 python -m relinkra.cli show WORKSPACE_ID [--registry PATH]
 ```

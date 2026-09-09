@@ -5,12 +5,21 @@ lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
 ## 0.1.2
 
-First intended public PyPI release candidate. No product source change
-since 0.1.1: that version was consumed as the TestPyPI-only candidate with
-immutable version/build identity, and the only code change between the two
-candidates was environment-aware connector-test hardening for CI. 0.1.2
-exists to preserve that immutable identity; PyPI publication has not
-happened yet.
+First public PyPI release. The published 0.1.2 package artifacts were built
+from release source commit `8afd3245347dea9cda93176384421d33fdfd69b3`.
+This later documentation-only closure does not change the package artifacts,
+their build source, or the public version, and does not republish 0.1.2.
+
+The public release includes the 0.1.1 product baseline, optional CBM and
+Engram integrations, host connectors, and the bounded context/freshness
+behavior documented below. Windows is certified for the product; Linux/macOS,
+CBM breadth, and real-host connector launch coverage retain their stated
+evidence boundaries.
+
+Known non-blocking follow-up: some published 0.1.2 doctor wording still
+mentions the nonexistent public `relinkra register` command. The public CBM
+route is `relinkra cbm index`; the runtime compatibility fix is deferred to
+0.1.3.
 
 ## 0.1.0
 

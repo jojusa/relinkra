@@ -1,165 +1,210 @@
 # Relinkra
 
-## What Relinkra does
+**Potente por dentro. Simple por fuera.**
 
-Relinkra gives AI coding agents shared code intelligence, persistent memory, and optimized context: one codebase, one shared context, many agents. Every connected agent sees the same project memory, handoffs, and code references instead of re-discovering the repository alone. Relinkra optimizes the path to information; it does not restrict the agent's ability to search, reason, edit, or validate by itself.
+Relinkra is an orchestration and context layer for AI coding agents. It
+optimizes the path to project information while leaving the agent in control
+of search, reasoning, editing, and validation.
 
-## Quick start
+> Relinkra optimiza el camino hacia la información; no restringe la capacidad del agente de buscar, razonar, editar o validar por sí mismo.
 
-Requirements: Python 3.9+ and Git. The quick start does not require any optional component.
+## Start here
 
-### Install
+This is the public 0.1.2 PyPI release. Use the normal install path; do not
+clone the source repository just to use Relinkra.
 
-The normal installation path after publication is:
+### 1. Install
+
+Requirements: Python 3.9 or newer and Git.
 
 ```bash
-python -m pip install relinkra
+pip install relinkra
 ```
 
-The literal `pip install relinkra` command is the equivalent user-facing
-contract. Relinkra is not being published to PyPI in this checkpoint, so this
-is the post-publication path rather than a claim of current public availability.
+Relinkra has zero runtime dependencies and is released under the [MIT
+License](LICENSE). The project is hosted at
+[github.com/jojusa/relinkra](https://github.com/jojusa/relinkra).
 
-For local validation or unreleased development only, install a built artifact
-or a source checkout:
+### 2. Add Relinkra to a project
 
-```bash
-# Install a locally built wheel or sdist
-python -m pip install path/to/relinkra-<version>-py3-none-any.whl
-
-# Or install from an unreleased source checkout
-git clone https://github.com/jojusa/relinkra.git
-cd relinkra
-python -m pip install .
-```
-
-Use `python -m pip install -e .` only when actively developing Relinkra. The
-source-checkout paths are not the normal user installation.
-
-### Initialize
-
-From inside the Git repository you want your agents to share:
+Run this inside an existing Git repository with at least one commit:
 
 ```bash
-relinkra --version
+relinkra version
 relinkra init
+relinkra status
 ```
 
-### Connect an agent
+`init` is per repository/workspace and idempotent. It writes
+`.relinkra/config.json` and `.relinkra/registry.json`, then reuses that local
+identity on later commands.
 
-Run the supported command sequence for the host you use:
+### 3. Connect an agent
+
+Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
+`devin-desktop`:
 
 ```bash
 relinkra doctor
-relinkra connect check <host>
-relinkra connect plan <host>
-relinkra connect apply <host>
+relinkra connect list
+relinkra connect inspect <agent>
+relinkra connect check <agent>
+relinkra connect plan <agent>
+relinkra connect apply <agent>
 ```
 
-Supported hosts include `claude`, `opencode`, `codex`, `zcode`, and
-`devin-desktop`. OpenCode and Codex receive global, bare `relinkra-mcp`
-registrations; Codex uses `args = []`. ZCode receives a workspace-local
-configuration with the repository-root `cwd`.
+`check` is read-only, `plan` previews changes, and `apply` writes the host
+configuration with a backup where supported. Restart or reload the host after
+`apply`.
 
-For the complete host list, run `relinkra connect list`. `connect check` is
-read-only, `connect plan` previews changes, and `connect apply` writes the
-configuration after creating a backup where supported.
+### 4. Build the optional code graph
 
-### Verify
-
-Restart the host so it can reread its configuration and launch Relinkra as its
-MCP (Model Context Protocol) server. Then record host-side proof:
+Codebase Memory (CBM) is optional. Relinkra owns the normal route; agents do
+not add CBM directly to their configuration.
 
 ```bash
-relinkra connect verify <host> --proof <proof-file>
+relinkra cbm setup
+relinkra cbm status
+relinkra cbm index
 ```
 
-`connect apply` and `connect check` validate configuration only; they do not
-prove that a real host launched the server.
+Use `relinkra cbm refresh` after the index becomes stale. `setup` also accepts
+`--from-file PATH` and `--json`; `index` and `refresh` accept `--path`,
+`--json`, and `--mode fast`.
 
-### Use
+### 5. Verify
 
-Once the connector is configured, ask normal project questions. You should not
-normally need to say "use Relinkra": the MCP server advertises when its shared
-context, memory, architecture, relationship, Git, or bounded-packet tools can
-reduce redundant exploration. It does not force those tools for trivial work,
-replace native tools, or make stale context authoritative.
+Configuration verification and host-side proof are separate:
 
-## What just happened?
+```bash
+relinkra connect check <agent>
+relinkra connect verify <agent> --proof <proof-file>
+```
 
-- `relinkra init` registered a portable identity for your repository and this workspace under `.relinkra/` — nothing else was touched.
-- `connect apply` added one MCP server entry named `relinkra` to the selected host configuration, after creating a timestamped backup where that host uses a writable config target.
-- Your agent can now request shared project context — memory, code references, and handoffs — through Relinkra instead of starting from zero.
-- Optional integrations are not required; their absence is reported honestly, and your agent's native tools remain untouched.
+`check` verifies the configuration. After the host is restarted or reloaded,
+`verify` records proof that the real host launched Relinkra.
 
-## How do I know it worked?
+## What Relinkra provides
 
-Run `relinkra doctor`, then `relinkra connect check <agent>`. After applying the
-configuration and restarting the host, use
-`relinkra connect verify <agent> --proof <proof-file>` when host-side evidence
-is required.
+- **Orchestration and context:** a shared project route for code references,
+  memory, handoffs, Git facts, and bounded context packets.
+- **CBM integration:** optional structural code intelligence, such as graph
+  indexing and bounded relationships, behind Relinkra's MCP server.
+- **Host configuration:** inspect, plan, apply, rollback, and verify supported
+  agent-host configuration without replacing the host's native tools.
+- **Honest degradation:** missing CBM or Engram is reported as unavailable or
+  optional; the core workflow remains usable.
 
-Healthy means: no FAIL entries in `doctor` (WARN entries are typically optional components in degraded mode — safe to ignore for now), and `check` reports the registration as valid. This confirms configuration only; host runtime proof is a separate `connect verify` concern.
+Relinkra does **not** replace an agent's native file search, reasoning, editing,
+testing, or validation. It does not make stale context authoritative, require
+CBM or Engram for every task, or register CBM directly with an agent.
 
-## If something fails
+## Agent hosts
 
-- **Python too old** — Relinkra requires Python 3.9+; check with `python --version`. See [Installation](docs/installation.md).
-- **Commands not found** — the virtual environment is not activated (or the console scripts directory is not on `PATH`). See [Troubleshooting](docs/troubleshooting.md).
-- **`init` refuses** — you are not inside a git repository. Run it from your project root. See [Installation](docs/installation.md).
-- **Outside Git or before `init`** — binding fails closed and does not create `.relinkra`; run `git init` for a new repository, then `relinkra init` before connecting a host.
-- **`doctor` reports a degraded backend** — an optional component is missing; the core still works. See [Troubleshooting](docs/troubleshooting.md).
-- **Host connector not detected** — the agent's config was not found; `connect inspect <agent>` shows what Relinkra probed. See [Connectors](docs/connectors.md).
-- **CBM unavailable or not certified on this platform** — code intelligence is unavailable; everything else works. See [CBM backend](docs/cbm-backend.md).
-- **Engram unavailable** — memory and handoffs report as unavailable; commands still succeed. See [Installation](docs/installation.md).
+The following connector IDs have configuration support in 0.1.2. Every one is
+**experimental**: configuration and format support are distinct from proof that
+the real host launches Relinkra end to end.
 
-Direct Engram use remains independently available; host binding does not depend
-on it and does not require direct CBM configuration.
+| Connector | Configuration target | Reload after `connect apply` |
+|---|---|---|
+| `codex` | Global user `~/.codex/config.toml` | Restart the Codex CLI. |
+| `opencode` | User `~/.config/opencode/opencode.json`; JSONC and workspace alternatives may also be recognized. | Restart OpenCode. |
+| `claude` | User `~/.claude.json`, project-scoped under `projects[<project>].mcpServers`. | Restart Claude, then run `/mcp`. |
+| `zcode` | Workspace-local `.zcode/config.json`. | Restart ZCode. |
+| `devin-desktop` | User `%APPDATA%/Devin/mcp_config.json`; workspace-local files are also recognized. | Reload the Cascade/MCP panel. |
 
-## Conflicting and stale context
+For any host, inspect before changing it and verify after restarting:
 
-Relinkra combines evidence from source, Git, CBM graphs, memory, and handoffs.
-When those sources disagree it does not silently collapse them into one truth:
-older evidence stays visible and is marked stale/historical, current-source
-evidence is presented as current for current-code claims, and unresolvable
-conflicts are surfaced as unresolved rather than guessed away. See
-[Freshness, contradictions, and explainability](docs/freshness-explainability.md).
+```bash
+relinkra connect inspect <agent>
+relinkra connect check <agent>
+relinkra connect verify <agent> --proof <proof-file>
+```
 
-## Optional external integrations
+`relinkra connect rollback <agent>` restores a supported backup. The
+`relinkra connect generic` route is available for generic configuration work.
+`devin-cloud` is unsupported.
 
-Both are third-party projects, installed and managed independently. Neither is bundled with Relinkra, and neither is required for the quick start. Direct CBM setup is optional advanced/local configuration, not part of the normal public installation path.
+## Project-local state
 
-- **Codebase Memory (CBM)** — code intelligence backend maintained by [DeusData](https://github.com/DeusData/codebase-memory-mcp) (MIT license). Certified with the real binary on Windows; on Linux/macOS it is NOT certified, and Relinkra keeps working without it. Manage its index with `relinkra cbm status/index/refresh` — see [CBM backend](docs/cbm-backend.md).
-- **Engram** — persistent memory backend maintained by Gentleman Programming (MIT license). External and optional; without it, memory and handoffs report as unavailable and commands still exit successfully.
+Relinkra state is intentionally local and should not be committed:
 
-## Current state
+- `.relinkra/` contains opaque project/workspace IDs, version data, and a
+  registry. The registry can contain machine-specific paths.
+- `.codebase-memory/` contains optional CBM binaries, caches, and indexes.
+- `*.relinkra-backup*` contains host-configuration safety backups.
 
-- Python 3.9 through 3.14 is covered by the repository's CI matrix, with zero runtime dependencies.
-- Windows is currently certified. Linux/macOS exact-SHA certification and hosted CI evidence are pending; runner quota/billing availability is infrastructure evidence, not a product defect.
-- The package is pure Python. Public release requires retained exact wheel and sdist E2E results for both CLI and MCP, supplied as the mandatory `INSTALLED_CLI_MCP` evidence; unsupported platforms are not certified.
-- CBM managed certification is Windows-focused; Linux/macOS remain an honest degraded path.
-- The ZCode connector is structurally validated, but runtime certification is pending; broader host certification remains visible as external PARTIAL debt. Devin Cloud is unsupported (roadmap).
-- The public release check requires local regression/package evidence plus exact-SHA external evidence:
+These paths are gitignored. `relinkra init` does not stage, commit, or modify
+Git history, and does not write agent configuration. Keep the generated state
+private to the workspace; do not add it to a pull request.
 
-  ```bash
-  RELEASE_SHA="$(git rev-parse HEAD)"
-  python tools/release_check.py --run-regression --run-packaging \
-    --evidence exact-release-head-evidence.json \
-    --require-sha "$RELEASE_SHA" --require public
-  ```
-  The evidence file must include the retained exact-artifact CLI/MCP results;
-  `release_check` does not collect installed E2E proof.
-- PyPI publication is not performed in this checkpoint; local validation uses built artifacts or a source checkout.
+## Optional backends
 
-## License
+### Codebase Memory (CBM)
 
-Relinkra is released under the [MIT License](LICENSE).
+CBM is an external, optional structural code-intelligence backend. The
+certified managed binary is Windows-amd64/Windows-focused. Linux and macOS
+have CI coverage but no certified CBM binary; Relinkra reports that limitation
+and continues without CBM.
+
+The lifecycle is:
+
+```bash
+relinkra cbm setup
+relinkra cbm status
+relinkra cbm index
+relinkra cbm refresh
+```
+
+`status` distinguishes missing, ready, stale, unavailable, unsupported, and
+unknown states. CBM remains behind Relinkra; agents should not install or
+register it directly.
+
+See [CBM backend](docs/cbm-backend.md) for certified acquisition, cache
+behavior, and limitations.
+
+### Engram
+
+Engram is an external, optional persisted-memory backend. Relinkra does not
+remove or restrict Engram capabilities, and direct Engram can coexist when
+another workflow requires it. For agent-neutral project memory and handoffs,
+the normal route should be Relinkra. If Engram is absent, Relinkra reports
+memory and handoffs as unavailable instead of pretending they are working.
+
+## Performance and scope
+
+Relinkra's value is meaningful in controlled, cross-module and context-heavy
+benchmarks where repeated repository orientation is expensive. There is no
+universal token-saving guarantee. Local or simple tasks can incur overhead
+from initialization, health checks, or optional backend inspection. The next
+validation step is Kiosuma dogfood.
+
+## Known 0.1.2 UX note
+
+The published 0.1.2 runtime does not expose a public `relinkra register`
+command. A stale doctor message may mention that text; ignore it. The public
+CBM route is `relinkra cbm index`. This is a non-blocking documentation/UX
+issue recorded for 0.1.3; 0.1.2 does not add a compatibility command.
+
+## Platform and release truth
+
+- Version **0.1.2** is the public PyPI release.
+- Windows is certified for the product. Linux and macOS have CI coverage, but
+  exact-SHA/product certification language remains limited to the evidence
+  available for each platform.
+- CBM managed certification is Windows-focused; Linux/macOS degrade honestly.
+- The connector hosts above are experimental; configuration support is not a
+  claim of real-host launch certification.
 
 ## Learn more
 
-- [Installation](docs/installation.md) — install, upgrade, and uninstall.
-- [Connectors](docs/connectors.md) — how agent hosts are connected.
-- [Product CLI](docs/cli.md) — the full command reference.
-- [Freshness, contradictions, and explainability](docs/freshness-explainability.md) — why context was shown and whether it is current.
-- [Release verification](docs/release.md) — CI, verification levels, and release gates (maintainer-facing).
-- [Contributing](CONTRIBUTING.md) — set up a development checkout and run the tests.
-- [Security](SECURITY.md) — supported versions and how to report a vulnerability.
+- [Installation](docs/installation.md) — public install and first run.
+- [Product CLI](docs/cli.md) — command behavior and exit codes.
+- [Connectors](docs/connectors.md) — host configuration details.
+- [CBM backend](docs/cbm-backend.md) — optional code-graph lifecycle.
+- [Freshness and explainability](docs/freshness-explainability.md) — how
+  Relinkra qualifies context and conflicts.
+- [Release verification](docs/release.md) — maintainer evidence and
+  certification boundaries.
+- [Contributing](CONTRIBUTING.md) — maintainer-only source setup.
+- [Security](SECURITY.md) — supported versions and vulnerability reporting.

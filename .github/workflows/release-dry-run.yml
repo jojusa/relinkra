@@ -35,9 +35,9 @@ jobs:
           python-version: "3.14"
       - name: Install the build frontend
         run: python -m pip install --upgrade build
-      # The dry run NEVER asserts --require public: LEGAL BLOCKED (no
-      # LICENSE) and CI PARTIAL (remote runs pending) are EXPECTED in the
-      # report today. release_check exits 0 when the report was computed,
+      # The dry run NEVER asserts --require public: LEGAL is PASS because the
+      # LICENSE exists, while CI PARTIAL (remote runs pending) may remain
+      # expected in the report. release_check exits 0 when the report was computed,
       # even with PARTIAL/BLOCKED gates. --run-regression runs the full
       # suite in-process; --run-packaging builds wheel+sdist into a temp
       # dir and enforces the artifact content contract.

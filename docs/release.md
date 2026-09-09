@@ -2,11 +2,11 @@
 
 How a maintainer verifies that a Relinkra release is releasable: what the CI
 workflows prove, what they do not, how the twelve release gates read
-evidence, and what remains open before a public release. This document
+evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.2 release policy.** Windows is currently certified. Linux/macOS
+> **Status: 0.1.2 public release.** Windows is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
 > defect. Public 0.1.2 policy carries those external results as visible
@@ -14,10 +14,11 @@ R5D.
 > never accepts `BLOCKED` or a missing deterministic product gate.
 >
 > Version identity is immutable: 0.1.1 was consumed as the TestPyPI-only
-> candidate (built from its own release commit), so 0.1.2 is the first
-> intended public PyPI release candidate. No product source changed between
-> them — only connector-test environment hardening and this version bump.
-> PyPI publication has not happened yet.
+> candidate (built from its own release commit), and 0.1.2 is the first public
+> PyPI release. The published 0.1.2 artifacts were built from release source
+> commit `8afd3245347dea9cda93176384421d33fdfd69b3`. The later documentation-
+> only closure is not the package-build source, and there is no republish or
+> rebuild of 0.1.2.
 >
 > The linked CI and packaging runs
 > ([CI run](https://github.com/jojusa/relinkra/actions/runs/31815886965),
@@ -29,23 +30,24 @@ R5D.
 
 ## Scope
 
-R5B delivers release *verification*: local test tooling, an artifact
-content contract, an evidence-driven gate model, and three GitHub
-workflows that run it all.
-
-R5B is **not** publication. This checkpoint does not publish the package to
-PyPI, create a GitHub Release, or push a git tag. The normal post-publication
-install command is `python -m pip install relinkra` (equivalent to
-`pip install relinkra`); local validation uses built artifacts or a source
-checkout. RC tagging remains governed by its stricter existing gates.
-Publication still requires all deterministic product/package/documentation/
-legal/security gates and a PASS from the mandatory installed-artifact gate,
-supplied through the external `installed` mapping;
-specified external certification debt may remain `PARTIAL`.
+R5B delivered release *verification*: local test tooling, an artifact content
+contract, an evidence-driven gate model, and three GitHub workflows. This
+document now records the public 0.1.2 evidence boundary; it is not a
+publication command and does not authorize a republish. The public install
+command is `pip install relinkra`; local validation uses retained artifacts or
+a maintainer source checkout. Specified external certification debt may remain
+`PARTIAL`, but deterministic product gates must not be missing or `BLOCKED`.
 
 ## Release artifact and provenance boundary
 
-Build and inspect the current release artifacts, then retain the exact
+The published 0.1.2 package artifacts are bound to the following release
+source commit:
+
+`8afd3245347dea9cda93176384421d33fdfd69b3`
+
+The later documentation-only closure commit is not the package-build source.
+Do not rebuild or republish 0.1.2 for this documentation closure. For a future
+release, maintainers build and inspect artifacts, then retain the exact
 release-HEAD report and its digests as external evidence:
 
 ```bash
@@ -368,8 +370,10 @@ RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.2.tar.gz \
 Without `RELINKRA_E2E_ARTIFACT`, the E2E suites build their own artifact
 (with network) inside their venv sandbox. With it, they install exactly
 the given wheel or sdist — which is how CI proves the shipped artifact,
-never a rebuild. Run both exact-artifact journeys before publication and
-retain their results in the external evidence mapping; they are the required
+never a rebuild. For a future release, run both exact-artifact journeys before
+publication; for 0.1.2, the published artifacts are already bound to the
+provenance above. Retain their results in the external evidence mapping; they
+are the required
 input for the `INSTALLED_CLI_MCP` gate, not a hidden PASS in the report.
 
 One environment prerequisite, verified while writing this document:
@@ -449,7 +453,7 @@ Pre-existing debt the tooling surfaces honestly rather than hiding:
   does not collect it; successful exact wheel and sdist E2E runs must be
   retained and supplied in the external `installed` mapping.
 
-Public-release blockers (must clear before publication):
+Public-release evidence requirements (for the published release and future releases):
 
 1. ~~**LICENSE absent**~~ — **resolved**: MIT LICENSE present; `LEGAL`
    gate PASS.
@@ -462,12 +466,11 @@ Public-release blockers (must clear before publication):
 
 Linux, macOS, hosted CI, broader CBM, and ZCode/host certification may remain
 visible as PARTIAL/pending debt for this public policy; they must not be
-reported as PASS, and any BLOCKED result still blocks publication.
+reported as PASS, and any BLOCKED result still blocks a public-release claim.
 
 ## External and infrastructure blockers
 
-Release-HEAD CI reruns, runner availability, artifact retention, and PyPI
-publication are external or infrastructure concerns. They are blockers to
+Release-HEAD CI reruns, runner availability, artifact retention, and future publication are external or infrastructure concerns. They are blockers to
 release evidence, not product defects by themselves. Product defects remain
 code, test, or gate failures and must be triaged separately. This evidence
 refresh does not reopen R5K.
@@ -491,4 +494,4 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Rehearse with the Release Candidate Dry Run workflow; its report must
       keep pending external debt visible rather than relabeling it PASS.
 - [ ] Version bumps only in a dedicated release commit; RC names are
-      `0.1.2rcN`; nothing in R5B/R5C/R5D tags or publishes.
+      `0.1.2rcN`; R5B/R5C/R5D did not perform tagging or publication.
