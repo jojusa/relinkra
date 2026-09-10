@@ -80,6 +80,7 @@ from .safe_write import (
     atomic_write_text,
     digest_bytes,
     digest_text,
+    EXPECTED_ABSENT,
     read_bounded_text,
     safe_replace,
 )
@@ -354,6 +355,8 @@ class ConnectorSafetyPreflight:
     actions: Tuple[str, ...] = ()
     readable: bool = False
     format_supported: bool = False
+    snapshot_exists: bool = False
+    snapshot_text: Optional[str] = None
     snapshot_digest: Optional[str] = None
 
     @property
@@ -897,6 +900,9 @@ def connector_safety_preflight(
     container_path = ()
     readable = False
     format_supported = False
+    snapshot_exists = False
+    snapshot_text: Optional[str] = None
+    snapshot_digest: Optional[str] = None
     legacy_warnings = legacy_scope_findings(spec, env)
     warnings = tuple(
         f"{warning.code}: {warning.message}" for warning in inspection.warnings
@@ -977,14 +983,15 @@ def connector_safety_preflight(
     )
     format_supported = True
 
-    # The inspection document is deliberately stale here. Read and parse the
-    # target again before scanning direct CBM, deciding ownership, or proving
-    # an idempotent registration. Those checks must all describe this one
-    # current document; a member-only reread after scanning the old document
-    # is not an authorization boundary.
-    if adapter is not None and location.exists:
+    # The inspection document and location flags are deliberately stale here.
+    # Establish one current target snapshot and use its exact text for every
+    # downstream decision, serialization input, and write precondition.
+    if adapter is not None and target.is_file():
         try:
-            document = adapter.parse(read_bounded_text(target))
+            snapshot_text = read_bounded_text(target)
+            document = adapter.parse(snapshot_text)
+            snapshot_exists = True
+            snapshot_digest = digest_text(snapshot_text)
         except (SafeWriteError, OSError, ValueError, MergeError) as exc:
             return refused(
                 "the current host configuration could not be read or parsed: "
@@ -993,7 +1000,6 @@ def connector_safety_preflight(
             )
     else:
         document = {}
-
     cbm_exposures = _direct_cbm_entries(
         document, container_path, spec.inherited_container_paths
     )
@@ -1082,7 +1088,26 @@ def connector_safety_preflight(
             ),
         )
 
-    snapshot_digest = None
+    # For a write, preserve the optimistic boundary established by the
+    # initial inspection as well as the complete current snapshot above.
+    # This must not gate a no-op: R5P.6 intentionally allows a benign,
+    # semantically valid edit to an existing no-op target. A write, however,
+    # must never merge against a target that appeared, disappeared, or
+    # changed after the inspected state was captured.
+    if decision.action != ACTION_NO_OP:
+        initially_exists = bool(location.exists)
+        if initially_exists != snapshot_exists:
+            return refused(
+                "configuration changed since it was inspected; re-run the plan",
+                ("Re-run 'relinkra connect plan' to review the new state, then apply again.",),
+            )
+        if initially_exists:
+            initial_text = inspection.raw_text if location is inspection.location else None
+            if initial_text is None or snapshot_digest != digest_text(initial_text):
+                return refused(
+                    "configuration changed since it was inspected; re-run the plan",
+                    ("Re-run 'relinkra connect plan' to review the new state, then apply again.",),
+                )
     if decision.action == ACTION_NO_OP:
         final_document, final_decision, final_refusal, final_digest = _final_no_op_snapshot(
             spec,
@@ -1122,6 +1147,8 @@ def connector_safety_preflight(
         no_op_verified=no_op_verified,
         readable=readable,
         format_supported=format_supported,
+        snapshot_exists=snapshot_exists,
+        snapshot_text=snapshot_text,
         snapshot_digest=snapshot_digest,
     )
 
@@ -1142,7 +1169,12 @@ def preferred_connector_target_path(
 
 
 def apply_connector(
-    spec: ConnectorSpec, launch: LaunchContract, env: DiscoveryEnvironment
+    spec: ConnectorSpec,
+    launch: LaunchContract,
+    env: DiscoveryEnvironment,
+    *,
+    inspection: Any = None,
+    plan: Any = None,
 ) -> ApplyResult:
     """Execute the connector's plan against its real configuration file.
 
@@ -1157,7 +1189,7 @@ def apply_connector(
         result.workspace_root = str(Path(str(env.workspace_root)).resolve())
 
     try:
-        return _apply_inner(spec, launch, env, result)
+        return _apply_inner(spec, launch, env, result, inspection=inspection, plan=plan)
     except Exception as exc:  # expected operator errors are handled inside
         result.error = _sanitize(str(exc))
         return result
@@ -1168,6 +1200,9 @@ def _apply_inner(
     launch: LaunchContract,
     env: DiscoveryEnvironment,
     result: ApplyResult,
+    *,
+    inspection: Any = None,
+    plan: Any = None,
 ) -> ApplyResult:
     if not spec.apply_available:
         return _refuse(
@@ -1193,7 +1228,9 @@ def _apply_inner(
             ("Run 'relinkra connect plan' and apply the change by hand.",),
         )
 
-    preflight = connector_safety_preflight(spec, launch, env)
+    preflight = connector_safety_preflight(
+        spec, launch, env, inspection=inspection, plan=plan
+    )
     inspection = preflight.inspection
     result.warnings += preflight.warnings
     result.discovered = inspection.discovery_status == DISCOVERY_DISCOVERED
@@ -1221,9 +1258,6 @@ def _apply_inner(
     is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
     decision = preflight.decision
 
-    raw_text = (
-        inspection.raw_text if location is inspection.location else None
-    )
     result.change_required = decision.changes_anything
 
     if decision.action == ACTION_NO_OP:
@@ -1256,16 +1290,8 @@ def _apply_inner(
     # line endings would turn a one-member addition into a whole-file
     # diff in their VCS — the exact outcome formatting preservation
     # exists to avoid.
-    byte_text = ""
-    if location.exists:
-        try:
-            byte_text = target.read_bytes().decode("utf-8", errors="replace")
-        except OSError as exc:
-            return _refuse(
-                result,
-                f"the host configuration could not be read: {_sanitize(str(exc))}",
-                ("Fix the file permissions, then re-run apply.",),
-            )
+    byte_text = preflight.snapshot_text if preflight.snapshot_exists else ""
+
     try:
         text = adapter.serialize_member(
             byte_text, document, container_path, MANAGED_SERVER_NAME, decision.member
@@ -1279,7 +1305,11 @@ def _apply_inner(
                 "'relinkra connect plan'. Nothing was changed.",
             ),
         )
-    expected_digest = digest_text(raw_text) if raw_text is not None else None
+    expected_digest = (
+        preflight.snapshot_digest
+        if preflight.snapshot_exists
+        else EXPECTED_ABSENT
+    )
 
     def _validate_written_registration(candidate: str) -> None:
         """Validate syntax and semantics while safe_replace still holds its lock.

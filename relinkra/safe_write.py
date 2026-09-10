@@ -40,7 +40,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 from .registry import interprocess_lock
 
@@ -78,6 +78,21 @@ class UnsafeTargetError(SafeWriteError):
 
 class PreconditionError(SafeWriteError):
     """Raised when the target changed since it was inspected."""
+
+
+class _ExpectedAbsent:
+    """Identity-only marker for an inspected target that did not exist."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "EXPECTED_ABSENT"
+
+
+# None intentionally remains the generic caller's no-precondition mode.
+# Connector apply uses this distinct value when its current snapshot proves
+# that the target was absent.
+EXPECTED_ABSENT = _ExpectedAbsent()
 
 
 class ContentValidationError(SafeWriteError):
@@ -354,7 +369,7 @@ def safe_replace(
     text: str,
     *,
     validator: Optional[Callable[[str], None]] = None,
-    expected_digest: Optional[str] = None,
+    expected_digest: Optional[Union[str, _ExpectedAbsent]] = None,
     backup: bool = True,
     before_replace_hook: Optional[Callable[[Path], None]] = None,
 ) -> WriteReceipt:
@@ -364,6 +379,10 @@ def safe_replace(
     plan is built from the file as it was READ, and the user may edit it
     in their editor while deciding. Writing the merged result then would
     silently discard their edit, so a changed digest aborts instead.
+
+    ``expected_digest=None`` intentionally disables this generic precondition.
+    The ``EXPECTED_ABSENT`` sentinel instead requires the target to remain
+    absent at both the initial and final write gates.
 
     On post-write validation failure the backup is restored and
     :class:`ContentValidationError` is raised with ``rolled_back=True``.
@@ -382,7 +401,15 @@ def safe_replace(
             original = read_bounded_text(target)
             digest_before = digest_text(original)
         original_identity = _target_identity(target) if existed else None
-        if expected_digest is not None and digest_before != expected_digest:
+        if expected_digest is EXPECTED_ABSENT and existed:
+            raise PreconditionError(
+                "configuration was created since it was inspected; re-run the plan"
+            )
+        if (
+            expected_digest is not None
+            and expected_digest is not EXPECTED_ABSENT
+            and digest_before != expected_digest
+        ):
             raise PreconditionError(
                 "configuration changed since it was inspected; re-run the plan"
             )
@@ -424,7 +451,16 @@ def safe_replace(
             if before_replace_hook is not None:
                 before_replace_hook(target)
             assert_writable_target(target)
-            if expected_digest is not None:
+            if expected_digest is EXPECTED_ABSENT:
+                if target.is_file():
+                    raise PreconditionError(
+                        "configuration was created immediately before replacement; re-run the plan"
+                    )
+            elif expected_digest is not None:
+                if not target.is_file():
+                    raise PreconditionError(
+                        "configuration was deleted immediately before replacement; re-run the plan"
+                    )
                 current_before_replace = read_bounded_text(target)
                 if digest_text(current_before_replace) != expected_digest:
                     raise PreconditionError(

@@ -25,6 +25,7 @@ from relinkra.safe_write import (
     NEW_FILE_MODE,
     ConfigTooLargeError,
     ContentValidationError,
+    EXPECTED_ABSENT,
     PreconditionError,
     SafeWriteError,
     UnsafeTargetError,
@@ -369,6 +370,82 @@ class SafeReplaceTests(TempCase):
         with self.assertRaises(PreconditionError):
             safe_replace(self.target, "{}", expected_digest=digest_text("{}"))
 
+    def test_expected_absent_rejects_a_file_created_at_the_initial_gate(self):
+        concurrent = b'{"concurrent": true}'
+        self.target.write_bytes(concurrent)
+        with self.assertRaises(PreconditionError):
+            safe_replace(self.target, "{}", expected_digest=EXPECTED_ABSENT)
+        self.assertEqual(self.target.read_bytes(), concurrent)
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_expected_absent_rejects_a_file_created_at_the_final_gate(self):
+        concurrent = b'{"concurrent": true}'
+
+        def create_target(target):
+            target.write_bytes(concurrent)
+
+        with self.assertRaises(PreconditionError):
+            safe_replace(
+                self.target,
+                "{}",
+                expected_digest=EXPECTED_ABSENT,
+                before_replace_hook=create_target,
+            )
+        self.assertEqual(self.target.read_bytes(), concurrent)
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_expected_digest_rejects_a_present_target_changed_at_the_final_gate(self):
+        original = b'{"original": true}'
+        concurrent = b'{"concurrent": true}'
+        self.target.write_bytes(original)
+
+        def change_target(target):
+            target.write_bytes(concurrent)
+
+        with self.assertRaises(PreconditionError):
+            safe_replace(
+                self.target,
+                "{}",
+                expected_digest=digest_text(original.decode("utf-8")),
+                before_replace_hook=change_target,
+            )
+        self.assertEqual(self.target.read_bytes(), concurrent)
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_expected_digest_rejects_a_present_target_deleted_at_the_final_gate(self):
+        original = '{"original": true}'
+        self.write(original)
+
+        def delete_target(target):
+            target.unlink()
+
+        with self.assertRaises(PreconditionError):
+            safe_replace(
+                self.target,
+                "{}",
+                expected_digest=digest_text(original),
+                before_replace_hook=delete_target,
+            )
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_expected_absent_permits_an_absent_target_to_be_created(self):
+        receipt = safe_replace(
+            self.target,
+            "{}",
+            expected_digest=EXPECTED_ABSENT,
+            validator=validate_json_text,
+        )
+        self.assertTrue(receipt.created)
+        self.assertFalse(receipt.backup_created)
+        self.assertEqual(self.target.read_text(encoding="utf-8"), "{}")
+
+    def test_none_remains_generic_no_precondition_behavior(self):
+        self.write('{"before": true}')
+        safe_replace(self.target, '{"after": true}', expected_digest=None)
+        self.assertEqual(
+            self.target.read_text(encoding="utf-8"), '{"after": true}'
+        )
     def test_oversized_existing_content_is_refused(self):
         self.write("x" * (MAX_CONFIG_BYTES + 16))
         with self.assertRaises(ConfigTooLargeError):

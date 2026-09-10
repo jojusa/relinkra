@@ -408,7 +408,9 @@ def cmd_connect(args) -> int:
             allow_paths=False,
         ) or EXIT_ACTION_REQUIRED
 
-    result = apply_connector(spec, launch, env)
+    result = apply_connector(
+        spec, launch, env, inspection=inspection, plan=plan
+    )
     payload = result.to_machine_dict() if getattr(args, "reveal_paths", False) else result.to_dict()
     payload["front_door"] = True
     code = _emit(

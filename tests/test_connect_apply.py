@@ -115,6 +115,7 @@ class ConnectApplyCase(unittest.TestCase):
             workspace_id=workspace.workspace_id,
         ).save(self.repo)
         self.workspace_id = workspace.workspace_id
+        self.installed = set()
 
         outer = self
 
@@ -124,7 +125,9 @@ class ConnectApplyCase(unittest.TestCase):
                 home=outer.home,
                 env={},
                 workspace_root=Path(workspace_root) if workspace_root else None,
-                which=lambda name: None,
+                which=lambda name: (
+                    "/usr/bin/" + name if name in outer.installed else None
+                ),
             )
 
         fixture = type(
@@ -744,6 +747,79 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
         self.assertFalse(payload["write_attempted"])
         self.assertEqual(path.read_text(encoding="utf-8"), external)
 
+
+    def test_missing_target_is_created_safely_for_every_apply_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex apply fixture needs tomllib")
+
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                self.installed.update(spec.executables)
+                env = self.env()
+                target = Path(str(spec.locations[0].build(env)))
+                self.assertFalse(target.exists())
+                code, payload, _ = self.run_json("apply", spec.connector_id)
+                self.assertEqual(code, EXIT_OK, payload)
+                self.assertTrue(payload["write_succeeded"], payload)
+                self.assertTrue(payload["validation_succeeded"], payload)
+                self.assertFalse(payload["backup_created"], payload)
+                self.assertTrue(target.is_file())
+
+    def test_missing_target_created_before_write_is_preserved_for_every_apply_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex apply fixture needs tomllib")
+
+        def concurrent_config(spec):
+            if spec is CODEX:
+                return (
+                    b'[mcp_servers.unrelated]\n'
+                    b'command = "other"\n'
+                    b'args = []\n'
+                )
+            if spec is OPENCODE:
+                return b'{"mcp":{"unrelated":{"type":"local","command":["other"]}}}\n'
+            if spec is ZCODE:
+                return b'{"mcp":{"servers":{"unrelated":{"command":"other","args":[]}}}}\n'
+            if spec is DEVIN_DESKTOP:
+                return b'{"mcpServers":{"unrelated":{"command":"other","args":[]}}}\n'
+            return json.dumps(
+                {
+                    "projects": {
+                        self.claude_key(): {
+                            "mcpServers": {
+                                "unrelated": {"command": "other", "args": []}
+                            }
+                        }
+                    }
+                }
+            ).encode("utf-8")
+
+        real_safe_replace = connector_apply.safe_replace
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                self.installed.update(spec.executables)
+                env = self.env()
+                target = Path(str(spec.locations[0].build(env)))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                concurrent = concurrent_config(spec)
+
+                def create_then_replace(path, text, *args, _bytes=concurrent, **kwargs):
+                    Path(path).write_bytes(_bytes)
+                    return real_safe_replace(path, text, *args, **kwargs)
+
+                with mock.patch.object(
+                    connector_apply, "safe_replace", side_effect=create_then_replace
+                ):
+                    code, payload, _ = self.run_json("apply", spec.connector_id)
+
+                self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+                self.assertIn("created", payload["refusal_reason"])
+                self.assertFalse(payload["write_attempted"], payload)
+                self.assertFalse(payload["write_succeeded"], payload)
+                self.assertEqual(target.read_bytes(), concurrent)
+                self.assertEqual(
+                    list(target.parent.glob(target.name + ".relinkra-backup*")), []
+                )
 
 class RollbackTests(ConnectApplyCase):
     def test_rollback_restores_the_exact_pre_apply_bytes(self):
