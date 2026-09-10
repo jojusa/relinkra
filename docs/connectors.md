@@ -4,19 +4,41 @@ Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
 Code, OpenCode, Codex, Devin Desktop (formerly Windsurf), or anything else that speaks MCP — to launch
 that server for this workspace.
 
-The user-facing shape is meant to stay this small:
+### Level A — 0.1.3 development front door (not yet published)
+
+The host-name forms below are development behavior for 0.1.3. They are not part
+of the published 0.1.2 CLI and do not claim that 0.1.3 has been published.
+
+```
+relinkra connect codex
+relinkra connect opencode
+relinkra connect claude
+relinkra connect devin-desktop
+relinkra connect zcode
+```
+
+### Level B — Published 0.1.2 advanced commands
+
+The current public release uses these exact advanced commands:
 
 ```
 relinkra connect list
 relinkra connect inspect claude
+relinkra connect check claude
 relinkra connect plan claude
 relinkra connect apply claude
-relinkra connect check claude
+relinkra connect rollback claude
+relinkra connect verify claude --proof <proof-file>
 relinkra connect routing
 relinkra connect generic
 ```
 
 Powerful inside, simple outside. Everything below is the "inside".
+
+The development front door inspects and plans first, no-ops when the
+registration already matches, asks before writing, and then reuses the
+existing backup, validation, rollback, restart, and verification flow. There
+is no `connect all`; use one host at a time.
 
 > **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), Devin
 > Desktop (R4C.1E), and ZCode (R5K.1) have gated write paths (`connect apply`
@@ -163,6 +185,15 @@ not invent one.
 
 Engram remains an independent optional path. Host binding does not require
 Engram, and these connector instructions do not configure a direct CBM server.
+
+### Generated state and Git hygiene
+
+ZCode owns `.zcode/config.json` and its generated `.zcode/config.json.lock`.
+Relinkra only detects and reports the lock; it never deletes it. Relinkra also
+does not silently edit `.gitignore`. Decide explicitly whether workspace-local
+host state belongs in Git before committing anything. Configuration presence
+is not host-launch proof; restart the host and use the existing `check` and
+`verify` commands.
 
 ---
 

@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from relinkra import connect_cli
@@ -680,6 +681,71 @@ class ReadOnlyTests(ConnectCLICase):
             self.run_cli(*argv)
             self.run_cli(*argv, "--json")
         self.assertEqual(self.snapshot(), before)
+
+
+class FrontDoorTests(ConnectCLICase):
+    def test_valid_registration_is_a_no_op_without_confirmation(self):
+        self.claude_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.registered_claude_entry()}}
+        )
+        code, payload, err = self.run_json("claude")
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertTrue(payload["front_door"])
+        self.assertTrue(payload["no_op"])
+        self.assertEqual(payload["operations"][0]["op"], "no_op")
+
+    def test_absent_registration_requires_confirmation_and_decline_writes_nothing(self):
+        self.claude_config({"mcpServers": {}})
+        before = self.snapshot()
+        with mock.patch("builtins.input", return_value="n"):
+            code, payload, _ = self.run_json("claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertEqual(payload["confirmation"], "declined")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_wrong_workspace_fails_closed(self):
+        outside = Path(self._temp.name) / "not-a-repository"
+        outside.mkdir()
+        code, _, err = self.run_cli("claude", path=outside)
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("git repository", err.lower())
+
+    def test_malformed_config_fails_closed_without_confirmation(self):
+        self.claude_config("{ broken")
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertEqual(payload["status"], "unavailable")
+        confirm.assert_not_called()
+
+    def test_confirmed_front_door_preserves_restart_guidance(self):
+        self.claude_config({"mcpServers": {}})
+        with mock.patch("builtins.input", return_value="yes"):
+            code, payload, _ = self.run_json("claude")
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(payload["host_restart_required"])
+        self.assertTrue(any("Restart" in action for action in payload["actions"]))
+
+    def test_zcode_generated_state_guidance_never_deletes_lock(self):
+        state = self.repo / ".zcode"
+        state.mkdir()
+        (state / "config.json").write_text("{}", encoding="utf-8")
+        lock = state / "config.json.lock"
+        lock.write_text("host-owned", encoding="utf-8")
+        before = self.snapshot()
+        code, payload, _ = self.run_json("inspect", "zcode")
+        self.assertEqual(code, EXIT_OK)
+        codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("zcode_lock_present", codes)
+        self.assertIn("zcode_workspace_state", codes)
+        self.assertTrue(lock.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_advanced_commands_remain_available(self):
+        self.claude_config({"mcpServers": {}})
+        code, payload, _ = self.run_json("inspect", "claude")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(payload["connector_id"], "claude")
 
 
 class ExitCodeContractTests(ConnectCLICase):

@@ -480,8 +480,8 @@ def evaluate_cbm_trust(
                 "CBM index",
                 STAGE_WARN,
                 "no CBM project identity is recorded for this workspace",
-                "Register the workspace-to-CBM mapping through 'relinkra "
-                "register' (relinkra.cli) after indexing.",
+                "Run 'relinkra cbm index' to register the workspace-to-CBM "
+                "mapping after indexing.",
             )
         )
         return stages
@@ -496,7 +496,8 @@ def evaluate_cbm_trust(
                 "CBM index",
                 STAGE_WARN,
                 "recorded CBM project identity is not a safe slug",
-                "Re-register the workspace with the CBM path-derived project slug.",
+                "Run 'relinkra cbm index' to refresh the workspace with the "
+                "CBM path-derived project slug.",
             )
         )
         return stages

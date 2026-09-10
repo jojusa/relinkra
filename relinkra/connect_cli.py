@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from .backend_detection import assess_workspace
@@ -167,6 +168,27 @@ def _launch_for(root, connector_id: Optional[str] = None) -> Any:
     return resolve_launch(root, registry_path(root) if root else None)
 
 
+def _add_generated_state_guidance(spec, root, inspection) -> None:
+    """Report ZCode generated-state ownership without changing Git/files."""
+    if spec.connector_id != "zcode" or root is None:
+        return
+    lock = Path(root) / ".zcode" / "config.json.lock"
+    if lock.exists():
+        inspection.warn(
+            "zcode_lock_present",
+            "ZCode's workspace-local config lock is present; it is host-owned "
+            "generated state. Relinkra will not delete it or edit .gitignore.",
+        )
+    config = Path(root) / ".zcode" / "config.json"
+    if config.exists():
+        inspection.warn(
+            "zcode_workspace_state",
+            "ZCode configuration is workspace-local generated state. Review "
+            "Git ownership/ignore policy yourself; Relinkra does not silently "
+            "edit .gitignore.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -180,6 +202,7 @@ def cmd_list(args) -> int:
     reports: List[ConnectorReport] = []
     for spec in CONNECTORS:
         inspection = inspect_connector(spec, env)
+        _add_generated_state_guidance(spec, root, inspection)
         # Planned here too, not only in `connect plan`: without it the
         # "registration planned" capability could never be true and the
         # column would be decorative. Planning is free — the config was
@@ -214,6 +237,7 @@ def cmd_inspect(args) -> int:
         _launch_for(root, spec.connector_id) if root is not None else None
     )
     inspection = inspect_connector(spec, env)
+    _add_generated_state_guidance(spec, root, inspection)
     plan = build_plan(spec, inspection, launch) if launch else None
     report = build_report(spec, inspection, launch, plan)
 
@@ -254,6 +278,7 @@ def cmd_plan(args) -> int:
 
     launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
+    _add_generated_state_guidance(spec, root, inspection)
     plan = build_plan(spec, inspection, launch)
 
     payload = plan.to_dict()
@@ -268,6 +293,89 @@ def cmd_plan(args) -> int:
     # A blocked or unavailable plan ran fine; it is the OUTCOME that
     # needs a person, which is exactly what exit 2 means here.
     return EXIT_ACTION_REQUIRED
+
+
+def cmd_connect(args) -> int:
+    """Safe normal-user front door for one host connector.
+
+    It reuses inspect -> plan -> apply.  A valid registration is an
+    immediate no-op; every write requires an explicit confirmation and the
+    existing apply engine remains responsible for backup, validation,
+    rollback, and restart guidance.
+    """
+    try:
+        spec = resolve_connector(args.frontdoor_agent)
+    except UnknownConnectorError as exc:
+        _fail(str(exc), "Run 'relinkra connect list' to see known connectors.")
+        return EXIT_ERROR
+
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect <agent>' from inside a git repository.",
+        )
+        return EXIT_ERROR
+
+    launch = _launch_for(root, spec.connector_id)
+    inspection = inspect_connector(spec, env)
+    _add_generated_state_guidance(spec, root, inspection)
+    plan = build_plan(spec, inspection, launch)
+    if plan.status != PLAN_READY:
+        payload = plan.to_dict()
+        payload["front_door"] = True
+        return _emit(
+            payload,
+            render_plan(plan),
+            as_json=args.json,
+            allow_paths=False,
+        ) or EXIT_ACTION_REQUIRED
+
+    if plan.idempotent:
+        payload = plan.to_dict()
+        payload["front_door"] = True
+        payload["no_op"] = True
+        return _emit(
+            payload,
+            render_plan(plan),
+            as_json=args.json,
+            allow_paths=False,
+        )
+
+    prompt = (
+        f"Relinkra will update the {spec.display_name} configuration after "
+        "the existing inspect/plan checks."
+    )
+    if args.json:
+        print(prompt, file=sys.stderr)
+    else:
+        print(prompt)
+    try:
+        answer = input("" if args.json else "Continue and write the configuration? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() not in {"y", "yes"}:
+        payload = plan.to_dict()
+        payload.update({"front_door": True, "confirmation": "declined"})
+        return _emit(
+            payload,
+            render_plan(plan) + "\nConfirmation declined; no file was changed.",
+            as_json=args.json,
+            allow_paths=False,
+        ) or EXIT_ACTION_REQUIRED
+
+    result = apply_connector(spec, launch, env)
+    payload = result.to_machine_dict() if getattr(args, "reveal_paths", False) else result.to_dict()
+    payload["front_door"] = True
+    code = _emit(
+        payload,
+        render_apply(result, reveal=bool(getattr(args, "reveal_paths", False))),
+        as_json=args.json,
+        allow_paths=bool(getattr(args, "reveal_paths", False)),
+    )
+    if code != EXIT_OK:
+        return code
+    return _write_exit_code(result)
 
 
 def _verification_section(root, host: str, fingerprint: str) -> dict:
@@ -341,6 +449,7 @@ def cmd_check(args) -> int:
 
     launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
+    _add_generated_state_guidance(spec, root, inspection)
     unreadable_scope_finding, shadow_hints = authoritative_scope_status(
         spec,
         env,
@@ -724,6 +833,28 @@ def register(subparsers) -> None:
                 help="path to the operator proof JSON produced by the real host",
             )
         command.set_defaults(func=handler)
+
+    # Normal-user front door.  These are deliberately separate nested
+    # commands so the established advanced command grammar is unchanged.
+    for agent in ("codex", "opencode", "claude", "devin-desktop", "zcode"):
+        command = nested.add_parser(
+            agent,
+            help=f"safely connect {agent} (inspect, plan, confirm, apply)",
+        )
+        command.add_argument(
+            "--path",
+            default=None,
+            help="workspace directory (defaults to the current directory)",
+        )
+        command.add_argument(
+            "--json", action="store_true", help="emit machine-readable JSON"
+        )
+        command.add_argument(
+            "--reveal-paths",
+            action="store_true",
+            help="include machine-local paths and environment values",
+        )
+        command.set_defaults(func=cmd_connect, frontdoor_agent=agent)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

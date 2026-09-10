@@ -1067,6 +1067,44 @@ class PortableOutputTests(MCPTestCase):
         self.assertNotIn("sk-live-0123456789abcdefghij", json.dumps(payload))
 
 
+class RegisteredRevisionTests(MCPTestCase):
+    """Registered Git metadata and live Git are distinct MCP facts."""
+
+    workspace_root = "."
+
+    def _make_old(self):
+        self.env.workspace.git["head_sha"] = "b" * 40
+        self.services.git_service = HistoricalRelationGitService()
+
+    def test_project_resolve_reports_registered_old_current_new(self):
+        self._make_old()
+        payload = self.ok("project_resolve")
+        self.assertEqual(payload["registered_head_sha"], "b" * 40)
+        self.assertEqual(payload["current_revision"], "a" * 40)
+        self.assertEqual(payload["relation"], "ancestor")
+        self.assertEqual(payload["revision_distance"], 4)
+        self.assertEqual(payload["freshness"]["state"], "stale")
+        self.assertEqual(
+            payload["workspace"]["head_sha_semantics"], "registered_snapshot"
+        )
+        self.assertEqual(payload["workspace"]["head_sha"], "b" * 40)
+
+    def test_context_packet_carries_the_same_revision_snapshot(self):
+        self._make_old()
+        payload = self.ok("context_get", include_git=True)
+        workspace = payload["packet"]["project_facts"]["workspace"]
+        self.assertEqual(workspace["registered_head_sha"], "b" * 40)
+        self.assertEqual(workspace["current_revision"], "a" * 40)
+        self.assertEqual(workspace["freshness"]["state"], "stale")
+
+    def test_project_resolve_degrades_when_live_git_fails(self):
+        self.services.git_service = ExplodingGitService()
+        payload = self.ok("project_resolve")
+        self.assertIsNone(payload["current_revision"])
+        self.assertEqual(payload["freshness"]["state"], "unknown")
+        self.assertIn("current_revision_unavailable", payload["warnings"][0]["code"])
+
+
 class GitReadOnlyTests(MCPTestCase):
     workspace_root = "."
 

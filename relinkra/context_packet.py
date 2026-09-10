@@ -410,7 +410,9 @@ class ContextPacket:
             if ws.get("branch"):
                 bits.append(f"branch={ws['branch']}")
             if ws.get("head_sha"):
-                bits.append(f"head={ws['head_sha']}")
+                bits.append(f"registered_head={ws['head_sha']}")
+            if ws.get("current_revision"):
+                bits.append(f"current_revision={ws['current_revision']}")
             lines.append("- " + " ".join(bits))
         other = [
             item

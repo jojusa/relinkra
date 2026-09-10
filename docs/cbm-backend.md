@@ -81,13 +81,11 @@ database and its `-wal`/`-shm` companions.
 machine-readable result. `--mode fast` selects the supported fast lifecycle
 mode for `index` and `refresh`.
 
-## 0.1.2 stale doctor wording
+## Registration remediation
 
-The published 0.1.2 `doctor` output can still mention `relinkra register`.
-That wording is stale and should be ignored: the public product does not expose
-that command. Use `relinkra cbm index`, which owns workspace registration.
-This is a non-blocking 0.1.3 UX issue. This documentation does not add a
-runtime compatibility command.
+The supported registration route is `relinkra cbm index`. Relinkra 0.1.3
+doctor guidance uses this command directly; no `relinkra register` command is
+added or required.
 
 ## Certified release and platform boundary
 

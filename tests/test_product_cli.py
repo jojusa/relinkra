@@ -32,6 +32,7 @@ from relinkra.product_cli import (
     PASS,
     WARN,
     WorkspaceConfig,
+    check_registered_revision,
 )
 
 _HAS_GIT = shutil.which("git") is not None
@@ -558,6 +559,20 @@ class StatusTests(CLITestCase):
 
 
 class DoctorTests(CLITestCase):
+    def test_registered_revision_drift_is_a_warning_not_a_failure(self):
+        check = check_registered_revision(
+            {
+                "freshness": {"state": "stale"},
+                "registered_head_sha": "a" * 40,
+                "current_revision": "b" * 40,
+            }
+        )
+        self.assertIsNotNone(check)
+        self.assertEqual(check.status, WARN)
+        self.assertIn("differs from the current repository revision", check.detail)
+        self.assertIn("relinkra cbm index", check.action)
+        self.assertNotIn("relinkra register", check.action)
+
     def test_doctor_all_green_exits_zero(self):
         self.cbm = True
         self.init()

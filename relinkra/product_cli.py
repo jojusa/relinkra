@@ -1098,6 +1098,41 @@ def _git_facts(root: Path) -> dict:
     return facts
 
 
+def check_registered_revision(project: Optional[dict]) -> Optional[Check]:
+    """Report registry-vs-live revision drift without failing doctor."""
+    if not project:
+        return None
+    # Keep test doubles and older service implementations compatible: this
+    # diagnostic only applies when project resolution supplies the additive
+    # freshness contract.
+    if "freshness" not in project:
+        return None
+    freshness = project.get("freshness") or {}
+    state = freshness.get("state")
+    if state == "fresh":
+        return Check(
+            "Registered revision",
+            PASS,
+            "registered workspace snapshot matches current Git revision",
+        )
+    if state == "unknown":
+        return Check(
+            "Registered revision",
+            WARN,
+            "current Git revision is unavailable; integrated/control-plane "
+            "trust is degraded",
+            "Restore Git access and run 'relinkra doctor' again.",
+        )
+    return Check(
+        "Registered revision",
+        WARN,
+        "registered snapshot differs from the current repository revision; "
+        "integrated/control-plane trust is degraded",
+        "Run 'relinkra cbm index' to refresh the workspace registration, then "
+        "run 'relinkra doctor' again.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -1443,6 +1478,9 @@ def cmd_doctor(args) -> int:
     if resolved.root is not None:
         checks.append(check_config(resolved.root, resolved.config))
         checks.append(check_registry(resolved.root))
+        revision_check = check_registered_revision(resolved.project)
+        if revision_check is not None:
+            checks.append(revision_check)
         if resolved.error:
             checks.append(
                 Check(
@@ -1507,6 +1545,18 @@ def cmd_doctor(args) -> int:
         "contract_version": CONTRACT_VERSION,
         "checks": [check.to_dict() for check in checks],
     }
+    if resolved.project:
+        payload["revision"] = {
+            key: resolved.project.get(key)
+            for key in (
+                "registered_head_sha",
+                "current_revision",
+                "revision_source",
+                "freshness",
+                "relation",
+                "revision_distance",
+            )
+        }
 
     # The compatibility and routing section. Built from the same
     # assessment 'connect routing' renders, so the two commands cannot
@@ -1629,6 +1679,13 @@ def cmd_project(args) -> int:
         "os_family": workspace_facts.get("os_family"),
         "branch": git_facts.get("branch"),
         "head_sha": git_facts.get("head_sha"),
+        "registered_head_sha": (resolved.project or {}).get("registered_head_sha"),
+        "head_sha_semantics": "current_revision",
+        "current_revision": (resolved.project or {}).get("current_revision"),
+        "revision_source": (resolved.project or {}).get("revision_source"),
+        "freshness": (resolved.project or {}).get("freshness"),
+        "relation": (resolved.project or {}).get("relation"),
+        "revision_distance": (resolved.project or {}).get("revision_distance"),
         "detached": git_facts.get("detached"),
     }
 
@@ -1647,7 +1704,8 @@ def cmd_project(args) -> int:
             )
         )
     rows.append(("Branch", payload["branch"] or "(detached)"))
-    rows.append(("HEAD", payload["head_sha"] or "(unknown)"))
+    rows.append(("Registered HEAD", payload["registered_head_sha"] or "(unknown)"))
+    rows.append(("Current revision", payload["current_revision"] or "(unknown)"))
     if payload["detached"]:
         rows.append(("Detached", "yes"))
     lines = ["", *_aligned(rows), ""]

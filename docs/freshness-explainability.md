@@ -4,6 +4,17 @@ Relinkra explains **why evidence was shown and what supports its currency**.
 It does not certify that a fact is true, silently discard old evidence, or
 prevent an agent from inspecting, searching, or verifying the source.
 
+## Registered versus current workspace revision
+
+Workspace registration stores a snapshot. `workspace.head_sha` is retained
+for compatibility but explicitly means that registered snapshot; it is not
+live HEAD. Surfaces also expose `registered_head_sha`, `current_revision`,
+`revision_source`, `freshness`, `relation`, and `revision_distance`. The
+current value comes from a request-time read of Git. If that read fails,
+`current_revision` is `null` and freshness is `unknown` with a degraded-state
+warning. A mismatch is advisory and does not invalidate an otherwise valid
+Git/project/workspace/CBM workspace.
+
 ## Quick answers
 
 ### Why did Relinkra show me this?

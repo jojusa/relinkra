@@ -72,6 +72,7 @@ from .git_intelligence import (
     GitIntelligenceService,
 )
 from .explainability import annotate_packet
+from .freshness import assess_revision_snapshot
 from .memory import (
     STORE_PAGE_LIMIT,
     MemoryError,
@@ -271,7 +272,6 @@ class ContextBuilder:
         repository_identity = (
             project.repository_identity.to_dict() if project is not None else None
         )
-        project_facts = self._project_facts(project, workspace)
         local_diagnostics = self._local_diagnostics(workspace)
         if local_diagnostics:
             diagnostics["local"] = local_diagnostics
@@ -303,7 +303,7 @@ class ContextBuilder:
         )
 
         try:
-            git_items = self._collect_git_facts(
+            git_items, revision_snapshot = self._collect_git_facts(
                 request, mode, focus, project_id, workspace_id,
                 warnings, omitted, diagnostics,
             )
@@ -318,6 +318,13 @@ class ContextBuilder:
                 )
             )
             git_items = []
+            revision_snapshot = assess_revision_snapshot(
+                (workspace.git or {}).get("head_sha") if workspace else None,
+                None,
+                as_of=self._clock(),
+            )
+
+        project_facts = self._project_facts(project, workspace, revision_snapshot)
 
         matched_tokens = self._task_token_map(mode, task, candidates)
         ordered = _priority_sort(candidates)
@@ -501,7 +508,7 @@ class ContextBuilder:
         return project, workspace
 
     @staticmethod
-    def _project_facts(project, workspace) -> dict:
+    def _project_facts(project, workspace, revision_snapshot=None) -> dict:
         facts: dict[str, Any] = {
             "registered": project is not None,
         }
@@ -516,8 +523,11 @@ class ContextBuilder:
                 "os": workspace.os,
                 "branch": git.get("branch") or None,
                 "head_sha": git.get("head_sha") or None,
+                "head_sha_semantics": "registered_snapshot",
                 "cbm_project_name": cbm.get("project_name") or None,
             }
+            if revision_snapshot is not None:
+                facts["workspace"].update(revision_snapshot.to_dict())
             cache_dir = cbm.get("cache_dir") or None
             if cache_dir is not None and not _is_absolute_infra_path(cache_dir):
                 # Portable only when repo/machine-relative; absolute infra
@@ -541,7 +551,7 @@ class ContextBuilder:
     def _collect_git_facts(
         self, request, mode, focus, project_id, workspace_id,
         warnings, omitted, diagnostics,
-    ) -> List[PacketItem]:
+    ) -> tuple[List[PacketItem], Any]:
         """Collect opt-in git facts as typed PacketItems (source="git").
 
         Mode mapping (design §2): every mode gets repository_state +
@@ -554,10 +564,18 @@ class ContextBuilder:
         ONLY under diagnostics["local"] (machine-local channel).
         """
         if not request.include_git:
-            return []
+            registered = None
+            if self.registry is not None:
+                workspace = self.registry.get_workspace(workspace_id) if workspace_id else None
+                registered = (workspace.git or {}).get("head_sha") if workspace else None
+            return [], assess_revision_snapshot(
+                registered, None, as_of=self._clock()
+            )
         if not self.workspace_root:
             # No resolvable workspace root: git is silently skipped.
-            return []
+            return [], assess_revision_snapshot(
+                None, None, as_of=self._clock()
+            )
         g = self.guardrails
         root = self.workspace_root
         caps, cap_warnings = self.git.collect_capabilities(root)
@@ -567,7 +585,9 @@ class ContextBuilder:
             local = diagnostics.setdefault("local", {})
             local["git_repository_root"] = caps.repository_root
         if not (caps.git_available and caps.repository_detected):
-            return []
+            return [], assess_revision_snapshot(
+                None, None, as_of=self._clock()
+            )
 
         items: List[PacketItem] = []
 
@@ -601,12 +621,29 @@ class ContextBuilder:
                 state.to_dict(),
                 f"git repository state (mode={mode})",
             )
+        registered = None
+        if self.registry is not None and workspace_id:
+            registered_workspace = self.registry.get_workspace(workspace_id)
+            if registered_workspace is not None:
+                registered = (registered_workspace.git or {}).get("head_sha")
+        relation_resolver = None
+        if hasattr(self.git, "collect_revision_relation"):
+            relation_resolver = lambda evidence, current: self.git.collect_revision_relation(
+                root, evidence, current
+            )
+        revision_snapshot = assess_revision_snapshot(
+            registered,
+            state.head_sha if state is not None else None,
+            as_of=self._clock(),
+            relation_resolver=relation_resolver,
+            dirty=(not state.clean) if state is not None else None,
+        )
         head, head_warnings = self.git.collect_head_facts(root, state=state)
         extend_warnings(head_warnings)
         if head is not None:
             add("head_facts", head.to_dict(), f"git HEAD facts (mode={mode})")
         if mode == "project":
-            return self._cap_git_facts(items, omitted)
+            return self._cap_git_facts(items, omitted), revision_snapshot
 
         tree, tree_warnings = self.git.collect_working_tree(root)
         extend_warnings(tree_warnings)
@@ -661,7 +698,7 @@ class ContextBuilder:
         elif mode == "task" and (request.file or "").strip():
             anchor = normalize_repo_path(request.file)
         if anchor is None:
-            return self._cap_git_facts(items, omitted)
+            return self._cap_git_facts(items, omitted), revision_snapshot
         anchor_ref_id = CodeReference(
             project_id=project_id,
             workspace_id=workspace_id,
@@ -720,7 +757,7 @@ class ContextBuilder:
                 f"git co-changed path for the focused file (mode={mode})",
                 anchor_ref_id,
             )
-        return self._cap_git_facts(items, omitted)
+        return self._cap_git_facts(items, omitted), revision_snapshot
 
     def _cap_git_facts(self, items, omitted) -> List[PacketItem]:
         """Total git-fact guardrail: deterministic priority-first

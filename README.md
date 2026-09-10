@@ -39,23 +39,44 @@ relinkra status
 `.relinkra/config.json` and `.relinkra/registry.json`, then reuses that local
 identity on later commands.
 
-### 3. Connect an agent
+### Level A — Quick Start: connect one agent (0.1.3 development behavior)
 
 Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
 `devin-desktop`:
 
 ```bash
 relinkra doctor
+relinkra connect codex
+```
+
+The normal front door performs inspection and planning, asks for confirmation
+before a write, and then uses the existing backup, validation, rollback, and
+restart guidance. If the registration is already valid for the workspace it
+is a verified no-op. Configuration presence is never proof that the host
+launched Relinkra.
+
+Supported front-door targets are `codex`, `opencode`, `claude`,
+`devin-desktop`, and `zcode`. There is intentionally no `relinkra connect all`.
+This front door is 0.1.3 development behavior and is not yet published; the
+current public 0.1.2 release does not expose it. Use Level B below with 0.1.2.
+
+### Level B — Safe Advanced Connector Workflow (published 0.1.2)
+
+Use these published 0.1.2 advanced commands when you need to inspect or control
+one stage:
+
+```bash
 relinkra connect list
 relinkra connect inspect <agent>
 relinkra connect check <agent>
-relinkra connect plan <agent>
+relinkra connect plan <agent> --dry-run
 relinkra connect apply <agent>
+relinkra connect rollback <agent>
+relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`check` is read-only, `plan` previews changes, and `apply` writes the host
-configuration with a backup where supported. Restart or reload the host after
-`apply`.
+`inspect`, `check`, and `plan` are read-only. `apply` writes only after the
+existing safety gates; restart the host, then run `check` and `verify`.
 
 ### 4. Build the optional code graph
 
@@ -125,6 +146,22 @@ relinkra connect verify <agent> --proof <proof-file>
 `relinkra connect generic` route is available for generic configuration work.
 `devin-cloud` is unsupported.
 
+## Revision and generated-state hygiene
+
+Relinkra keeps the registered workspace snapshot separate from live Git. In
+MCP and context packet output, legacy `workspace.head_sha` means the
+registered snapshot; use `registered_head_sha` for that value and
+`current_revision` for the live checkout. `freshness`, `relation`, and
+`revision_distance` explain whether they agree. If Git cannot be read, the
+state is explicitly unknown/degraded.
+
+`.zcode/config.json` is workspace-local host configuration. A
+`.zcode/config.json.lock` is ZCode-owned generated state: Relinkra detects and
+reports it but never deletes it. Relinkra does not silently edit `.gitignore`;
+review Git ownership/ignore policy explicitly before committing workspace
+state. `.relinkra/`, `.codebase-memory/`, and `*.relinkra-backup*` remain local
+state. Engram remains an independent optional coexistence path.
+
 ## Project-local state
 
 Relinkra state is intentionally local and should not be committed:
@@ -177,14 +214,14 @@ Relinkra's value is meaningful in controlled, cross-module and context-heavy
 benchmarks where repeated repository orientation is expensive. There is no
 universal token-saving guarantee. Local or simple tasks can incur overhead
 from initialization, health checks, or optional backend inspection. The next
-validation step is Kiosuma dogfood.
+validation step is Kisouma dogfood.
 
-## Known 0.1.2 UX note
+## Relinkra 0.1.3 development behavior
 
-The published 0.1.2 runtime does not expose a public `relinkra register`
-command. A stale doctor message may mention that text; ignore it. The public
-CBM route is `relinkra cbm index`. This is a non-blocking documentation/UX
-issue recorded for 0.1.3; 0.1.2 does not add a compatibility command.
+The 0.1.3 changes described here are development behavior and are not a claim
+that 0.1.3 has been published. The CBM lifecycle is `relinkra cbm setup`,
+`relinkra cbm index`, `relinkra cbm status`, and `relinkra cbm refresh`; stale
+registration guidance uses the real route `relinkra cbm index`.
 
 ## Platform and release truth
 

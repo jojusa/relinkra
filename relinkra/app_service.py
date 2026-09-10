@@ -56,6 +56,8 @@ from .freshness import (
     FreshnessContext,
     RevisionRelation,
     RevisionRelationState,
+    RevisionSnapshot,
+    assess_revision_snapshot,
 )
 from .engram_adapter import EngramCLIAdapter
 from .git_intelligence import (
@@ -313,6 +315,17 @@ class RelinkraServices:
                     )
         return context, resolver
 
+    def _revision_snapshot(self, registered_revision: Any) -> RevisionSnapshot:
+        """Read live Git once and compare it with registered metadata."""
+        context, resolver = self._freshness_context("")
+        return assess_revision_snapshot(
+            registered_revision,
+            context.current_revision,
+            as_of=context.as_of,
+            relation_resolver=resolver,
+            dirty=context.dirty,
+        )
+
     def _resolve_project_id(self, project_id: Optional[str]) -> str:
         """Resolve project identity for one tool call.
 
@@ -544,6 +557,16 @@ class RelinkraServices:
                 "Git root is not registered; initialize this workspace first",
             )
 
+        registered_revision = None
+        if workspace is not None:
+            registered_revision = (workspace.git or {}).get("head_sha")
+        revision = self._revision_snapshot(registered_revision)
+        revision_warning_objects = [
+            ServiceWarning(code, revision.freshness.explanation)
+            for code in revision.warnings
+        ]
+        warnings.extend(revision_warning_objects)
+
         payload = {
             "project_id": project.project_id,
             "display_name": project.display_name,
@@ -552,6 +575,14 @@ class RelinkraServices:
             "resolved_from": "registry" if wanted else "discovery",
             "warnings": [w.to_dict() for w in warnings],
         }
+        payload.update(
+            {
+                key: value
+                for key, value in revision.to_dict().items()
+                if key != "warnings"
+            }
+        )
+        payload["warnings"] = [w.to_dict() for w in warnings]
         if workspace is not None:
             git_info = dict(workspace.git or {})
             # Field-by-field on purpose: Workspace also carries
@@ -563,6 +594,8 @@ class RelinkraServices:
                 "branch": git_info.get("branch"),
                 "head_sha": git_info.get("head_sha"),
             }
+            payload["workspace"].update(revision.to_dict())
+            payload["workspace"]["head_sha_semantics"] = "registered_snapshot"
         return payload
 
     def _discover_identity(self):

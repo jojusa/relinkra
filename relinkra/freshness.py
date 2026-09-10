@@ -64,6 +64,35 @@ class FreshnessContext:
 
 
 @dataclass(frozen=True)
+class RevisionSnapshot:
+    """Registered-vs-current revision facts for one read surface.
+
+    ``registered_revision`` is persisted metadata; ``current_revision`` is
+    read from the live checkout.  Keeping both in one value prevents callers
+    from accidentally presenting a registration snapshot as current HEAD.
+    """
+
+    registered_revision: Optional[str]
+    current_revision: Optional[str]
+    revision_source: str
+    freshness: FreshnessResult
+    relation: Optional[str]
+    revision_distance: Optional[int]
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "registered_head_sha": self.registered_revision,
+            "current_revision": self.current_revision,
+            "revision_source": self.revision_source,
+            "freshness": self.freshness.to_dict(),
+            "relation": self.relation,
+            "revision_distance": self.revision_distance,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True)
 class FreshnessResult:
     state: FreshnessState
     reason_code: str
@@ -93,6 +122,82 @@ class FreshnessResult:
             "trust_limitations": list(self.trust_limitations),
             "recommended_action": self.recommended_action,
         }
+
+
+def assess_revision_snapshot(
+    registered_revision: Any,
+    current_revision: Any,
+    *,
+    as_of: str,
+    relation_resolver: Optional[RelationResolver] = None,
+    dirty: Optional[bool] = None,
+) -> RevisionSnapshot:
+    """Evaluate persisted registration metadata against live Git.
+
+    This is intentionally narrower than evidence freshness: it describes
+    the workspace registration itself and is reused by project resolution,
+    context packets, and diagnostics.  Missing live Git is explicit
+    uncertainty, never a stale/fresh guess.
+    """
+    registered = normalize_git_revision(registered_revision)
+    current = normalize_git_revision(current_revision)
+    context = FreshnessContext(
+        as_of=as_of,
+        current_revision=current,
+        dirty=dirty,
+    )
+    warnings: tuple[str, ...] = ()
+    if current is None:
+        freshness = _result(
+            FreshnessState.UNKNOWN,
+            "current_revision_unavailable",
+            "The current repository revision could not be read from Git.",
+            context=context,
+            source_revision=registered,
+            limitations=("registered snapshot cannot be compared with live Git",),
+            action="Restore Git access and run the check again.",
+        )
+        warnings = ("current_revision_unavailable",)
+        return RevisionSnapshot(
+            registered, None, "registry", freshness, None, None, warnings
+        )
+    if registered is None:
+        freshness = _result(
+            FreshnessState.UNKNOWN,
+            "registered_revision_missing",
+            "The workspace has no valid registered Git revision snapshot.",
+            context=context,
+            limitations=("registration currency cannot be established",),
+            action="Run the existing workspace registration workflow.",
+        )
+        warnings = ("registered_revision_missing",)
+        return RevisionSnapshot(
+            None, current, "registry", freshness, None, None, warnings
+        )
+
+    # Keep the registered workspace comparison on the same authoritative
+    # revision primitive used by the rest of the freshness model.  In
+    # particular, this preserves bounded ancestor distance and explicit
+    # UNKNOWN results when Git cannot relate two revisions.
+    freshness = _revision_result(
+        evidence_type="registered_workspace",
+        source_revision=registered,
+        observed_at=None,
+        context=context,
+        resolver=relation_resolver,
+        current_git_fact=True,
+    )
+    if freshness.state != FreshnessState.FRESH:
+        warnings = ("registered_revision_differs",)
+    return RevisionSnapshot(
+        registered,
+        current,
+        "registry",
+        freshness,
+        freshness.relation,
+        freshness.revision_distance,
+        warnings,
+    )
 
 
 RelationResolver = Callable[[str, str], RevisionRelation]
