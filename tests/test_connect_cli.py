@@ -1008,6 +1008,63 @@ class FrontDoorTests(ConnectCLICase):
         self.assertEqual(payload["connector_id"], "claude")
 
 
+    def test_front_door_conditional_create_refuses_target_created_at_commit_for_every_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex front-door fixture needs tomllib")
+
+        def concurrent_config(spec):
+            if spec is CODEX:
+                return b'[mcp_servers.unrelated]\ncommand = "other"\nargs = []\n'
+            if spec is OPENCODE:
+                return b'{"mcp":{"unrelated":{"type":"local","command":["other"]}}}\n'
+            if spec is ZCODE:
+                return b'{"mcp":{"servers":{"unrelated":{"command":"other","args":[]}}}}\n'
+            if spec is DEVIN_DESKTOP:
+                return b'{"mcpServers":{"unrelated":{"command":"other","args":[]}}}\n'
+            return json.dumps(
+                {"projects": {claude_project_key(self.repo.resolve()): {
+                    "mcpServers": {"unrelated": {"command": "other", "args": []}}
+                }}}
+            ).encode("utf-8")
+
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                self.installed.update(spec.executables)
+                env = DiscoveryEnvironment(
+                    system=SYSTEM_WINDOWS if os.name == "nt" else SYSTEM_LINUX,
+                    home=self.home,
+                    env={},
+                    workspace_root=self.repo.resolve(),
+                    which=lambda name: None,
+                )
+                target = Path(str(spec.locations[0].build(env)))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                concurrent = concurrent_config(spec)
+
+                real_safe_replace = __import__(
+                    "relinkra.connector_apply", fromlist=["safe_replace"]
+                ).safe_replace
+
+                def replace_then_create(path_arg, text, *args, _bytes=concurrent, **kwargs):
+                    def create_at_commit(_target):
+                        Path(path_arg).write_bytes(_bytes)
+                    kwargs["after_terminal_gate_hook"] = create_at_commit
+                    return real_safe_replace(path_arg, text, *args, **kwargs)
+
+                with mock.patch(
+                    "relinkra.connector_apply.safe_replace",
+                    side_effect=replace_then_create,
+                ), mock.patch("builtins.input", return_value="y"):
+                    code, payload, _ = self.run_json(spec.connector_id)
+
+                self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+                self.assertTrue(payload["front_door"], payload)
+                self.assertFalse(payload["write_succeeded"], payload)
+                self.assertIn("created", payload["refusal_reason"])
+                self.assertEqual(target.read_bytes(), concurrent)
+                self.assertEqual(
+                    list(target.parent.glob(target.name + ".relinkra-backup*")), []
+                )
     def test_confirmed_front_door_refuses_absent_target_created_before_write_for_every_host(self):
         if not toml_parser_available():
             self.skipTest("Codex front-door fixture needs tomllib")

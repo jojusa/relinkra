@@ -727,6 +727,38 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
         self.assertFalse(payload["write_attempted"])
         self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
 
+    def test_late_authority_race_is_rolled_back_without_false_success(self):
+        path = self.claude_config({"mcpServers": {}})
+        before = path.read_bytes()
+        scope = self.repo / ".mcp.json"
+        real_safe_replace = connector_apply.safe_replace
+
+        def replace_then_add_authority(path_arg, text, *args, **kwargs):
+            def add_authority(_target):
+                scope.write_text(
+                    json.dumps(
+                        {"mcpServers": {"memory-helper": {
+                            "command": "codebase-memory-mcp"
+                        }}}
+                    ),
+                    encoding="utf-8",
+                )
+            kwargs["after_terminal_gate_hook"] = add_authority
+            return real_safe_replace(path_arg, text, *args, **kwargs)
+
+        with mock.patch.object(
+            connector_apply, "safe_replace", side_effect=replace_then_add_authority
+        ):
+            code, payload, _ = self.run_json("apply", "claude")
+        self.assertEqual(code, EXIT_ERROR, payload)
+        self.assertIn("authoritative configuration changed concurrently", payload["error"])
+        self.assertFalse(payload["write_succeeded"])
+        self.assertTrue(payload["rollback_succeeded"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(
+            json.loads(scope.read_text(encoding="utf-8"))["mcpServers"]["memory-helper"]["command"],
+            "codebase-memory-mcp",
+        )
     def test_a_concurrent_edit_aborts_the_write(self):
         path = self.claude_config({"mcpServers": {}})
         external = json.dumps({"mcpServers": {}, "external_edit": True}, indent=2)
@@ -809,6 +841,54 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
 
                 with mock.patch.object(
                     connector_apply, "safe_replace", side_effect=create_then_replace
+                ):
+                    code, payload, _ = self.run_json("apply", spec.connector_id)
+
+                self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+                self.assertIn("created", payload["refusal_reason"])
+                self.assertFalse(payload["write_attempted"], payload)
+                self.assertFalse(payload["write_succeeded"], payload)
+                self.assertEqual(target.read_bytes(), concurrent)
+                self.assertEqual(
+                    list(target.parent.glob(target.name + ".relinkra-backup*")), []
+                )
+
+    def test_missing_target_created_at_terminal_commit_is_preserved_for_every_apply_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex apply fixture needs tomllib")
+
+        def concurrent_config(spec):
+            if spec is CODEX:
+                return b'[mcp_servers.unrelated]\ncommand = "other"\nargs = []\n'
+            if spec is OPENCODE:
+                return b'{"mcp":{"unrelated":{"type":"local","command":["other"]}}}\n'
+            if spec is ZCODE:
+                return b'{"mcp":{"servers":{"unrelated":{"command":"other","args":[]}}}}\n'
+            if spec is DEVIN_DESKTOP:
+                return b'{"mcpServers":{"unrelated":{"command":"other","args":[]}}}\n'
+            return json.dumps(
+                {"projects": {self.claude_key(): {
+                    "mcpServers": {"unrelated": {"command": "other", "args": []}}
+                }}}
+            ).encode("utf-8")
+
+        real_safe_replace = connector_apply.safe_replace
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                self.installed.update(spec.executables)
+                env = self.env()
+                target = Path(str(spec.locations[0].build(env)))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                concurrent = concurrent_config(spec)
+
+                def replace_then_create(path_arg, text, *args, _bytes=concurrent, **kwargs):
+                    def create_at_commit(_target):
+                        Path(path_arg).write_bytes(_bytes)
+                    kwargs["after_terminal_gate_hook"] = create_at_commit
+                    return real_safe_replace(path_arg, text, *args, **kwargs)
+
+                with mock.patch.object(
+                    connector_apply, "safe_replace", side_effect=replace_then_create
                 ):
                     code, payload, _ = self.run_json("apply", spec.connector_id)
 

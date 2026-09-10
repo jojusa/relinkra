@@ -78,6 +78,8 @@ from .safe_write import (
     UnsafeTargetError,
     assert_writable_target,
     atomic_write_text,
+    commit_prepared_write,
+    prepare_atomic_write,
     digest_bytes,
     digest_text,
     EXPECTED_ABSENT,
@@ -1311,6 +1313,19 @@ def _apply_inner(
         else EXPECTED_ABSENT
     )
 
+    def _validate_authoritative_state(_target: Path = target) -> None:
+        """Rebind non-target authority at the terminal and post-write gates."""
+        scope_cbm, unreadable, shadows = _authoritative_scope_scan(
+            spec, env, target_path=_target
+        )
+        if unreadable is not None or scope_cbm or shadows:
+            raise PreconditionError(
+                "authoritative configuration changed concurrently; nothing was overwritten"
+            )
+
+    def _validate_post_authoritative_state(_candidate: str) -> None:
+        _validate_authoritative_state(target)
+
     def _validate_written_registration(candidate: str) -> None:
         """Validate syntax and semantics while safe_replace still holds its lock.
 
@@ -1328,6 +1343,10 @@ def _apply_inner(
         )
         if candidate_entry is None or not is_managed_entry(candidate_entry):
             raise MergeError("the written configuration has no managed Relinkra entry")
+        if _direct_cbm_entries(
+            candidate_document, container_path, spec.inherited_container_paths
+        ):
+            raise MergeError("the written configuration exposes direct CBM")
         candidate_decision = decide_member(
             candidate_document,
             container_path,
@@ -1343,6 +1362,8 @@ def _apply_inner(
             target,
             text,
             validator=_validate_written_registration,
+            post_validator=_validate_post_authoritative_state,
+            terminal_validator=_validate_authoritative_state,
             expected_digest=expected_digest,
         )
     except PreconditionError as exc:
@@ -1749,43 +1770,59 @@ def _rollback_inner(
     except OSError:
         mode = None
 
-    # One lock for the whole verify-then-mutate sequence, with the digest
-    # and safety gates RE-CHECKED inside it. The checks above are the
-    # cheap early rejection; the host can rewrite its own state file at
-    # any moment, and only the in-lock re-read proves the bytes about to
-    # be replaced are still the bytes the gates approved.
-    with interprocess_lock(str(target)):
-        try:
-            assert_writable_target(target)
-            current_now = read_bounded_text(target)
-        except UnsafeTargetError as exc:
-            return _refuse(
-                result,
-                f"the configuration target became unsafe before the restore: {exc}",
-                ("Restore the file by hand. Nothing was changed.",),
-            )
-        except (SafeWriteError, OSError) as exc:
-            return _refuse(
-                result,
-                f"the current configuration could not be re-read: {_sanitize(str(exc))}",
-                ("Restore the file by hand. Nothing was changed.",),
-            )
-        if digest_text(current_now) != recorded_after:
-            return _refuse(
-                result,
-                "the configuration was edited after Relinkra applied it; "
-                "rolling back would overwrite those external edits.",
-                (
-                    f"Restore manually from the backup '{result.backup_ref or '(unknown)'}' "
-                    "if you are certain, then re-run 'relinkra connect check'. "
-                    "Nothing was changed.",
-                ),
-            )
-        # Re-read and re-authenticate the backup while the target lock is
-        # held.  The pre-lock read is only an early refusal; using those
-        # bytes after an external backup edit would restore stale or forged
-        # content even though the target itself passed its digest gate.
-        if not created_by_apply:
+    # Prepare any restore payload before the terminal digest gate. After the
+    # gate, only an atomic commit and post-commit readback are allowed.
+    prepared_restore = None
+    try:
+        with interprocess_lock(str(target)):
+            try:
+                assert_writable_target(target)
+                current_now = read_bounded_text(target)
+            except UnsafeTargetError as exc:
+                return _refuse(
+                    result,
+                    f"the configuration target became unsafe before the restore: {exc}",
+                    ("Restore the file by hand. Nothing was changed.",),
+                )
+            except (SafeWriteError, OSError) as exc:
+                return _refuse(
+                    result,
+                    f"the current configuration could not be re-read: {_sanitize(str(exc))}",
+                    ("Restore the file by hand. Nothing was changed.",),
+                )
+            if digest_text(current_now) != recorded_after:
+                return _refuse(
+                    result,
+                    "the configuration was edited after Relinkra applied it; "
+                    "rolling back would overwrite those external edits.",
+                    (
+                        f"Restore manually from the backup '{result.backup_ref or '(unknown)'}' "
+                        "if you are certain, then re-run 'relinkra connect check'. "
+                        "Nothing was changed.",
+                    ),
+                )
+
+            if created_by_apply:
+                # No payload preparation is needed for an absent pre-apply
+                # state. The digest gate above is immediately adjacent to
+                # this single unlink syscall.
+                try:
+                    os.unlink(str(target))
+                except OSError as exc:
+                    result.error = _sanitize(str(exc))
+                    return result
+                result.rollback_succeeded = True
+                result.validation_succeeded = not target.exists()
+                result.registration_present = False
+                result.actions = (
+                    f"Run 'relinkra connect check {spec.connector_id}' to confirm "
+                    "the configuration side.",
+                )
+                return result
+
+            # Re-read and authenticate the backup while the target lock is
+            # held, then fully prepare the restore before the terminal target
+            # digest gate.
             if backup is None or not _regular_non_reparse_file(backup):
                 return _refuse(
                     result,
@@ -1796,43 +1833,57 @@ def _rollback_inner(
                 backup_bytes = backup.read_bytes()
                 restored_text = backup_bytes.decode("utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                return _refuse(
-                    result,
-                    f"the managed backup could not be read before restore: {_sanitize(str(exc))}",
-                    ("Restore the configuration by hand. Nothing was changed.",),
-                )
+                result.error = _sanitize(str(exc))
+                return result
             if recorded_backup_digest and digest_bytes(backup_bytes) != recorded_backup_digest:
                 return _refuse(
                     result,
                     "the managed backup changed before restore; refusing rollback.",
                     ("Restore from a trusted copy by hand. Nothing was changed.",),
                 )
+            prepared_restore = prepare_atomic_write(target, restored_text, mode=mode)
 
-        if created_by_apply:
-            # The pre-apply state is ABSENT: Relinkra created the file, so
-            # the honest restore removes exactly the file it created.
+            # This is the terminal target gate: no backup read, temp write,
+            # fsync or unrelated work follows it before commit.
             try:
-                os.unlink(str(target))
-            except OSError as exc:
-                result.error = _sanitize(str(exc))
-                return result
-            result.rollback_succeeded = True
-            result.validation_succeeded = not target.exists()
-            result.registration_present = False
-            result.actions = (
-                f"Run 'relinkra connect check {spec.connector_id}' to confirm "
-                "the configuration side.",
-            )
-            return result
-
-        try:
-            atomic_write_text(target, restored_text, mode=mode)
+                assert_writable_target(target)
+                terminal_now = read_bounded_text(target)
+            except UnsafeTargetError as exc:
+                return _refuse(
+                    result,
+                    f"the configuration target became unsafe before the restore: {exc}",
+                    ("Restore the file by hand. Nothing was changed.",),
+                )
+            except (SafeWriteError, OSError) as exc:
+                return _refuse(
+                    result,
+                    f"the current configuration could not be re-read: {_sanitize(str(exc))}",
+                    ("Restore the file by hand. Nothing was changed.",),
+                )
+            if digest_text(terminal_now) != recorded_after:
+                return _refuse(
+                    result,
+                    "the configuration was edited after Relinkra applied it; "
+                    "rolling back would overwrite those external edits.",
+                    (
+                        f"Restore manually from the backup '{result.backup_ref or '(unknown)'}' "
+                        "if you are certain, then re-run 'relinkra connect check'. "
+                        "Nothing was changed.",
+                    ),
+                )
+            commit_prepared_write(prepared_restore)
+            prepared_restore = None
             written = read_bounded_text(target)
             adapter.validate(written)
-        except (SafeWriteError, OSError, ValueError, MergeError) as exc:
-            result.error = _sanitize(str(exc))
-            return result
-
+    except (SafeWriteError, OSError, ValueError, MergeError) as exc:
+        result.error = _sanitize(str(exc))
+        return result
+    finally:
+        if prepared_restore is not None:
+            try:
+                os.unlink(str(prepared_restore.temp))
+            except OSError:
+                pass
     restored_digest = digest_text(written)
     result.digest_after = restored_digest
     result.backup_digest = recorded_backup_digest or digest_text(restored_text)

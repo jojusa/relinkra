@@ -429,6 +429,37 @@ class SafeReplaceTests(TempCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
 
+    def test_expected_absent_rejects_creation_after_the_terminal_gate(self):
+        concurrent = b'{"concurrent": true}'
+
+        def create_after_gate(target):
+            target.write_bytes(concurrent)
+
+        with self.assertRaises(PreconditionError):
+            safe_replace(
+                self.target,
+                "{}",
+                expected_digest=EXPECTED_ABSENT,
+                after_terminal_gate_hook=create_after_gate,
+            )
+        self.assertEqual(self.target.read_bytes(), concurrent)
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_failed_post_validation_does_not_restore_over_newer_target(self):
+        self.write('{"before": true}')
+        concurrent = b'{"external": true}'
+        calls = {"n": 0}
+
+        def validator(_text):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                self.target.write_bytes(concurrent)
+                raise ValueError("synthetic authority race")
+
+        with self.assertRaises(ContentValidationError) as caught:
+            safe_replace(self.target, '{"after": true}', validator=validator)
+        self.assertFalse(caught.exception.rolled_back)
+        self.assertEqual(self.target.read_bytes(), concurrent)
     def test_expected_absent_permits_an_absent_target_to_be_created(self):
         receipt = safe_replace(
             self.target,

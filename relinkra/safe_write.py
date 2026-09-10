@@ -29,11 +29,20 @@ with a typed error instead.
 
 This module performs no host-specific reasoning and knows nothing about
 MCP. It is the mechanical layer under ``config_merge`` and the connectors.
+
+BOUNDED CONCURRENCY CONTRACT. Relinkra uses optimistic digests, same-directory
+atomic filesystem primitives and terminal/post-write safety gates. It detects
+and refuses meaningful state changes before commit and never reports success
+when post-write safety validation detects authority divergence. It does not
+claim a serializable transaction across independent files against arbitrary
+non-cooperating writers; the remaining risk is limited to syscall-sized races
+that the platform cannot compare-and-swap portably.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import os
 import shutil
@@ -106,6 +115,21 @@ class ContentValidationError(SafeWriteError):
     def __init__(self, message: str, *, rolled_back: bool = False):
         super().__init__(message)
         self.rolled_back = rolled_back
+
+
+@dataclass
+class _PreparedWrite:
+    """A complete same-directory payload waiting for its terminal commit."""
+
+    target: Path
+    temp: Path
+
+
+def _discard_prepared(prepared: Optional[_PreparedWrite]) -> None:
+    if prepared is None:
+        return
+    with contextlib.suppress(OSError):
+        os.unlink(str(prepared.temp))
 
 
 @dataclass(frozen=True)
@@ -314,14 +338,8 @@ def _fsync_dir(path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def atomic_write_text(path, text: str, *, mode: Optional[int] = None) -> None:
-    """Write ``text`` to ``path`` atomically, in the same directory.
-
-    ``newline=""`` keeps Python's universal-newline translation out of
-    the way: the caller already decided the line endings (see
-    :func:`detect_newline`), and a second translation on Windows would
-    turn a deliberate ``\\r\\n`` into ``\\r\\r\\n``.
-    """
+def prepare_atomic_write(path, text: str, *, mode: Optional[int] = None) -> _PreparedWrite:
+    """Prepare all payload bytes before a terminal safety/commit gate."""
     target = Path(path)
     _require_host_absolute(target)
     directory = target.parent
@@ -336,12 +354,60 @@ def atomic_write_text(path, text: str, *, mode: Optional[int] = None) -> None:
             os.fsync(stream.fileno())
         with contextlib.suppress(OSError, NotImplementedError):
             os.chmod(temp_name, NEW_FILE_MODE if mode is None else mode)
-        os.replace(temp_name, str(target))
+        return _PreparedWrite(target=target, temp=Path(temp_name))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(temp_name)
         raise
-    _fsync_dir(directory)
+
+
+def commit_prepared_write(
+    prepared: _PreparedWrite, *, conditional_create: bool = False
+) -> None:
+    """Commit a prepared payload with no-expensive-work terminal semantics.
+
+    Conditional creation uses a same-directory hard link.  Link creation is
+    atomic and fails when the destination already exists on the supported
+    Windows/Linux/macOS filesystems; it is never weakened to ``replace``.
+    """
+    target = prepared.target
+    temp = prepared.temp
+    try:
+        if conditional_create:
+            try:
+                os.link(str(temp), str(target))
+            except FileExistsError as exc:
+                raise PreconditionError(
+                    "configuration was created immediately before replacement; re-run the plan"
+                ) from exc
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise PreconditionError(
+                        "configuration was created immediately before replacement; re-run the plan"
+                    ) from exc
+                raise SafeWriteError(
+                    "the filesystem cannot enforce an atomic expected-absence create"
+                ) from exc
+            with contextlib.suppress(OSError):
+                os.unlink(str(temp))
+        else:
+            os.replace(str(temp), str(target))
+        _fsync_dir(target.parent)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(str(temp))
+
+
+def atomic_write_text(path, text: str, *, mode: Optional[int] = None, _prepare_only: bool = False):
+    """Prepare and atomically replace ``path`` with ``text``."""
+    prepared = prepare_atomic_write(path, text, mode=mode)
+    if _prepare_only:
+        return prepared
+    try:
+        commit_prepared_write(prepared)
+    except BaseException:
+        _discard_prepared(prepared)
+        raise
 
 
 def _current_mode(path) -> Optional[int]:
@@ -372,6 +438,9 @@ def safe_replace(
     expected_digest: Optional[Union[str, _ExpectedAbsent]] = None,
     backup: bool = True,
     before_replace_hook: Optional[Callable[[Path], None]] = None,
+    terminal_validator: Optional[Callable[[Path], None]] = None,
+    after_terminal_gate_hook: Optional[Callable[[Path], None]] = None,
+    post_validator: Optional[Callable[[str], None]] = None,
 ) -> WriteReceipt:
     """Replace a config file's contents, or leave it exactly as it was.
 
@@ -437,19 +506,17 @@ def safe_replace(
             raise
         mode = _current_mode(target) if existed else None
 
+        prepared: Optional[_PreparedWrite] = None
         try:
-            # Re-checked at the LAST possible moment. The check before
-            # the lock is a cheap early rejection, but it runs several
-            # I/O steps before the replace — long enough for the target
-            # to be swapped for a symlink in between, which is exactly
-            # the substitution the check exists to refuse. Inside the
-            # try so a refusal here also discards the backup.
+            # All expensive payload preparation happens before the terminal
+            # authority/target gate. The final gate is intentionally followed
+            # only by a commit primitive and deterministic test hook.
+            prepared = atomic_write_text(target, text, mode=mode, _prepare_only=True)
             assert_writable_target(target)
-            # Deterministic test hook: callers can model an external edit
-            # between backup creation and the last gate without relying on
-            # timing. It runs before the final identity/digest check.
             if before_replace_hook is not None:
                 before_replace_hook(target)
+            if terminal_validator is not None:
+                terminal_validator(target)
             assert_writable_target(target)
             if expected_digest is EXPECTED_ABSENT:
                 if target.is_file():
@@ -470,18 +537,30 @@ def safe_replace(
                 raise PreconditionError(
                     "configuration target identity changed immediately before replacement; re-run the plan"
                 )
-            atomic_write_text(target, text, mode=mode)
+            if after_terminal_gate_hook is not None:
+                after_terminal_gate_hook(target)
+            commit_prepared_write(
+                prepared, conditional_create=expected_digest is EXPECTED_ABSENT
+            )
+            prepared = None
         except BaseException:
-            # Nothing was replaced (atomic_write_text either replaced or
-            # raised before replacing), so the backup is redundant noise.
+            _discard_prepared(prepared)
+            # No target replacement occurred on a precondition failure, so
+            # the backup is redundant noise and must not become a recovery
+            # point for a write that was refused.
             _discard_backup(backup_path)
             raise
-
+        candidate_digest: Optional[str] = None
+        candidate_identity: Optional[tuple] = None
         try:
             written = read_bounded_text(target)
+            candidate_digest = digest_text(written)
+            candidate_identity = _target_identity(target)
             if validator is not None:
                 validator(written)
-            digest_after = digest_text(written)
+            if post_validator is not None:
+                post_validator(written)
+            digest_after = candidate_digest
         except Exception as exc:
             restored = _restore(
                 backup_path,
@@ -489,6 +568,9 @@ def safe_replace(
                 existed=existed,
                 original=original,
                 mode=mode,
+                expected_current_digest=candidate_digest,
+                expected_current_identity=candidate_identity,
+                expected_backup_digest=backup_digest,
             )
             raise ContentValidationError(
                 f"post-write validation failed: {exc}", rolled_back=restored
@@ -511,15 +593,8 @@ def _discard_backup(backup_path: Optional[Path]) -> None:
         os.unlink(str(backup_path))
 
 
-def _atomic_copy(source: Path, target: Path) -> None:
-    """Replace ``target`` with ``source``'s bytes, atomically.
-
-    Rollback has to be at least as safe as the write it undoes. A plain
-    ``copy2`` onto the live file is a chunked read/write: interrupt it
-    and the target is neither the original nor the new content — exactly
-    the torn state the forward path uses a temp file to avoid. So the
-    restore takes the same route.
-    """
+def _prepare_atomic_copy(source: Path, target: Path) -> _PreparedWrite:
+    """Prepare a backup payload before rollback's terminal target gate."""
     directory = target.parent
     handle, temp_name = tempfile.mkstemp(
         dir=str(directory), prefix=".relinkra-restore-", suffix=".tmp"
@@ -532,12 +607,11 @@ def _atomic_copy(source: Path, target: Path) -> None:
             os.fsync(stream.fileno())
         with contextlib.suppress(OSError, NotImplementedError):
             shutil.copymode(str(source), temp_name)
-        os.replace(temp_name, str(target))
+        return _PreparedWrite(target=target, temp=Path(temp_name))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(temp_name)
         raise
-    _fsync_dir(directory)
 
 
 def _restore(
@@ -547,44 +621,64 @@ def _restore(
     existed: bool,
     original: Optional[str],
     mode: Optional[int],
+    expected_current_digest: Optional[str],
+    expected_current_identity: Optional[tuple],
+    expected_backup_digest: Optional[str],
 ) -> bool:
-    """Put the target back. Returns whether the original state is restored.
+    """Restore only while the target still contains Relinkra's candidate.
 
-    Three recovery routes, in order of fidelity:
-
-    1. a backup file, copied back atomically;
-    2. the original text, which ``safe_replace`` already read to compute
-       the precondition digest — this is what covers ``backup=False``,
-       where there is no backup file but the original content is still
-       known, and without it that combination would leave the rejected
-       content on disk;
-    3. deletion, when the file did not exist before — then the correct
-       original state is ABSENT, not a half-valid file.
+    Preparation is deliberately completed before the final candidate gate.
+    If an external writer changed the post-write target, rollback refuses and
+    leaves that newer evidence in place instead of overwriting it.
     """
-    expected_digest = digest_text(original) if original is not None else None
+    expected_original_digest = digest_text(original) if original is not None else None
 
     def _matches_original() -> bool:
         if not existed:
             return not target.exists()
-        if expected_digest is None:
+        if expected_original_digest is None:
             return False
         try:
-            return digest_text(read_bounded_text(target)) == expected_digest
+            return digest_text(read_bounded_text(target)) == expected_original_digest
         except (OSError, SafeWriteError):
             return False
 
+    def _candidate_still_present() -> bool:
+        if expected_current_digest is None:
+            return False
+        try:
+            if digest_text(read_bounded_text(target)) != expected_current_digest:
+                return False
+            if (
+                expected_current_identity is not None
+                and _target_identity(target) != expected_current_identity
+            ):
+                return False
+            return True
+        except (OSError, SafeWriteError):
+            return False
+
+    prepared: Optional[_PreparedWrite] = None
     try:
         if backup_path is not None and backup_path.exists():
-            _atomic_copy(backup_path, target)
-            if _matches_original():
-                return True
-        if original is not None:
-            atomic_write_text(target, original, mode=mode)
-            return _matches_original()
-        if not existed:
-            with contextlib.suppress(OSError):
-                os.unlink(str(target))
-            return _matches_original()
-    except OSError:
+            backup_bytes = backup_path.read_bytes()
+            if expected_backup_digest and digest_bytes(backup_bytes) != expected_backup_digest:
+                return False
+            prepared = _prepare_atomic_copy(backup_path, target)
+        elif original is not None:
+            prepared = prepare_atomic_write(target, original, mode=mode)
+
+        if not _candidate_still_present():
+            return False
+        if prepared is not None:
+            commit_prepared_write(prepared)
+            prepared = None
+        else:
+            # The original state was absence. The candidate gate above is
+            # the only authorization for this unlink.
+            os.unlink(str(target))
+        return _matches_original()
+    except (OSError, SafeWriteError):
         return False
-    return False
+    finally:
+        _discard_prepared(prepared)
