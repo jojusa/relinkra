@@ -354,6 +354,7 @@ class ConnectorSafetyPreflight:
     actions: Tuple[str, ...] = ()
     readable: bool = False
     format_supported: bool = False
+    snapshot_digest: Optional[str] = None
 
     @property
     def refused(self) -> bool:
@@ -790,6 +791,82 @@ def authoritative_scope_status(
     )
 
 
+def _final_no_op_snapshot(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    target: Path,
+    adapter: Any,
+    container_path: Sequence[str],
+    desired: Any,
+    *,
+    is_managed,
+) -> Tuple[Mapping[str, Any], Any, str, str]:
+    """Return a fresh no-op snapshot and its complete safety decision.
+
+    The first preflight pass rejects unsafe state early. A no-op gets one
+    final pass because the authoritative-scope files can change while that
+    first pass is reading them. The target is parsed once for this pass, and
+    the target/inherited CBM, ownership, and authoritative-scope checks are
+    evaluated before the snapshot is handed to the caller.
+    """
+    try:
+        snapshot_text = read_bounded_text(target)
+        document = adapter.parse(snapshot_text)
+    except (SafeWriteError, OSError, ValueError, MergeError) as exc:
+        return {}, None, (
+            "the current host configuration could not be read or parsed: "
+            f"{_sanitize(str(exc))}"
+        ), ""
+
+    if _direct_cbm_entries(
+        document, container_path, spec.inherited_container_paths
+    ):
+        return {}, None, (
+            "a direct codebase-memory (CBM) registration is present in this "
+            "configuration. Relinkra does not apply alongside direct CBM "
+            "exposure: CBM is Relinkra's private backend, and two routes to "
+            "it cannot be reconciled from here."
+        ), ""
+
+    scope_cbm, unreadable, shadows = _authoritative_scope_scan(
+        spec, env, target_path=target
+    )
+    if unreadable is not None:
+        label = "project" if unreadable.scope == SCOPE_WORKSPACE else "user"
+        return {}, None, (
+            f"an authoritative {label} MCP scope could not be read "
+            f"({unreadable.display_hint}); refusing to claim direct CBM is absent."
+        ), ""
+    if shadows:
+        joined = ", ".join(shadows)
+        return {}, None, (
+            f"an entry named '{MANAGED_SERVER_NAME}' in {joined} shadows the "
+            "managed registration: the host merges that scope beside the "
+            "target, so which entry runs is the host's merge rule, not "
+            "Relinkra's."
+        ), ""
+    if scope_cbm:
+        return {}, None, (
+            "a direct codebase-memory (CBM) registration is present in an "
+            "authoritative MCP scope; refusing to claim the connector is safe "
+            "until it is removed."
+        ), ""
+
+    try:
+        decision = decide_member(
+            document,
+            container_path,
+            MANAGED_SERVER_NAME,
+            desired,
+            is_managed=is_managed,
+        )
+    except MergeError as exc:
+        return {}, None, str(exc), ""
+    if decision.action == ACTION_CONFLICT:
+        return {}, None, decision.reason, ""
+    return document, decision, "", digest_text(snapshot_text)
+
+
 def connector_safety_preflight(
     spec: ConnectorSpec,
     launch: LaunchContract,
@@ -807,9 +884,10 @@ def connector_safety_preflight(
     Devin legacy scopes are warnings, never refusals.
     """
     # Callers that already performed the front-door inspect/plan pass hand
-    # those immutable read-only facts in. Apply has no prior facts, so it
-    # performs the pass here. This keeps the front door from reading the
-    # target twice while preserving one authority for both entry points.
+    # those facts in only to build the user's plan. They are not authorization
+    # evidence: the target may have changed after inspect_connector returned.
+    # Apply has no prior plan, so it performs the inspection here. Both entry
+    # points below establish a fresh target snapshot before any no-op claim.
     if inspection is None:
         inspection = inspect_connector(spec, env)
     location = None
@@ -894,15 +972,28 @@ def connector_safety_preflight(
         )
 
     adapter = adapter_for(spec.config_format)
-    document = (
-        inspection.document
-        if inspection.document is not None and location is inspection.location
-        else {}
-    )
     container_path = inspection.container_path or container_path_for(
         spec, env.workspace_root
     )
     format_supported = True
+
+    # The inspection document is deliberately stale here. Read and parse the
+    # target again before scanning direct CBM, deciding ownership, or proving
+    # an idempotent registration. Those checks must all describe this one
+    # current document; a member-only reread after scanning the old document
+    # is not an authorization boundary.
+    if adapter is not None and location.exists:
+        try:
+            document = adapter.parse(read_bounded_text(target))
+        except (SafeWriteError, OSError, ValueError, MergeError) as exc:
+            return refused(
+                "the current host configuration could not be read or parsed: "
+                f"{_sanitize(str(exc))}",
+                ("Repair the target configuration, then re-run connect.",),
+            )
+    else:
+        document = {}
+
     cbm_exposures = _direct_cbm_entries(
         document, container_path, spec.inherited_container_paths
     )
@@ -991,30 +1082,31 @@ def connector_safety_preflight(
             ),
         )
 
-    no_op_verified = False
+    snapshot_digest = None
     if decision.action == ACTION_NO_OP:
-        verification = ApplyResult(host=spec.connector_id)
-        _verify_registration(
-            verification,
+        final_document, final_decision, final_refusal, final_digest = _final_no_op_snapshot(
+            spec,
+            env,
             target,
+            adapter,
             container_path,
             desired,
             is_managed=is_managed,
-            adapter=adapter,
         )
-        if verification.error:
+        if final_refusal:
             return refused(
-                "the existing registration could not be semantically verified "
-                f"from the target: {verification.error}",
+                final_refusal,
                 ("Repair the target configuration, then re-run connect.",),
             )
-        if not verification.registration_matches_expected:
-            return refused(
-                "the target no longer contains the expected Relinkra "
-                "registration; refusing to claim a safe no-op.",
-                ("Repair or re-plan the target configuration, then re-run connect.",),
-            )
-        no_op_verified = True
+        document = final_document
+        decision = final_decision
+        snapshot_digest = final_digest
+
+    # The decision above is made from the same final parsed document that
+    # passed the direct-CBM and authoritative-scope scans. Do not replace
+    # that snapshot with a narrower member-only reread before authorizing a
+    # no-op.
+    no_op_verified = decision.action == ACTION_NO_OP
 
     return ConnectorSafetyPreflight(
         inspection=inspection,
@@ -1030,6 +1122,7 @@ def connector_safety_preflight(
         no_op_verified=no_op_verified,
         readable=readable,
         format_supported=format_supported,
+        snapshot_digest=snapshot_digest,
     )
 
 
@@ -1135,10 +1228,19 @@ def _apply_inner(
 
     if decision.action == ACTION_NO_OP:
         # Idempotent re-apply: no backup, no write. Everything is
-        # verified by re-reading instead of by trusting the inspection.
+        # verified from the complete final snapshot, not stale inspection facts.
+        # Use the same final snapshot that passed the complete preflight.
+        # A member-only reread here would reopen the TOCTOU gap.
         _verify_registration(
-            result, target, container_path, desired, is_managed=is_managed, adapter=adapter
+            result,
+            target,
+            container_path,
+            desired,
+            is_managed=is_managed,
+            adapter=adapter,
+            document=document,
         )
+        result.digest_after = preflight.snapshot_digest
         result.validation_succeeded = result.registration_matches_expected
         result.verification_stage = STAGE_CONFIG_APPLIED_HOST_UNVERIFIED
         result.actions = (
@@ -1301,6 +1403,7 @@ def _verify_registration(
     *,
     is_managed,
     adapter,
+    document: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Re-read the file and semantically verify the Relinkra entry.
 
@@ -1311,14 +1414,15 @@ def _verify_registration(
     desired entry instead would falsely fail entries carrying operator
     additions the merge rules deliberately preserve.
     """
-    try:
-        written = read_bounded_text(target)
-        document = adapter.parse(written)
-    except (SafeWriteError, OSError, ValueError, MergeError) as exc:
-        result.error = _sanitize(str(exc))
-        return
-    if result.digest_after is None:
-        result.digest_after = digest_text(written)
+    if document is None:
+        try:
+            written = read_bounded_text(target)
+            document = adapter.parse(written)
+        except (SafeWriteError, OSError, ValueError, MergeError) as exc:
+            result.error = _sanitize(str(exc))
+            return
+        if result.digest_after is None:
+            result.digest_after = digest_text(written)
     container = _container(document, container_path)
     entry = container.get(MANAGED_SERVER_NAME) if isinstance(container, Mapping) else None
     result.registration_present = entry is not None

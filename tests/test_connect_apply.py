@@ -56,9 +56,14 @@ from relinkra.connector_apply import (
 )
 from relinkra.connectors import (
     CLAUDE,
+    CODEX,
+    DEVIN_DESKTOP,
+    OPENCODE,
     SERVER_MODULE,
+    ZCODE,
     claude_project_key,
     resolve_launch,
+    resolve_host_launch,
 )
 from relinkra.handoff import contains_absolute_path
 from relinkra.host_discovery import (
@@ -76,6 +81,7 @@ from relinkra.product_cli import (
     registry_path,
 )
 from relinkra.registry import Registry
+from relinkra.toml_edit import toml_parser_available
 from relinkra.safe_write import (
     ContentValidationError,
     PreconditionError,
@@ -532,6 +538,34 @@ class ApplyRefusalTests(ConnectApplyCase):
 
 
 class ApplyFailureSemanticsTests(ConnectApplyCase):
+    def test_no_op_rechecks_direct_cbm_after_inspection(self):
+        path = self.claude_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.registered_claude_entry()}}
+        )
+        real_inspect = connector_apply.inspect_connector
+
+        def inspect_then_add_direct_cbm(spec, env):
+            inspection = real_inspect(spec, env)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            self.mcp_servers(document)["memory-helper"] = {
+                "command": "codebase-memory-mcp",
+                "args": [],
+            }
+            path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+            return inspection
+
+        with mock.patch.object(
+            connector_apply,
+            "inspect_connector",
+            side_effect=inspect_then_add_direct_cbm,
+        ):
+            code, payload, _ = self.run_json("apply", "claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        self.assertFalse(payload["write_attempted"])
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+
     def test_an_atomic_write_failure_keeps_the_original_and_no_backup(self):
         path = self.claude_config({"mcpServers": {}})
         before = path.read_bytes()
@@ -574,6 +608,121 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
         self.assertTrue(payload["rollback_attempted"])
         self.assertTrue(payload["rollback_succeeded"])
         self.assertEqual(path.read_bytes(), before)
+
+    def test_no_op_rechecks_direct_cbm_after_inspection_for_every_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex TOCTOU fixture needs tomllib")
+
+        def setup(spec):
+            launch = resolve_host_launch(
+                spec.connector_id, self.repo, registry_path(self.repo)
+            )
+            entry = spec.entry_builder(launch)
+            if spec.connector_id == "claude":
+                return self.claude_config({MANAGED_SERVER_NAME: entry})
+            if spec.connector_id == "opencode":
+                return self.write_config(
+                    ".config", "opencode", "opencode.json",
+                    content={"mcp": {MANAGED_SERVER_NAME: entry}},
+                )
+            if spec.connector_id == "codex":
+                return self.write_config(
+                    ".codex", "config.toml",
+                    content=(
+                        "[mcp_servers.relinkra]\n"
+                        f"command = {json.dumps(entry['command'])}\n"
+                        f"args = {json.dumps(entry['args'])}\n"
+                    ),
+                )
+            if spec.connector_id == "zcode":
+                path = self.repo / ".zcode" / "config.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"mcp": {"servers": {MANAGED_SERVER_NAME: entry}}}),
+                    encoding="utf-8",
+                )
+                return path
+            path = self.repo / ".devin" / "mcp_config.local.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"mcpServers": {MANAGED_SERVER_NAME: entry}}),
+                encoding="utf-8",
+            )
+            return path
+
+        def mutate(spec, path):
+            if spec.connector_id == "codex":
+                path.write_text(
+                    path.read_text(encoding="utf-8")
+                    + "\n[mcp_servers.memory_helper]\n"
+                    + 'command = "codebase-memory-mcp"\nargs = []\n',
+                    encoding="utf-8",
+                )
+                return
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if spec.connector_id == "claude":
+                servers = self.mcp_servers(document)
+            elif spec.connector_id == "opencode":
+                servers = document["mcp"]
+            elif spec.connector_id == "zcode":
+                servers = document["mcp"]["servers"]
+            else:
+                servers = document["mcpServers"]
+            servers["memory-helper"] = {"command": "codebase-memory-mcp", "args": []}
+            path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                path = setup(spec)
+                real_inspect = connector_apply.inspect_connector
+
+                def inspect_then_mutate(current_spec, env, *, _path=path, _spec=spec):
+                    inspection = real_inspect(current_spec, env)
+                    mutate(_spec, _path)
+                    return inspection
+
+                with mock.patch.object(
+                    connector_apply,
+                    "inspect_connector",
+                    side_effect=inspect_then_mutate,
+                ):
+                    code, payload, _ = self.run_json("apply", spec.connector_id)
+                self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+                self.assertIn("direct codebase-memory", payload["refusal_reason"])
+                self.assertFalse(payload["write_attempted"])
+                self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+    def test_no_op_rechecks_authoritative_scope_after_first_scan(self):
+        path = self.claude_config({MANAGED_SERVER_NAME: self.registered_claude_entry()})
+        scope = self.repo / ".mcp.json"
+        real_scan = connector_apply._authoritative_scope_scan
+        calls = []
+
+        def scan_then_add_scope(spec, env, target_path=None):
+            result = real_scan(spec, env, target_path)
+            calls.append(1)
+            if len(calls) == 1:
+                scope.write_text(
+                    json.dumps(
+                        {"mcpServers": {"memory-helper": {
+                            "command": "codebase-memory-mcp"
+                        }}}
+                    ),
+                    encoding="utf-8",
+                )
+            return result
+
+        with mock.patch.object(
+            connector_apply,
+            "_authoritative_scope_scan",
+            side_effect=scan_then_add_scope,
+        ):
+            code, payload, _ = self.run_json("apply", "claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertFalse(payload["write_attempted"])
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
 
     def test_a_concurrent_edit_aborts_the_write(self):
         path = self.claude_config({"mcpServers": {}})
