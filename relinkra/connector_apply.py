@@ -41,6 +41,7 @@ from .backend_detection import classify_entry, entry_matches_backend
 from .backend_policy import BACKEND_CBM, DETECTION_DETECTED
 from .config_formats import adapter_for
 from .config_merge import (
+    ACTION_CONFLICT,
     ACTION_NO_OP,
     MergeError,
     decide_member,
@@ -326,6 +327,37 @@ class ApplyResult:
         data["real_backup_path"] = self.real_backup_path
         data["workspace_root"] = self.workspace_root
         return data
+
+
+@dataclass(frozen=True)
+class ConnectorSafetyPreflight:
+    """Read-only safety facts shared by the front door and apply.
+
+    The front door must not infer that an idempotent plan is safe from the
+    plan alone: apply-time target, direct-CBM and authoritative-scope gates
+    are part of that claim. Keeping these facts together also prevents the
+    two entry points from growing subtly different safety logic.
+    """
+
+    inspection: Any
+    location: Any = None
+    target: Optional[Path] = None
+    document: Mapping[str, Any] = None
+    container_path: Tuple[str, ...] = ()
+    adapter: Any = None
+    warnings: Tuple[str, ...] = ()
+    legacy_warnings: Tuple[str, ...] = ()
+    plan: Any = None
+    decision: Any = None
+    no_op_verified: bool = False
+    refusal_reason: str = ""
+    actions: Tuple[str, ...] = ()
+    readable: bool = False
+    format_supported: bool = False
+
+    @property
+    def refused(self) -> bool:
+        return bool(self.refusal_reason)
 
 
 def _refuse(
@@ -728,11 +760,26 @@ def authoritative_scope_status(
     ``apply``. Keep the legacy ``shadow_registration_hints`` helper intact
     for callers that only need shadow names.
     """
-    _count, unreadable, shadows = _authoritative_scope_scan(
+    if target_path is None:
+        inspection = inspect_connector(spec, env)
+        location = _preferred_location(spec, inspection)
+        target_path = (
+            Path(str(location.path))
+            if location is not None and location.path is not None
+            else None
+        )
+    count, unreadable, shadows = _authoritative_scope_scan(
         spec, env, target_path
     )
-    if unreadable is None:
+    if unreadable is None and not count:
         return None, shadows
+    if unreadable is None:
+        return (
+            "a direct codebase-memory (CBM) registration is present in an "
+            "authoritative MCP scope; refusing to claim the connector is "
+            "safe until it is removed.",
+            shadows,
+        )
     label = "project" if unreadable.scope == SCOPE_WORKSPACE else "user"
     return (
         f"an authoritative {label} MCP scope could not be read "
@@ -741,6 +788,259 @@ def authoritative_scope_status(
         "connect check or apply.",
         shadows,
     )
+
+
+def connector_safety_preflight(
+    spec: ConnectorSpec,
+    launch: LaunchContract,
+    env: DiscoveryEnvironment,
+    *,
+    inspection: Any = None,
+    plan: Any = None,
+) -> ConnectorSafetyPreflight:
+    """Run the connector's complete read-only safety authority.
+
+    This is intentionally the same authority used immediately before an
+    apply write. It re-reads the target, validates the exact target path,
+    scans target/inherited and sibling authoritative scopes, evaluates the
+    merge/ownership decision, and re-reads a no-op target for semantic proof.
+    Devin legacy scopes are warnings, never refusals.
+    """
+    # Callers that already performed the front-door inspect/plan pass hand
+    # those immutable read-only facts in. Apply has no prior facts, so it
+    # performs the pass here. This keeps the front door from reading the
+    # target twice while preserving one authority for both entry points.
+    if inspection is None:
+        inspection = inspect_connector(spec, env)
+    location = None
+    target = None
+    adapter = None
+    document = {}
+    container_path = ()
+    readable = False
+    format_supported = False
+    legacy_warnings = legacy_scope_findings(spec, env)
+    warnings = tuple(
+        f"{warning.code}: {warning.message}" for warning in inspection.warnings
+    ) + legacy_warnings
+
+    def refused(
+        reason: str,
+        actions: Sequence[str],
+        extra_warnings: Sequence[str] = (),
+    ) -> ConnectorSafetyPreflight:
+        return ConnectorSafetyPreflight(
+            inspection=inspection,
+            warnings=warnings + tuple(extra_warnings),
+            legacy_warnings=legacy_warnings,
+            refusal_reason=reason,
+            actions=tuple(actions),
+            location=location,
+            target=target,
+            document=document,
+            container_path=container_path,
+            adapter=adapter,
+            readable=readable,
+            format_supported=format_supported,
+        )
+
+    if inspection.discovery_status in (
+        DISCOVERY_CONFIG_MALFORMED,
+        DISCOVERY_CONFIG_UNSUPPORTED,
+    ):
+        detail = next(
+            (warning.message for warning in inspection.warnings),
+            "the existing configuration could not be parsed.",
+        )
+        return refused(
+            f"the host configuration is {inspection.discovery_status}: {detail}",
+            (
+                "Repair the configuration by hand, then re-run "
+                "'relinkra connect'.",
+            ),
+        )
+    if inspection.raw_text is not None and inspection.document is None:
+        detail = next(
+            (warning.message for warning in inspection.warnings),
+            "the host configuration could not be parsed on this interpreter.",
+        )
+        return refused(
+            detail,
+            ("Use a Python 3.11+ interpreter to manage this host's configuration.",),
+        )
+
+    location = _preferred_location(spec, inspection)
+    if location is None or location.path is None:
+        return refused(
+            "no configuration location applies to this platform.",
+            ("Install the host or create its configuration, then re-run connect.",),
+        )
+    target = Path(str(location.path))
+    if location.exists and not location.readable:
+        return refused(
+            "the host configuration exists but could not be read.",
+            ("Fix the file permissions, then re-run connect.",),
+        )
+    readable = True
+    try:
+        assert_writable_target(target)
+    except UnsafeTargetError as exc:
+        return refused(
+            f"the configuration target is not a plain writable file: {exc}",
+            (
+                "Replace the symlink or reparse point with a regular file; "
+                "Relinkra never writes through indirection.",
+            ),
+        )
+
+    adapter = adapter_for(spec.config_format)
+    document = (
+        inspection.document
+        if inspection.document is not None and location is inspection.location
+        else {}
+    )
+    container_path = inspection.container_path or container_path_for(
+        spec, env.workspace_root
+    )
+    format_supported = True
+    cbm_exposures = _direct_cbm_entries(
+        document, container_path, spec.inherited_container_paths
+    )
+    scope_cbm_exposures, unreadable_location, shadow_hints = (
+        _authoritative_scope_scan(spec, env, target_path=target)
+    )
+    if unreadable_location is not None:
+        label = (
+            "project" if unreadable_location.scope == SCOPE_WORKSPACE else "user"
+        )
+        return refused(
+            f"an authoritative {label} MCP scope could not be read "
+            f"({unreadable_location.display_hint}); refusing to claim direct "
+            "CBM is absent.",
+            (
+                "Repair or remove the unreadable MCP configuration, then "
+                "re-run connect. Nothing was changed.",
+            ),
+        )
+    if shadow_hints:
+        joined = ", ".join(shadow_hints)
+        return refused(
+            f"an entry named '{MANAGED_SERVER_NAME}' in {joined} shadows the "
+            "managed registration: the host merges that scope beside the "
+            "target, so which entry runs is the host's merge rule, not "
+            "Relinkra's.",
+            (
+                f"Remove or rename the '{MANAGED_SERVER_NAME}' entry in "
+                f"{joined}, then re-run connect. Nothing was changed.",
+            ),
+        )
+    cbm_exposures += scope_cbm_exposures
+    if cbm_exposures:
+        return refused(
+            "a direct codebase-memory (CBM) registration is present in this "
+            "configuration. Relinkra does not apply alongside direct CBM "
+            "exposure: CBM is Relinkra's private backend, and two routes to "
+            "it cannot be reconciled from here.",
+            (
+                "Remove the direct codebase-memory registration yourself, "
+                "then re-run connect. Nothing was changed.",
+            ),
+            (
+                "direct_cbm_exposure: the configuration registers the "
+                "codebase-memory backend directly, beside the entry Relinkra "
+                "would manage.",
+            ),
+        )
+
+    if adapter is None or spec.entry_builder is None:
+        return refused(
+            "this host's configuration format is not writable in this phase.",
+            ("Run 'relinkra connect plan' and apply the change by hand.",),
+        )
+    if plan is None:
+        plan = build_plan(spec, inspection, launch)
+    if plan.status != PLAN_READY or plan.conflicts:
+        reason = plan.unavailable_reason or (
+            "; ".join(plan.conflicts)
+            if plan.conflicts
+            else f"plan status is '{plan.status}'"
+        )
+        return refused(
+            reason,
+            ("Run 'relinkra connect plan' to review what blocks the connector.",),
+        )
+
+    desired = spec.entry_builder(launch)
+    is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
+    try:
+        decision = decide_member(
+            document,
+            container_path,
+            MANAGED_SERVER_NAME,
+            desired,
+            is_managed=is_managed,
+        )
+    except MergeError as exc:
+        return refused(str(exc), ("Repair the configuration, then re-run connect.",))
+    if decision.action == ACTION_CONFLICT:
+        return refused(
+            decision.reason,
+            (
+                f"Rename or remove the '{MANAGED_SERVER_NAME}' entry owned by "
+                "another server; Relinkra never overwrites it.",
+            ),
+        )
+
+    no_op_verified = False
+    if decision.action == ACTION_NO_OP:
+        verification = ApplyResult(host=spec.connector_id)
+        _verify_registration(
+            verification,
+            target,
+            container_path,
+            desired,
+            is_managed=is_managed,
+            adapter=adapter,
+        )
+        if verification.error:
+            return refused(
+                "the existing registration could not be semantically verified "
+                f"from the target: {verification.error}",
+                ("Repair the target configuration, then re-run connect.",),
+            )
+        if not verification.registration_matches_expected:
+            return refused(
+                "the target no longer contains the expected Relinkra "
+                "registration; refusing to claim a safe no-op.",
+                ("Repair or re-plan the target configuration, then re-run connect.",),
+            )
+        no_op_verified = True
+
+    return ConnectorSafetyPreflight(
+        inspection=inspection,
+        location=location,
+        target=target,
+        document=document,
+        container_path=container_path,
+        adapter=adapter,
+        warnings=warnings,
+        legacy_warnings=legacy_warnings,
+        plan=plan,
+        decision=decision,
+        no_op_verified=no_op_verified,
+        readable=readable,
+        format_supported=format_supported,
+    )
+
+
+def preferred_connector_target_path(
+    spec: ConnectorSpec, inspection: Any
+) -> Optional[Path]:
+    """Return the exact current-product target selected by apply/plan."""
+    location = _preferred_location(spec, inspection)
+    if location is None or location.path is None:
+        return None
+    return Path(str(location.path))
 
 
 # ---------------------------------------------------------------------------
@@ -800,176 +1100,33 @@ def _apply_inner(
             ("Run 'relinkra connect plan' and apply the change by hand.",),
         )
 
-    inspection = inspect_connector(spec, env)
-    result.warnings += tuple(
-        f"{warning.code}: {warning.message}" for warning in inspection.warnings
-    )
-    # Legacy/evidence-only scopes of a renamed host are surfaced loudly
-    # but never block: only authoritative-scope CBM gates the write.
-    result.warnings += legacy_scope_findings(spec, env)
+    preflight = connector_safety_preflight(spec, launch, env)
+    inspection = preflight.inspection
+    result.warnings += preflight.warnings
     result.discovered = inspection.discovery_status == DISCOVERY_DISCOVERED
 
-    if inspection.discovery_status in (
-        DISCOVERY_CONFIG_MALFORMED,
-        DISCOVERY_CONFIG_UNSUPPORTED,
-    ):
-        detail = next(
-            (warning.message for warning in inspection.warnings),
-            "the existing configuration could not be parsed.",
-        )
-        return _refuse(
-            result,
-            f"the host configuration is {inspection.discovery_status}: {detail}",
-            (
-                "Repair the configuration by hand, then re-run "
-                "'relinkra connect apply'.",
-            ),
-        )
+    location = preflight.location
+    target = preflight.target
+    document = preflight.document
+    container_path = preflight.container_path
+    adapter = preflight.adapter or adapter
+    if location is not None:
+        result.config_path = location.display_hint
+    if target is not None:
+        result.real_config_path = str(target)
+    if preflight.readable:
+        result.readable = True
+    if preflight.format_supported:
+        result.format_supported = True
+    if preflight.refused:
+        return _refuse(result, preflight.refusal_reason, preflight.actions)
 
-    if inspection.raw_text is not None and inspection.document is None:
-        # The file was read but not parsed — today exactly one case: TOML
-        # on an interpreter without tomllib. The registration state is
-        # UNKNOWN, and writing against an unknown state would be guessing.
-        detail = next(
-            (warning.message for warning in inspection.warnings),
-            "the host configuration could not be parsed on this interpreter.",
-        )
-        return _refuse(
-            result,
-            detail,
-            (
-                "Use a Python 3.11+ interpreter to manage this host's "
-                "configuration. Nothing was changed.",
-            ),
-        )
-
-    location = _preferred_location(spec, inspection)
-    if location is None or location.path is None:
-        return _refuse(
-            result,
-            "no configuration location applies to this platform.",
-            ("Install the host or create its configuration, then re-run apply.",),
-        )
-    target = Path(str(location.path))
-    result.config_path = location.display_hint
-    result.real_config_path = str(target)
-
-    if location.exists and not location.readable:
-        return _refuse(
-            result,
-            "the host configuration exists but could not be read.",
-            ("Fix the file permissions, then re-run apply.",),
-        )
-    result.readable = True
-
-    try:
-        assert_writable_target(target)
-    except UnsafeTargetError as exc:
-        return _refuse(
-            result,
-            f"the configuration target is not a plain writable file: {exc}",
-            (
-                "Replace the symlink or reparse point with a regular file; "
-                "Relinkra never writes through indirection.",
-            ),
-        )
-
-    # The document the decision merges into must be the TARGET's content.
-    # When the preferred target is not the inspected location — a
-    # legacy-only install whose apply aims at a current-product create
-    # path — the inspected document describes another file, so the merge
-    # starts from empty exactly as ``build_plan`` does.
-    document = (
-        inspection.document
-        if inspection.document is not None and location is inspection.location
-        else {}
-    )
-    result.format_supported = True
-    # The container the inspection read — workspace-resolved for hosts
-    # like Claude Code whose LOCAL scope is keyed by project.
-    container_path = inspection.container_path or container_path_for(
-        spec, env.workspace_root
-    )
-
-    cbm_exposures = _direct_cbm_entries(
-        document, container_path, spec.inherited_container_paths
-    )
-    scope_cbm_exposures, unreadable_location, shadow_hints = _authoritative_scope_scan(
-        spec, env, target_path=target
-    )
-    if unreadable_location is not None:
-        label = (
-            "project"
-            if unreadable_location.scope == SCOPE_WORKSPACE
-            else "user"
-        )
-        return _refuse(
-            result,
-            f"an authoritative {label} MCP scope could not be read "
-            f"({unreadable_location.display_hint}); refusing to claim direct CBM is absent.",
-            ("Repair or remove the unreadable MCP configuration, then re-run apply. Nothing was changed.",),
-        )
-    if shadow_hints:
-        joined = ", ".join(shadow_hints)
-        return _refuse(
-            result,
-            f"an entry named '{MANAGED_SERVER_NAME}' in {joined} shadows the "
-            "managed registration: the host merges that scope beside the "
-            "apply target, so which entry runs is the host's merge rule, "
-            "not Relinkra's. Relinkra never removes or overwrites another "
-            "scope's entry.",
-            (
-                f"Remove or rename the '{MANAGED_SERVER_NAME}' entry in "
-                f"{joined}, then re-run 'relinkra connect apply'. Nothing was changed.",
-            ),
-        )
-    cbm_exposures += scope_cbm_exposures
-    if cbm_exposures:
-        result.warnings += (
-            "direct_cbm_exposure: the configuration registers the "
-            "codebase-memory backend directly, beside the entry Relinkra "
-            "would manage.",
-        )
-        return _refuse(
-            result,
-            "a direct codebase-memory (CBM) registration is present in this "
-            "configuration. Relinkra does not apply alongside direct CBM "
-            "exposure: CBM is Relinkra's private backend, and two routes to "
-            "it cannot be reconciled from here.",
-            (
-                "Remove the direct codebase-memory registration yourself, "
-                "then re-run 'relinkra connect apply'. Nothing was changed.",
-            ),
-        )
-
-    plan = build_plan(spec, inspection, launch)
-    result.plan_ready = plan.status == PLAN_READY and not plan.conflicts
-    if not result.plan_ready:
-        reason = plan.unavailable_reason or (
-            "; ".join(plan.conflicts)
-            if plan.conflicts
-            else f"plan status is '{plan.status}'"
-        )
-        actions = ["Run 'relinkra connect plan' to review what blocks the write."]
-        if plan.conflicts:
-            actions.append(
-                f"Rename or remove the '{MANAGED_SERVER_NAME}' entry owned by "
-                "another server; Relinkra never overwrites it."
-            )
-        return _refuse(result, reason, actions)
+    plan = preflight.plan
+    result.plan_ready = True
 
     desired = spec.entry_builder(launch)
     is_managed = ownership_test(is_managed_entry, marker_allowed=spec.marker_allowed)
-    try:
-        decision = decide_member(
-            document,
-            container_path,
-            MANAGED_SERVER_NAME,
-            desired,
-            is_managed=is_managed,
-        )
-    except MergeError as exc:
-        return _refuse(result, str(exc), ("Repair the configuration, then re-run apply.",))
+    decision = preflight.decision
 
     raw_text = (
         inspection.raw_text if location is inspection.location else None
@@ -1585,12 +1742,14 @@ __all__ = [
     "RECEIPT_VERSION",
     "STAGE_CONFIG_APPLIED_HOST_UNVERIFIED",
     "ApplyResult",
+    "ConnectorSafetyPreflight",
     "apply_connector",
     "authoritative_scope_status",
     "classify_server_entry",
     "entries_equivalent",
     "launch_fingerprint",
     "legacy_scope_findings",
+    "preferred_connector_target_path",
     "rollback_connector",
     "shadow_registration_hints",
 ]

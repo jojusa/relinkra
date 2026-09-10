@@ -1446,5 +1446,57 @@ class OpenCodeShadowAndScopeAlignmentTests(ConnectApplyOpenCodeCase):
             self.assertEqual(section["status"], STATUS_ABSENT)
 
 
+class OpenCodeFrontDoorSafetyTests(ConnectApplyOpenCodeCase):
+    def test_valid_registration_is_a_read_only_front_door_no_op(self):
+        path = self.opencode_config(
+            {"mcp": {MANAGED_SERVER_NAME: self.registered_opencode_entry()}}
+        )
+        before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("opencode")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["no_op"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+    def test_front_door_refuses_authoritative_workspace_cbm_before_confirmation(self):
+        target = self.opencode_config(
+            {"mcp": {MANAGED_SERVER_NAME: self.registered_opencode_entry()}}
+        )
+        scope = self.repo / "opencode.json"
+        scope.write_text(
+            json.dumps(
+                {"mcp": {"memory-helper": {"command": ["codebase-memory-mcp"]}}}
+            ),
+            encoding="utf-8",
+        )
+        target_before = target.read_bytes()
+        scope_before = scope.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("opencode")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        confirm.assert_not_called()
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual(scope.read_bytes(), scope_before)
+        self.assertEqual(list(target.parent.glob(target.name + ".relinkra-backup*")), [])
+
+    def test_front_door_refuses_unreadable_authoritative_scope_before_confirmation(self):
+        target = self.opencode_config(
+            {"mcp": {MANAGED_SERVER_NAME: self.registered_opencode_entry()}}
+        )
+        scope = self.repo / "opencode.json"
+        scope.mkdir()
+        target_before = target.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("opencode")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("authoritative project MCP scope", payload["refusal_reason"])
+        confirm.assert_not_called()
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual(list(target.parent.glob(target.name + ".relinkra-backup*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

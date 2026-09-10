@@ -73,14 +73,17 @@ from .connect_verification import (
 from .connector import (
     PLAN_READY,
     ConnectorReport,
+    ConnectorWarning,
     UnknownConnectorError,
     iter_strings,
 )
 from .connector_apply import (
     apply_connector,
     authoritative_scope_status,
+    connector_safety_preflight,
     launch_fingerprint,
     legacy_scope_findings,
+    preferred_connector_target_path,
     rollback_connector,
 )
 from .connectors import (
@@ -331,7 +334,48 @@ def cmd_connect(args) -> int:
             allow_paths=False,
         ) or EXIT_ACTION_REQUIRED
 
-    if plan.idempotent:
+    preflight = connector_safety_preflight(
+        spec,
+        launch,
+        env,
+        inspection=inspection,
+        plan=plan,
+    )
+    for message in preflight.legacy_warnings:
+        plan.warnings.append(ConnectorWarning("legacy_scope", message))
+    if preflight.refused:
+        if any(
+            warning.startswith("direct_cbm_exposure:")
+            for warning in preflight.warnings
+        ):
+            plan.warnings.append(
+                ConnectorWarning(
+                    "direct_cbm_exposure",
+                    "the configuration registers the codebase-memory backend "
+                    "directly, beside the entry Relinkra would manage.",
+                )
+            )
+        payload = plan.to_dict()
+        payload.update(
+            {
+                "front_door": True,
+                "safety_refusal": True,
+                "refusal_reason": preflight.refusal_reason,
+                "actions": list(preflight.actions),
+            }
+        )
+        code = _emit(
+            payload,
+            render_plan(plan)
+            + "\nAction required: "
+            + preflight.refusal_reason
+            + ("\n" + "\n".join(preflight.actions) if preflight.actions else ""),
+            as_json=args.json,
+            allow_paths=False,
+        )
+        return EXIT_ACTION_REQUIRED if code == EXIT_OK else code
+
+    if plan.idempotent and preflight.no_op_verified:
         payload = plan.to_dict()
         payload["front_door"] = True
         payload["no_op"] = True
@@ -453,7 +497,7 @@ def cmd_check(args) -> int:
     unreadable_scope_finding, shadow_hints = authoritative_scope_status(
         spec,
         env,
-        target_path=inspection.location.path if inspection.location else None,
+        target_path=preferred_connector_target_path(spec, inspection),
     )
     result = check_registration(
         spec,

@@ -1127,5 +1127,36 @@ class DevinDesktopDoctorTests(ConnectApplyDevinDesktopCase):
         self.assertEqual(section["evidence_class"], "local_operational")
 
 
+class DevinDesktopFrontDoorSafetyTests(ConnectApplyDevinDesktopCase):
+    def test_valid_registration_is_a_read_only_front_door_no_op(self):
+        path = self.current_config({"mcpServers": {MANAGED_SERVER_NAME: self.managed_entry()}})
+        before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("devin-desktop")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["no_op"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+    def test_front_door_refuses_authoritative_workspace_cbm_before_confirmation(self):
+        target = self.workspace_local_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.managed_entry()}}
+        )
+        scope = self.workspace_project_config(
+            {"mcpServers": {"memory-helper": dict(_CBM_ENTRY)}}
+        )
+        target_before = target.read_bytes()
+        scope_before = scope.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("devin-desktop")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        confirm.assert_not_called()
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual(scope.read_bytes(), scope_before)
+        self.assertEqual(list(target.parent.glob(target.name + ".relinkra-backup*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

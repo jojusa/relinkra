@@ -26,6 +26,7 @@ from relinkra.identity import canonicalize_path
 from relinkra.connectors import (
     CLAUDE,
     SERVER_MODULE,
+    ZCODE,
     claude_project_key,
     resolve_host_launch,
     resolve_launch,
@@ -685,14 +686,92 @@ class ReadOnlyTests(ConnectCLICase):
 
 class FrontDoorTests(ConnectCLICase):
     def test_valid_registration_is_a_no_op_without_confirmation(self):
-        self.claude_config(
+        path = self.claude_config(
             {"mcpServers": {MANAGED_SERVER_NAME: self.registered_claude_entry()}}
         )
-        code, payload, err = self.run_json("claude")
+        before = self.snapshot()
+        with mock.patch.object(
+            connect_cli, "inspect_connector", wraps=connect_cli.inspect_connector
+        ) as inspect, mock.patch("builtins.input") as confirm:
+            code, payload, err = self.run_json("claude")
         self.assertEqual(code, EXIT_OK, err)
         self.assertTrue(payload["front_door"])
         self.assertTrue(payload["no_op"])
         self.assertEqual(payload["operations"][0]["op"], "no_op")
+        confirm.assert_not_called()
+        inspect.assert_called_once()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+    def test_idempotent_front_door_refuses_authoritative_direct_cbm(self):
+        target = self.claude_config(
+            {"mcpServers": {MANAGED_SERVER_NAME: self.registered_claude_entry()}}
+        )
+        scope = self.repo / ".mcp.json"
+        scope.write_text(
+            json.dumps(
+                {"mcpServers": {"memory-helper": {"command": "codebase-memory-mcp"}}}
+            ),
+            encoding="utf-8",
+        )
+        before = self.snapshot()
+        scope_before = scope.read_bytes()
+        with mock.patch.object(
+            connect_cli, "inspect_connector", wraps=connect_cli.inspect_connector
+        ) as inspect, mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("claude")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertTrue(payload["safety_refusal"])
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        self.assertTrue(
+            any(warning["code"] == "direct_cbm_exposure" for warning in payload["warnings"])
+        )
+        confirm.assert_not_called()
+        inspect.assert_called_once()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(scope.read_bytes(), scope_before)
+        self.assertEqual(list(target.parent.glob(target.name + ".relinkra-backup*")), [])
+
+    def test_zcode_front_door_no_op_and_authoritative_cbm_refusal_are_read_only(self):
+        path = self.repo / ".zcode" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        launch = resolve_host_launch("zcode", self.repo, registry_path(self.repo))
+        path.write_text(
+            json.dumps(
+                {"mcp": {"servers": {MANAGED_SERVER_NAME: ZCODE.entry_builder(launch)}}}
+            ),
+            encoding="utf-8",
+        )
+        before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("zcode")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["no_op"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+        path.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "servers": {
+                            MANAGED_SERVER_NAME: ZCODE.entry_builder(launch),
+                            "memory-helper": {"command": "codebase-memory-mcp"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        unsafe_before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("zcode")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), unsafe_before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
 
     def test_absent_registration_requires_confirmation_and_decline_writes_nothing(self):
         self.claude_config({"mcpServers": {}})

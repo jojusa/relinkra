@@ -1360,5 +1360,34 @@ class CodexDoctorPerHostTests(ConnectApplyCodexCase):
         self.assertEqual(checks["Host verification"]["status"], WARN)
 
 
+class CodexFrontDoorSafetyTests(ConnectApplyCodexCase):
+    def test_valid_registration_is_a_read_only_front_door_no_op(self):
+        path = self.codex_config(self.registered_toml())
+        before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("codex")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(payload["no_op"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+    def test_front_door_refuses_target_cbm_before_confirmation(self):
+        path = self.codex_config(
+            self.registered_toml()
+            + "\n[mcp_servers.memory-helper]\n"
+            'command = "python"\n'
+            'args = ["-m", "codebase_memory_mcp"]\n'
+        )
+        before = path.read_bytes()
+        with mock.patch("builtins.input") as confirm:
+            code, payload, _ = self.run_json("codex")
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        confirm.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob(path.name + ".relinkra-backup*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
