@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from relinkra import safe_write as safe_write_module
@@ -460,6 +461,85 @@ class SafeReplaceTests(TempCase):
             safe_replace(self.target, '{"after": true}', validator=validator)
         self.assertFalse(caught.exception.rolled_back)
         self.assertEqual(self.target.read_bytes(), concurrent)
+    def test_post_commit_external_bytes_are_not_rollback_owned(self):
+        self.write('{"before": true}')
+        external = b'{"external": true}'
+        real_commit = safe_write_module.commit_prepared_write
+        calls = {"n": 0}
+
+        def commit_then_external(prepared, *args, **kwargs):
+            calls["n"] += 1
+            result = real_commit(prepared, *args, **kwargs)
+            if calls["n"] == 1:
+                self.target.write_bytes(external)
+            return result
+
+        with mock.patch.object(
+            safe_write_module,
+            "commit_prepared_write",
+            side_effect=commit_then_external,
+        ):
+            with self.assertRaises(ContentValidationError) as caught:
+                safe_replace(self.target, '{"after": true}')
+        self.assertFalse(caught.exception.rolled_back)
+        self.assertEqual(self.target.read_bytes(), external)
+
+    def test_backup_mismatch_before_commit_aborts_without_touching_target(self):
+        original = b'{"before": true}'
+        forged = b'{"forged": true}'
+        self.target.write_bytes(original)
+        backup = self.target.with_name(self.target.name + BACKUP_SUFFIX)
+
+        def forge_backup(_target):
+            backup.write_bytes(forged)
+
+        with self.assertRaises(PreconditionError):
+            safe_replace(
+                self.target,
+                '{"after": true}',
+                before_replace_hook=forge_backup,
+            )
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assertEqual(list(self.root.glob("*" + BACKUP_SUFFIX)), [])
+
+    def test_backup_mutated_before_automatic_rollback_is_rejected(self):
+        original = b'{"before": true}'
+        forged = b'{"forged": true}'
+        self.target.write_bytes(original)
+        calls = {"n": 0}
+        backup = self.target.with_name(self.target.name + BACKUP_SUFFIX)
+
+        def validator(_text):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                backup.write_bytes(forged)
+                raise ValueError("synthetic post-validation failure")
+
+        with self.assertRaises(ContentValidationError) as caught:
+            safe_replace(self.target, '{"after": true}', validator=validator)
+        self.assertFalse(caught.exception.rolled_back)
+        self.assertEqual(self.target.read_bytes(), b'{"after": true}')
+        self.assertEqual(backup.read_bytes(), forged)
+
+    def test_absent_candidate_changed_before_cleanup_is_preserved(self):
+        external = b'{"external": true}'
+        calls = {"n": 0}
+
+        def validator(_text):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                self.target.write_bytes(external)
+                raise ValueError("synthetic post-validation failure")
+
+        with self.assertRaises(ContentValidationError) as caught:
+            safe_replace(
+                self.target,
+                '{"candidate": true}',
+                expected_digest=EXPECTED_ABSENT,
+                validator=validator,
+            )
+        self.assertFalse(caught.exception.rolled_back)
+        self.assertEqual(self.target.read_bytes(), external)
     def test_expected_absent_permits_an_absent_target_to_be_created(self):
         receipt = safe_replace(
             self.target,

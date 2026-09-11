@@ -901,7 +901,98 @@ class ApplyFailureSemanticsTests(ConnectApplyCase):
                     list(target.parent.glob(target.name + ".relinkra-backup*")), []
                 )
 
+    def test_post_commit_external_target_is_preserved_for_every_apply_host(self):
+        if not toml_parser_available():
+            self.skipTest("Codex apply fixture needs tomllib")
+
+        def setup(spec):
+            if spec is CLAUDE:
+                return self.claude_config({})
+            if spec is OPENCODE:
+                return self.write_config(
+                    ".config", "opencode", "opencode.json", content={"mcp": {}}
+                )
+            if spec is CODEX:
+                return self.write_config(
+                    ".codex", "config.toml", content="[mcp_servers]\n"
+                )
+            if spec is ZCODE:
+                return self.write_config(
+                    ".zcode", "config.json", content={"mcp": {"servers": {}}}
+                )
+            return self.write_config(
+                ".devin", "mcp_config.local.json", content={"mcpServers": {}}
+            )
+
+        def external_config(spec):
+            if spec is CODEX:
+                return b"[mcp_servers]\nexternal = true\n"
+            if spec is OPENCODE:
+                return b'{"mcp":{"external":{"type":"local","command":["other"]}}}\n'
+            if spec is ZCODE:
+                return b'{"mcp":{"servers":{"external":{"command":"other","args":[]}}}}\n'
+            if spec is DEVIN_DESKTOP:
+                return b'{"mcpServers":{"external":{"command":"other","args":[]}}}\n'
+            return b'{"projects":{}}\n'
+
+        real_commit = relinkra_safe_write.commit_prepared_write
+        for spec in (CODEX, OPENCODE, CLAUDE, DEVIN_DESKTOP, ZCODE):
+            with self.subTest(host=spec.connector_id):
+                self.installed.update(spec.executables)
+                setup_path = setup(spec)
+                inspection = connector_apply.inspect_connector(spec, self.env())
+                target = connector_apply.preferred_connector_target_path(spec, inspection)
+                if target is None:
+                    self.fail("no canonical target for test fixture")
+                if target != setup_path:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(setup_path.read_bytes())
+                external = external_config(spec)
+                calls = {"n": 0}
+
+                def commit_then_external(
+                    prepared, *args, _target=target, _bytes=external, **kwargs
+                ):
+                    calls["n"] += 1
+                    result = real_commit(prepared, *args, **kwargs)
+                    if calls["n"] == 1:
+                        _target.write_bytes(_bytes)
+                    return result
+
+                with mock.patch.object(
+                    relinkra_safe_write,
+                    "commit_prepared_write",
+                    side_effect=commit_then_external,
+                ):
+                    code, payload, _ = self.run_json("apply", spec.connector_id)
+                self.assertEqual(code, EXIT_ERROR, payload)
+                self.assertFalse(payload["write_succeeded"], payload)
+                self.assertFalse(payload["rollback_succeeded"], payload)
+                self.assertEqual(target.read_bytes(), external)
+
 class RollbackTests(ConnectApplyCase):
+    def test_created_file_rollback_reports_failure_after_concurrent_recreation(self):
+        self.installed.update(CLAUDE.executables)
+        target = self.claude_path()
+        code, payload, _ = self.run_json("apply", "claude")
+        self.assertEqual(code, EXIT_OK, payload)
+        self.assertTrue(target.is_file())
+        external = b'{"external": true}'
+        real_unlink = connector_apply.os.unlink
+
+        def unlink_then_recreate(path_arg):
+            real_unlink(path_arg)
+            if Path(path_arg) == target:
+                target.write_bytes(external)
+
+        with mock.patch.object(
+            connector_apply.os, "unlink", side_effect=unlink_then_recreate
+        ):
+            code, rollback, _ = self.run_json("rollback", "claude")
+        self.assertNotEqual(code, EXIT_OK, rollback)
+        self.assertFalse(rollback["rollback_succeeded"])
+        self.assertFalse(rollback["validation_succeeded"])
+        self.assertEqual(target.read_bytes(), external)
     def test_rollback_restores_the_exact_pre_apply_bytes(self):
         path = self.claude_config(
             {"c7": {"command": "npx", "args": []}}, theme="dark"

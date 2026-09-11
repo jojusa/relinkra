@@ -1686,17 +1686,34 @@ def _rollback_inner(
         result.backup_ref = backup.name
         result.real_backup_path = str(backup)
 
-    created_by_apply = bool(receipt.get("digest_before") is None)
-    if backup is None and not created_by_apply:
-        return _refuse(
-            result,
-            "the machine receipt has no attributable backup for this apply, "
-            "so there is nothing safe to restore from.",
-            (
-                "If you kept a copy of the pre-apply configuration, restore "
-                "it by hand. Nothing was changed.",
-            ),
-        )
+    recorded_before = str(receipt.get("digest_before") or "")
+    recorded_backup_digest = str(receipt.get("backup_digest") or "")
+    created_by_apply = not recorded_before
+    if created_by_apply:
+        if backup is not None or recorded_backup_digest:
+            return _refuse(
+                result,
+                "the machine receipt has inconsistent rollback provenance; refusing rollback.",
+                ("Restore the configuration by hand. Nothing was changed.",),
+            )
+    else:
+        if backup is None:
+            return _refuse(
+                result,
+                "the machine receipt has no attributable backup for this apply, "
+                "so there is nothing safe to restore from.",
+                (
+                    "If you kept a copy of the pre-apply configuration, restore "
+                    "it by hand. Nothing was changed.",
+                ),
+            )
+        if recorded_backup_digest != recorded_before:
+            result.error = (
+                "backup provenance does not match the recorded pre-apply digest; "
+                "refusing rollback"
+            )
+            result.actions = ("Restore the configuration by hand. Nothing was changed.",)
+            return result
 
     try:
         assert_writable_target(target)
@@ -1746,7 +1763,6 @@ def _rollback_inner(
     result.rollback_attempted = True
 
     restored_text: Optional[str] = None
-    recorded_backup_digest = str(receipt.get("backup_digest") or "")
     if not created_by_apply:
         try:
             backup_bytes = backup.read_bytes()
@@ -1754,7 +1770,7 @@ def _rollback_inner(
         except (OSError, UnicodeDecodeError) as exc:
             result.error = _sanitize(str(exc))
             return result
-        if recorded_backup_digest and digest_bytes(backup_bytes) != recorded_backup_digest:
+        if digest_bytes(backup_bytes) != recorded_backup_digest:
             return _refuse(
                 result,
                 "the recorded backup does not match the receipt's backup "
@@ -1811,9 +1827,19 @@ def _rollback_inner(
                 except OSError as exc:
                     result.error = _sanitize(str(exc))
                     return result
-                result.rollback_succeeded = True
                 result.validation_succeeded = not target.exists()
+                result.rollback_succeeded = result.validation_succeeded
                 result.registration_present = False
+                if not result.rollback_succeeded:
+                    result.error = (
+                        "the target changed during rollback; the current external "
+                        "configuration was preserved"
+                    )
+                    result.actions = (
+                        "Re-run connect check and restore the external configuration "
+                        "manually if needed. Nothing else was changed.",
+                    )
+                    return result
                 result.actions = (
                     f"Run 'relinkra connect check {spec.connector_id}' to confirm "
                     "the configuration side.",
@@ -1835,7 +1861,7 @@ def _rollback_inner(
             except (OSError, UnicodeDecodeError) as exc:
                 result.error = _sanitize(str(exc))
                 return result
-            if recorded_backup_digest and digest_bytes(backup_bytes) != recorded_backup_digest:
+            if digest_bytes(backup_bytes) != recorded_backup_digest:
                 return _refuse(
                     result,
                     "the managed backup changed before restore; refusing rollback.",
@@ -1871,7 +1897,7 @@ def _rollback_inner(
                         "Nothing was changed.",
                     ),
                 )
-            commit_prepared_write(prepared_restore)
+            commit_prepared_write(prepared_restore, expected_digest=recorded_after)
             prepared_restore = None
             written = read_bounded_text(target)
             adapter.validate(written)
@@ -1886,12 +1912,11 @@ def _rollback_inner(
                 pass
     restored_digest = digest_text(written)
     result.digest_after = restored_digest
-    result.backup_digest = recorded_backup_digest or digest_text(restored_text)
+    result.backup_digest = recorded_backup_digest
 
     # Cross-check the restore against the recorded pre-apply state. A
     # mismatch means the restored bytes are NOT what the apply saw, and
     # that is a failed restore, never a success with a caveat.
-    recorded_before = receipt.get("digest_before") if receipt else None
     if recorded_before and restored_digest != recorded_before:
         result.rollback_succeeded = False
         result.error = (

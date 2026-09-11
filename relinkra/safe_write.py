@@ -362,7 +362,10 @@ def prepare_atomic_write(path, text: str, *, mode: Optional[int] = None) -> _Pre
 
 
 def commit_prepared_write(
-    prepared: _PreparedWrite, *, conditional_create: bool = False
+    prepared: _PreparedWrite,
+    *,
+    conditional_create: bool = False,
+    expected_digest: Optional[str] = None,
 ) -> None:
     """Commit a prepared payload with no-expensive-work terminal semantics.
 
@@ -373,6 +376,11 @@ def commit_prepared_write(
     target = prepared.target
     temp = prepared.temp
     try:
+        if expected_digest is not None:
+            if not target.is_file() or digest_text(read_bounded_text(target)) != expected_digest:
+                raise PreconditionError(
+                    "configuration changed before the rollback commit; retry is required"
+                )
         if conditional_create:
             try:
                 os.link(str(temp), str(target))
@@ -457,6 +465,7 @@ def safe_replace(
     :class:`ContentValidationError` is raised with ``rolled_back=True``.
     """
     target = Path(path)
+    candidate_digest = digest_text(text)
     assert_writable_target(target)
 
     # One lock for the whole read-modify-write, matching the registry's
@@ -493,13 +502,11 @@ def safe_replace(
 
         backup_path = create_backup(target) if (backup and existed) else None
         try:
-            # Bind the backup's exact bytes while the transaction lock is
-            # still held. The caller must never hash this provenance after
-            # safe_replace returns, when an external writer can race it.
-            backup_digest = (
-                digest_bytes(backup_path.read_bytes())
-                if backup_path is not None
-                else None
+            # Anchor provenance to the original target digest. Never accept
+            # a digest calculated only from whatever bytes the backup has
+            # become after creation.
+            backup_digest = _validate_backup_provenance(
+                backup_path, digest_before
             )
         except BaseException:
             _discard_backup(backup_path)
@@ -517,6 +524,11 @@ def safe_replace(
                 before_replace_hook(target)
             if terminal_validator is not None:
                 terminal_validator(target)
+            # Revalidate provenance after all preparation and immediately
+            # before the terminal target gate.
+            backup_digest = _validate_backup_provenance(
+                backup_path, digest_before
+            )
             assert_writable_target(target)
             if expected_digest is EXPECTED_ABSENT:
                 if target.is_file():
@@ -550,12 +562,13 @@ def safe_replace(
             # point for a write that was refused.
             _discard_backup(backup_path)
             raise
-        candidate_digest: Optional[str] = None
-        candidate_identity: Optional[tuple] = None
         try:
             written = read_bounded_text(target)
-            candidate_digest = digest_text(written)
-            candidate_identity = _target_identity(target)
+            observed_digest = digest_text(written)
+            if observed_digest != candidate_digest:
+                raise PreconditionError(
+                    "configuration changed after commit; rollback is not authorized"
+                )
             if validator is not None:
                 validator(written)
             if post_validator is not None:
@@ -569,7 +582,7 @@ def safe_replace(
                 original=original,
                 mode=mode,
                 expected_current_digest=candidate_digest,
-                expected_current_identity=candidate_identity,
+                expected_current_identity=None,
                 expected_backup_digest=backup_digest,
             )
             raise ContentValidationError(
@@ -591,6 +604,38 @@ def _discard_backup(backup_path: Optional[Path]) -> None:
         return
     with contextlib.suppress(OSError):
         os.unlink(str(backup_path))
+
+
+def _validate_backup_provenance(
+    backup_path: Optional[Path], expected_digest: Optional[str]
+) -> Optional[str]:
+    """Prove backup bytes equal the pre-write target digest.
+
+    The expected digest is captured from the original target before the
+    backup exists. A digest computed only from the backup would be
+    self-referential and would authenticate forged restore bytes.
+    """
+    if backup_path is None:
+        return None
+    if (
+        expected_digest is None
+        or backup_path.is_symlink()
+        or not backup_path.is_file()
+    ):
+        raise PreconditionError(
+            "backup provenance could not be validated; refusing the write"
+        )
+    try:
+        backup_bytes = backup_path.read_bytes()
+    except OSError as exc:
+        raise PreconditionError(
+            "backup provenance could not be read; refusing the write"
+        ) from exc
+    if digest_bytes(backup_bytes) != expected_digest:
+        raise PreconditionError(
+            "backup provenance changed before the write; re-run the plan"
+        )
+    return expected_digest
 
 
 def _prepare_atomic_copy(source: Path, target: Path) -> _PreparedWrite:
@@ -660,18 +705,21 @@ def _restore(
 
     prepared: Optional[_PreparedWrite] = None
     try:
-        if backup_path is not None and backup_path.exists():
-            backup_bytes = backup_path.read_bytes()
-            if expected_backup_digest and digest_bytes(backup_bytes) != expected_backup_digest:
-                return False
+        if backup_path is not None:
+            # A transaction that created a backup may not silently fall back
+            # to the in-memory original when that backup disappears or is
+            # tampered with. That would hide a provenance failure.
+            _validate_backup_provenance(backup_path, expected_backup_digest)
             prepared = _prepare_atomic_copy(backup_path, target)
+            if digest_bytes(prepared.temp.read_bytes()) != expected_backup_digest:
+                return False
         elif original is not None:
             prepared = prepare_atomic_write(target, original, mode=mode)
 
         if not _candidate_still_present():
             return False
         if prepared is not None:
-            commit_prepared_write(prepared)
+            commit_prepared_write(prepared, expected_digest=expected_current_digest)
             prepared = None
         else:
             # The original state was absence. The candidate gate above is
