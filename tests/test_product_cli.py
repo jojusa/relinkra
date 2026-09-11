@@ -955,7 +955,7 @@ class TopLevelCliTests(unittest.TestCase):
         code, out, err = self.run_cli(["version", "--json"])
         self.assertEqual(code, EXIT_OK, err)
         payload = json.loads(out)
-        self.assertEqual(payload["relinkra_version"], "0.1.2")
+        self.assertEqual(payload["relinkra_version"], "0.1.3")
         self.assertEqual(payload["install_mode"], "source")
         self.assertIsNone(payload["installed_metadata_version"])
         self.assertIsNone(payload["metadata_version_consistent"])

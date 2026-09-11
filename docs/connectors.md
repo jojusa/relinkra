@@ -4,10 +4,10 @@ Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
 Code, OpenCode, Codex, Devin Desktop (formerly Windsurf), or anything else that speaks MCP — to launch
 that server for this workspace.
 
-### Level A — 0.1.3 development front door (not yet published)
+### Level A — 0.1.3 release-preparation front door (not yet published)
 
-The host-name forms below are development behavior for 0.1.3. They are not part
-of the published 0.1.2 CLI and do not claim that 0.1.3 has been published.
+The host-name forms below are candidate behavior for 0.1.3. They are not part
+of the last-published 0.1.2 CLI and do not claim that 0.1.3 has been published.
 
 ```
 relinkra connect codex
@@ -17,9 +17,9 @@ relinkra connect devin-desktop
 relinkra connect zcode
 ```
 
-### Level B — Published 0.1.2 advanced commands
+### Level B — Last-published 0.1.2 advanced commands
 
-The current public release uses these exact advanced commands:
+The last-published public release uses these exact advanced commands:
 
 ```
 relinkra connect list
@@ -35,7 +35,7 @@ relinkra connect generic
 
 Powerful inside, simple outside. Everything below is the "inside".
 
-The development front door inspects and plans first, no-ops when the
+The release-preparation front door inspects and plans first, no-ops when the
 registration already matches, asks before writing, and then reuses the
 existing backup, validation, rollback, restart, and verification flow. There
 is no `connect all`; use one host at a time.
@@ -43,7 +43,7 @@ is no `connect all`; use one host at a time.
 > **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), Devin
 > Desktop (R4C.1E), and ZCode (R5K.1) have gated write paths (`connect apply`
 > / `rollback` / `verify`). Historical/local Devin Desktop evidence exists, but
-> the published 0.1.2 CLI currently reports `real_host_launch_proven=false` for
+> the last-published 0.1.2 CLI currently reports `real_host_launch_proven=false` for
 > Devin Desktop and overall. Actual host proof is separate and must be recorded
 > through the published verify flow. See [Capability honesty](#capability-honesty).
 
@@ -239,7 +239,7 @@ R4C.1E recorded historical/local Devin Desktop/Cascade evidence, including the
 expected eleven-tool Relinkra roster, six successful tool calls, project
 binding, handoff retrieval, and an explicit null `workspace_id`. Preserve that
 record as historical/local evidence only: it is not current host certification.
-The published 0.1.2 CLI reports `real_host_launch_proven=false` for Devin
+The last-published 0.1.2 CLI reports `real_host_launch_proven=false` for Devin
 Desktop and overall. Actual host proof is separate and must be recorded after
 the host launch with the published flow, for example:
 `relinkra connect verify devin-desktop --proof <proof-file>`.
@@ -493,7 +493,7 @@ left to right — a later one is never implied by an earlier one.
 | `mcp_process_contract_validated` | The launch contract resolves and the server module imports. |
 | `real_host_launch_proven` | **A real host actually started this server.** |
 
-The published 0.1.2 CLI currently reports the last one as `false` for Devin
+The last-published 0.1.2 CLI currently reports the last one as `false` for Devin
 Desktop and overall. Historical/local R4C.1E Cascade evidence (see [Devin
 Desktop](#devin-desktop)) is not current certification. The value cannot be
 set by planning: producing a plan proves a file could be edited, not that a
@@ -530,7 +530,7 @@ Windows, Linux and macOS are all first-class.
 **Still requiring CI certification on real machines:** POSIX permission
 assertions and symlink refusal are skipped on Windows and vice versa; the
 `%APPDATA%` and `$XDG_CONFIG_HOME` branches are asserted through injected
-environments rather than on real Linux and macOS hosts. The published 0.1.2
+environments rather than on real Linux and macOS hosts. The last-published 0.1.2
 CLI currently records no certified real-host launch for Devin Desktop or
 overall. The R4C.1E Cascade record is historical/local evidence only; actual
 host proof remains separate and must be recorded through

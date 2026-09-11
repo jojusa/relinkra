@@ -83,9 +83,9 @@ mode for `index` and `refresh`.
 
 ## Registration remediation
 
-The supported registration route is `relinkra cbm index`. Relinkra 0.1.3
-doctor guidance uses this command directly; no `relinkra register` command is
-added or required.
+The supported registration route is `relinkra cbm index`. The 0.1.3
+release-preparation candidate's doctor guidance uses this command directly; no
+`relinkra register` command is added or required.
 
 ## Certified release and platform boundary
 

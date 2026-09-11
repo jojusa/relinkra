@@ -20,6 +20,7 @@ from relinkra.app_service import (
     RelinkraServices,
     ServiceConfig,
 )
+from relinkra import __version__
 from relinkra.context_packet import ContextPacket
 from relinkra.freshness import RevisionRelation, RevisionRelationState
 from relinkra.git_intelligence import (
@@ -332,6 +333,7 @@ class ProtocolTests(MCPTestCase):
     def test_initialize_reports_server_identity(self):
         result = self.rpc("initialize", {})["result"]
         self.assertEqual(result["serverInfo"]["name"], "relinkra")
+        self.assertEqual(result["serverInfo"]["version"], __version__)
         self.assertEqual(
             result["serverInfo"]["contractVersion"], CONTRACT_VERSION
         )

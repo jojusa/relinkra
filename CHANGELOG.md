@@ -3,6 +3,25 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.1.3 — release-preparation candidate
+
+This candidate is not yet published.
+
+### Changed
+
+- Clarified explicit registered-versus-current revision semantics, including
+  `project_resolve` freshness and current-revision reporting.
+- Kept `context_get` revision and freshness output consistent.
+- Added doctor/trust divergence detection.
+- Added the safe `connect <agent>` front door.
+- Hardened connector safety.
+- Added a bounded optimistic concurrency model.
+- Added expected-absence preconditions.
+- Revalidated terminal authority before completion.
+- Fixed rollback ownership and provenance handling.
+- Improved Git/generated-state onboarding.
+- Improved the README quick start.
+
 ## 0.1.2
 
 First public PyPI release. The published 0.1.2 package artifacts were built

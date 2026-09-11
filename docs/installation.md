@@ -1,7 +1,8 @@
 # Install Relinkra
 
-Relinkra is the public 0.1.2 Python package that gives coding agents an
-orchestration and context layer without replacing their native tools.
+Relinkra's 0.1.3 release-preparation candidate gives coding agents an
+orchestration and context layer without replacing their native tools. It is not
+yet published; 0.1.2 remains the last public package until publication.
 
 ## Quick path
 

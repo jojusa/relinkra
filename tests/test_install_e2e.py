@@ -41,7 +41,7 @@ IS_NT = os.name == "nt"
 #: When set to an existing artifact path, the suites install THAT artifact
 #: instead of building one (CI reuses a certified build across cells).
 ENV_ARTIFACT = "RELINKRA_E2E_ARTIFACT"
-RELEASE_VERSION = "0.1.2"
+RELEASE_VERSION = "0.1.3"
 
 # Variables the sandbox environment keeps from the real one so git and the
 # interpreter still resolve; everything home- or config-related is replaced.

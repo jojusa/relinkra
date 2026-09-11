@@ -10,8 +10,10 @@ of search, reasoning, editing, and validation.
 
 ## Start here
 
-This is the public 0.1.2 PyPI release. Use the normal install path; do not
-clone the source repository just to use Relinkra.
+This checkout is the 0.1.3 release-preparation candidate. It is not yet
+published; the last public PyPI package is 0.1.2. Use the normal install path
+for the published package, or the maintainer source checkout when exercising
+this candidate.
 
 ### 1. Install
 
@@ -39,7 +41,7 @@ relinkra status
 `.relinkra/config.json` and `.relinkra/registry.json`, then reuses that local
 identity on later commands.
 
-### Level A — Quick Start: connect one agent (0.1.3 development behavior)
+### Level A — Quick Start: connect one agent (0.1.3 release-preparation candidate)
 
 Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
 `devin-desktop`:
@@ -57,13 +59,14 @@ launched Relinkra.
 
 Supported front-door targets are `codex`, `opencode`, `claude`,
 `devin-desktop`, and `zcode`. There is intentionally no `relinkra connect all`.
-This front door is 0.1.3 development behavior and is not yet published; the
-current public 0.1.2 release does not expose it. Use Level B below with 0.1.2.
+This front door is part of the 0.1.3 release-preparation candidate and is not
+yet published. The last public 0.1.2 package does not expose it; use a source
+checkout to exercise this candidate.
 
-### Level B — Safe Advanced Connector Workflow (published 0.1.2)
+### Level B — Safe Advanced Connector Workflow (last-published 0.1.2)
 
-Use these published 0.1.2 advanced commands when you need to inspect or control
-one stage:
+Use these last-published 0.1.2 advanced commands when you need to inspect or
+control one stage:
 
 ```bash
 relinkra connect list
@@ -122,9 +125,10 @@ CBM or Engram for every task, or register CBM directly with an agent.
 
 ## Agent hosts
 
-The following connector IDs have configuration support in 0.1.2. Every one is
-**experimental**: configuration and format support are distinct from proof that
-the real host launches Relinkra end to end.
+The following connector IDs have configuration support in the 0.1.3
+release-preparation candidate. Every one is **experimental**: configuration
+and format support are distinct from proof that the real host launches Relinkra
+end to end.
 
 | Connector | Configuration target | Reload after `connect apply` |
 |---|---|---|
@@ -216,16 +220,17 @@ universal token-saving guarantee. Local or simple tasks can incur overhead
 from initialization, health checks, or optional backend inspection. The next
 validation step is Kisouma dogfood.
 
-## Relinkra 0.1.3 development behavior
+## Relinkra 0.1.3 release-preparation candidate
 
-The 0.1.3 changes described here are development behavior and are not a claim
-that 0.1.3 has been published. The CBM lifecycle is `relinkra cbm setup`,
+The 0.1.3 changes described here are in the release-preparation candidate and
+are not a claim that 0.1.3 has been published. The CBM lifecycle is `relinkra cbm setup`,
 `relinkra cbm index`, `relinkra cbm status`, and `relinkra cbm refresh`; stale
 registration guidance uses the real route `relinkra cbm index`.
 
 ## Platform and release truth
 
-- Version **0.1.2** is the public PyPI release.
+- Version **0.1.3** is the release-preparation candidate; 0.1.2 remains the
+  last public PyPI release until publication.
 - Windows is certified for the product. Linux and macOS have CI coverage, but
   exact-SHA/product certification language remains limited to the evidence
   available for each platform.

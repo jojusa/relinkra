@@ -6,10 +6,11 @@ evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.2 public release.** Windows is currently certified. Linux/macOS
+> **Status: 0.1.3 release-preparation candidate; not yet published.** Windows
+> is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
-> defect. Public 0.1.2 policy carries those external results as visible
+> defect. The last-public-release policy carries those external results as visible
 > `PARTIAL` debt, together with broader CBM and host/ZCode certification, but
 > never accepts `BLOCKED` or a missing deterministic product gate.
 >
@@ -32,7 +33,7 @@ R5D.
 
 R5B delivered release *verification*: local test tooling, an artifact content
 contract, an evidence-driven gate model, and three GitHub workflows. This
-document now records the public 0.1.2 evidence boundary; it is not a
+document now records the prior public 0.1.2 evidence boundary; it is not a
 publication command and does not authorize a republish. The public install
 command is `pip install relinkra`; local validation uses retained artifacts or
 a maintainer source checkout. Specified external certification debt may remain
@@ -45,16 +46,17 @@ source commit:
 
 `8afd3245347dea9cda93176384421d33fdfd69b3`
 
-The later documentation-only closure commit is not the package-build source.
-Do not rebuild or republish 0.1.2 for this documentation closure. For a future
-release, maintainers build and inspect artifacts, then retain the exact
-release-HEAD report and its digests as external evidence:
+The 0.1.2 artifact record is historical and is not the package-build source
+for this 0.1.3 candidate. Do not rebuild or republish 0.1.2. For the 0.1.3
+release-preparation candidate, after release authorization, maintainers build
+and inspect artifacts, then retain the exact release-HEAD report and its
+digests as external evidence:
 
 ```bash
 python -m build
 python tools/artifact_checks.py \
-  dist/relinkra-0.1.2-py3-none-any.whl dist/relinkra-0.1.2.tar.gz
-cd dist && sha256sum relinkra-0.1.2-py3-none-any.whl relinkra-0.1.2.tar.gz
+  dist/relinkra-0.1.3-py3-none-any.whl dist/relinkra-0.1.3.tar.gz
+cd dist && sha256sum relinkra-0.1.3-py3-none-any.whl relinkra-0.1.3.tar.gz
 ```
 
 The provenance boundary is the artifact SHA-256 plus the exact release Git
@@ -340,7 +342,7 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 python -m build
 python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
 # explicit paths — PowerShell does not expand the glob:
-# python tools/artifact_checks.py dist/relinkra-0.1.2-py3-none-any.whl dist/relinkra-0.1.2.tar.gz
+# python tools/artifact_checks.py dist/relinkra-0.1.3-py3-none-any.whl dist/relinkra-0.1.3.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -356,14 +358,14 @@ python tools/release_check.py --evidence external.json --require rc
 # retain and supply their CLI/MCP results under the external `installed` key.
 # release_check does not collect installed CLI/MCP evidence.
 # bash:
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.2-py3-none-any.whl \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.3-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.2.tar.gz \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.3.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 # PowerShell equivalents:
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.2-py3-none-any.whl"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.3-py3-none-any.whl"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.2.tar.gz"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.3.tar.gz"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
@@ -371,7 +373,7 @@ Without `RELINKRA_E2E_ARTIFACT`, the E2E suites build their own artifact
 (with network) inside their venv sandbox. With it, they install exactly
 the given wheel or sdist — which is how CI proves the shipped artifact,
 never a rebuild. For a future release, run both exact-artifact journeys before
-publication; for 0.1.2, the published artifacts are already bound to the
+publication; the last-published 0.1.2 artifacts are already bound to the
 provenance above. Retain their results in the external evidence mapping; they
 are the required
 input for the `INSTALLED_CLI_MCP` gate, not a hidden PASS in the report.
@@ -407,7 +409,7 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- Version 0.1.2, single-sourced in `relinkra/__init__.py`
+- Version 0.1.3, single-sourced in `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by
   `tests/test_packaging.py`.
@@ -415,7 +417,7 @@ RC realism rehearsal, not a release.
   **patch** bumps are fixes only.
 - The bump happens **only** in a dedicated release commit by the
   maintainer — never mixed into feature work.
-- RC naming is `0.1.2rcN`, only if and when tagging is approved. R5B
+- RC naming is `0.1.3rcN`, only if and when tagging is approved. R5B
   does not tag.
 
 ## Legal and NOTICE readiness
@@ -494,4 +496,4 @@ The maintainer owns the release decision; the tooling computes it.
 - [ ] Rehearse with the Release Candidate Dry Run workflow; its report must
       keep pending external debt visible rather than relabeling it PASS.
 - [ ] Version bumps only in a dedicated release commit; RC names are
-      `0.1.2rcN`; R5B/R5C/R5D did not perform tagging or publication.
+      `0.1.3rcN`; R5B/R5C/R5D did not perform tagging or publication.
