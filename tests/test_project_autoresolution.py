@@ -168,8 +168,8 @@ class WorkspaceCase(unittest.TestCase):
 class PublicSurfaceTests(unittest.TestCase):
     """G/H — tool count and namespace hygiene stay frozen."""
 
-    def test_public_tool_count_is_eleven(self):
-        self.assertEqual(len(TOOLS), 11)
+    def test_public_tool_count_is_twelve(self):
+        self.assertEqual(len(TOOLS), 12)
 
     def test_no_tool_name_double_prefixes_the_server_namespace(self):
         for tool in TOOLS:

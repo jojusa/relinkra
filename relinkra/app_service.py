@@ -758,9 +758,17 @@ class RelinkraServices:
         memory_type: Optional[str] = None,
         workspace_id: Optional[str] = None,
         include_history: bool = False,
+        include_handoffs: bool = False,
         limit: int = 20,
     ) -> dict:
-        """Search shared project memory under the R1C scope policy."""
+        """Search shared project memory under the R1C scope policy.
+
+        Handoff mirror records are excluded by default so they do not
+        compete with canonical memories in normal retrieval —
+        ``handoff_get`` is authoritative for handoff state. They come
+        back when explicitly requested (``include_handoffs``) or when
+        the caller filters on ``memory_type="handoff"``.
+        """
         auto_workspace = not bool(project_id or self.config.default_project_id)
         project_id = self._resolve_project_id(project_id)
         workspace_id = self._resolve_workspace_id(
@@ -786,6 +794,9 @@ class RelinkraServices:
                 text=query,
                 memory_type=memory_type,
                 include_history=bool(include_history),
+                # An explicit handoff type filter IS a mirror request.
+                include_handoff_mirrors=bool(include_handoffs)
+                or memory_type == "handoff",
                 limit=limit,
             )
         except MemoryValidationError as exc:
@@ -797,6 +808,12 @@ class RelinkraServices:
         explained_memories = []
         for memory in result.memories:
             record = memory.to_dict()
+            # Mark mirror provenance in the presentation layer only:
+            # the stored record is untouched, so older clients that
+            # ignore the field see exactly the 0.1.3 shape.
+            record["source"] = (
+                "handoff_mirror" if memory.memory_type == "handoff" else "memory"
+            )
             record["explain"] = explain_record(
                 "memory",
                 {
@@ -819,6 +836,102 @@ class RelinkraServices:
                 "advisory_only": True,
                 "current_revision": freshness_context.current_revision,
             },
+        }
+
+    def memory_get(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        memory_id: str = "",
+    ) -> dict:
+        """Fetch exactly one memory by id — deterministic exact lookup.
+
+        Uses the policy layer's targeted id path (no fuzzy search
+        fallback). Visibility follows the same channel policy as
+        memory_search: the shared channel plus the caller's workspace
+        channel when one applies; ``agent_private`` records are never
+        reachable through this surface.
+        """
+        auto_workspace = not bool(project_id or self.config.default_project_id)
+        project_id = self._resolve_project_id(project_id)
+        workspace_id = self._resolve_workspace_id(
+            workspace_id, auto=auto_workspace
+        )
+        memory_id = str(memory_id or "").strip()
+        if not memory_id:
+            raise ServiceError(ERR_INVALID_INPUT, "memory_id is required")
+
+        diagnostics: Dict[str, Any] = {}
+        try:
+            memory = self.memories.get(
+                project_id=project_id,
+                memory_id=memory_id,
+                diagnostics=diagnostics,
+            )
+        except MemoryValidationError as exc:
+            raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
+        except MemoryError as exc:
+            raise ServiceError(ERR_UNAVAILABLE, str(exc)) from exc
+
+        freshness_context, relation_resolver = self._freshness_context(project_id)
+        explainability = {
+            "as_of": freshness_context.as_of,
+            "advisory_only": True,
+            "current_revision": freshness_context.current_revision,
+        }
+        not_found: Dict[str, Any] = {
+            "project_id": project_id,
+            "memory_id": memory_id,
+            "found": False,
+            "reason": "not_found",
+            "memory": None,
+            "explainability": explainability,
+        }
+        if memory is None:
+            if diagnostics.get("skipped_truncated"):
+                # The store page could not hand every record back whole
+                # (CLI-transport truncation). Absence stays the answer,
+                # but the caller must be able to tell clean absence from
+                # a read the transport cut off.
+                not_found["warning"] = (
+                    "the store page included unreadable (truncated) "
+                    "records; the requested id may be among them"
+                )
+                not_found["skipped_truncated"] = diagnostics["skipped_truncated"]
+            return not_found
+
+        # Channel visibility mirrors memory_search: a record outside the
+        # caller's channels (agent_private, another workspace) is policy-
+        # invisible, which on this surface is not_found.
+        scope = "workspace_local" if workspace_id else "project_shared"
+        try:
+            channels = self.memories.visible_channels(scope, workspace_id)
+        except MemoryValidationError as exc:
+            raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
+        if memory.scope_channel not in channels:
+            return not_found
+
+        record = memory.to_dict()
+        record["source"] = (
+            "handoff_mirror" if memory.memory_type == "handoff" else "memory"
+        )
+        record["explain"] = explain_record(
+            "memory",
+            {
+                "timestamp": record.get("timestamp"),
+                "commit_sha": record.get("commit_sha"),
+                "project_id": record.get("project_id"),
+            },
+            context=freshness_context,
+            relation_resolver=relation_resolver,
+        )
+        return {
+            "project_id": project_id,
+            "memory_id": memory_id,
+            "found": True,
+            "memory": record,
+            "explainability": explainability,
         }
 
     def memory_save(
@@ -989,6 +1102,7 @@ class RelinkraServices:
         direction: str = "both",
         max_hops: int = 2,
         limit: int = 20,
+        include_tests: bool = False,
     ) -> dict:
         """Return high-level callers/dependencies for one resolved symbol."""
         auto_workspace = not bool(project_id or self.config.default_project_id)
@@ -1016,6 +1130,10 @@ class RelinkraServices:
             raise ServiceError(
                 ERR_INVALID_INPUT,
                 f"limit must be between 1 and {TRACE_MAX_LIMIT}",
+            )
+        if not isinstance(include_tests, bool):
+            raise ServiceError(
+                ERR_INVALID_INPUT, "include_tests must be a boolean"
             )
 
         linkage = LinkageService(self.memories, self.cbm_adapter)
@@ -1050,6 +1168,7 @@ class RelinkraServices:
             direction=direction,
             max_hops=max_hops,
             limit=limit,
+            include_tests=bool(include_tests),
         )
         return self._structural_response(
             project_id, result, "bounded_path", "relationships"

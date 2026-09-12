@@ -45,6 +45,11 @@ STORE_PAGE_LIMIT = 200
 PROJECT_ID_RE = re.compile(r"^rlk_[0-9a-f]{32}$")
 WORKSPACE_ID_RE = re.compile(r"^ws_[0-9a-f]{32}$")
 
+# memory_id is ``mem_`` + secrets.token_hex(8), i.e. 16 hex characters —
+# NOT the 32 used by ref_/pkt_/hof_ ids. The upper bound leaves room for
+# the generator to widen without invalidating stored handoffs.
+MEMORY_ID_RE = re.compile(r"^mem_[0-9a-f]{16,64}$")
+
 MEMORY_TYPES = (
     "decision",
     "discovery",
@@ -691,6 +696,7 @@ class MemoryService:
         text: Optional[str] = None,
         memory_type: Optional[str] = None,
         include_history: bool = False,
+        include_handoff_mirrors: bool = True,
         limit: int = 50,
     ) -> QueryResult:
         """Scope-policy query. project_id is mandatory — no cross-project
@@ -699,6 +705,20 @@ class MemoryService:
         - project_shared  -> only the shared channel
         - workspace_local -> shared channel + that workspace's channel
         - agent_private   -> ONLY the requested agent_type's channel
+
+        Results are a deterministic total order for identical inputs:
+        ascending ``(timestamp, memory_id)`` — the id breaks timestamp
+        ties — sliced to the newest ``limit`` records after lifecycle
+        filtering. The store is asked for ONE fixed page of at most
+        ``STORE_PAGE_LIMIT`` matches; when a project holds more matches
+        than that, page membership is the store's newest-first window
+        and this layer re-sorts whatever the page contains.
+
+        ``include_handoff_mirrors=False`` hides handoff-type mirror
+        records from the result (handoff state is authoritative through
+        the handoff service, which queries this layer with the mirror
+        included). Literal flag: ``False`` combined with
+        ``memory_type="handoff"`` yields an empty result.
         """
         project_id = validate_project_id(project_id)
         scope = normalize_scope(scope)
@@ -729,6 +749,8 @@ class MemoryService:
         if memory_type:
             storage_type_for(memory_type)
             visible = [m for m in visible if m.memory_type == memory_type]
+        if not include_handoff_mirrors:
+            visible = [m for m in visible if m.memory_type != "handoff"]
         visible.sort(key=lambda m: (m.timestamp, m.memory_id))
         visible = self._apply_lifecycle(visible, include_history)
         if not include_history:
@@ -740,10 +762,73 @@ class MemoryService:
         )
 
     def get(
-        self, *, project_id: str, memory_id: str
+        self,
+        *,
+        project_id: str,
+        memory_id: str,
+        diagnostics: Optional[dict] = None,
     ) -> Optional[Memory]:
+        """Exact lookup by memory_id within one project. No fuzzy fallback.
+
+        The id is queried against the store directly first: the stored
+        envelope always contains the id, so a targeted search reaches the
+        record without depending on the record being inside the match-all
+        page window — a busy project pushes older records out of that
+        fixed page, which would report a false ``not_found``. The
+        standard match-all page runs as a fallback for stores whose
+        search tokenization does not surface the raw id (and for ids
+        outside the canonical ``mem_`` shape). Only an exact id match is
+        ever returned; lifecycle status does not hide a record here
+        (superseded history stays addressable); cross-project records
+        are dropped by policy.
+
+        When ``diagnostics`` is a dict it is filled with honest skip
+        counters so a caller can tell clean absence from a page the
+        transport could not read whole.
+        """
         project_id = validate_project_id(project_id)
-        return self._find_by_id(project_id, memory_id)
+        memory_id = (memory_id or "").strip()
+        if diagnostics is not None:
+            diagnostics.clear()
+        if not memory_id:
+            return None
+        queries = []
+        if MEMORY_ID_RE.match(memory_id):
+            queries.append(memory_id)
+        queries.append(ENVELOPE_VERSION)
+        found: Optional[Memory] = None
+        skipped_truncated = 0
+        skipped_malformed = 0
+        for query in queries:
+            records = self.store.search_records(
+                query=query, project=project_id, limit=STORE_PAGE_LIMIT
+            )
+            memories, malformed, truncated = self._parse_envelopes(
+                records, project_id
+            )
+            skipped_malformed += malformed
+            skipped_truncated += truncated
+            for memory in memories:
+                if memory.memory_id == memory_id:
+                    found = memory
+                    break
+            if found is not None:
+                break
+        if diagnostics is not None:
+            diagnostics["skipped_malformed"] = skipped_malformed
+            diagnostics["skipped_truncated"] = skipped_truncated
+        return found
+
+    def visible_channels(
+        self,
+        scope: str,
+        workspace_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+    ) -> set:
+        """Scope-policy channel visibility for one query context."""
+        return self._visible_channels(
+            normalize_scope(scope), workspace_id, agent_type
+        )
 
     # -- internals --------------------------------------------------------
 
@@ -868,7 +953,7 @@ class MemoryService:
         return max(active, key=lambda m: (m.timestamp, m.memory_id))
 
     def _find_by_id(self, project_id: str, memory_id: str) -> Optional[Memory]:
-        for m in self._search_project(project_id, ENVELOPE_VERSION):
-            if m.memory_id == memory_id:
-                return m
-        return None
+        # Same exact lookup as get(): the targeted id query keeps
+        # supersede targets reachable on projects larger than one store
+        # page, where a match-all scan would report a false unknown id.
+        return self.get(project_id=project_id, memory_id=memory_id)

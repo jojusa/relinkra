@@ -367,6 +367,24 @@ def _close_all_loopbacks() -> None:
 atexit.register(_close_all_loopbacks)
 
 
+def _deterministic_newest_first(
+    records: List[StoredRecord],
+) -> List[StoredRecord]:
+    """Order a store page deterministically, newest first.
+
+    The backend's result order is incidental: FTS ranking for HTTP
+    reads, output order for CLI reads. The MemoryStore protocol promises
+    newest-first pages, so the adapter enforces that contract itself
+    instead of trusting the read tier — sorting by (timestamp,
+    record_id) makes identical inputs produce identical page order and
+    keeps the page cut deterministic regardless of which tier served
+    the read.
+    """
+    return sorted(
+        records, key=lambda r: (r.timestamp, r.record_id), reverse=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # Engram CLI adapter
 # ---------------------------------------------------------------------------
@@ -522,13 +540,18 @@ class EngramCLIAdapter:
         output = self._run(args)
         if "No memories found" in output:
             return []
-        return parse_search_output(output)
+        # The CLI backend already applied its own limit to its own
+        # (incidental) ordering; re-ordering the parsed page is the only
+        # deterministic part left in Relinkra's hands.
+        return _deterministic_newest_first(parse_search_output(output))
 
     @staticmethod
     def _filtered(
         records: List[StoredRecord], storage_type: Optional[str], limit: int
     ) -> List[StoredRecord]:
-        """Client-side type filter + page cut for full-content reads."""
+        """Deterministic page cut for full-content reads: newest-first
+        order first, then the type filter, then the limit cut."""
+        records = _deterministic_newest_first(records)
         if storage_type:
             records = [r for r in records if r.storage_type == storage_type]
         return records[:limit]

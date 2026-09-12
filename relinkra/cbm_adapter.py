@@ -635,6 +635,7 @@ class CBMCLIAdapter:
         direction: str = "both",
         max_hops: int = TRACE_DEFAULT_DEPTH,
         limit: int = TRACE_DEFAULT_LIMIT,
+        include_tests: bool = False,
     ) -> dict:
         """Return bounded caller/dependency relationships from ``trace_path``.
 
@@ -642,7 +643,10 @@ class CBMCLIAdapter:
         contain only ``name``, ``qualified_name`` and ``hop`` for call traces.
         The adapter strips the path-derived slug, sorts deterministically,
         caps the result, and states explicitly that an empty graph result is
-        not proof of absence.
+        not proof of absence. Test-code relationships are excluded from the
+        graph by default (``--include-tests false``); ``include_tests``
+        lifts that boundary for inbound questions whose callers live in
+        test files.
         """
         slug = self._project(project)
         function_name = str(function_name or "").strip()
@@ -653,6 +657,8 @@ class CBMCLIAdapter:
             raise CBMAdapterError(
                 "trace direction must be inbound, outbound, or both"
             )
+        if not isinstance(include_tests, bool):
+            raise CBMAdapterError("include_tests must be a boolean")
         max_hops = self._bounded_limit(
             max_hops, TRACE_MAX_DEPTH, "max_hops", minimum=1
         )
@@ -663,7 +669,7 @@ class CBMCLIAdapter:
             "--direction", direction,
             "--depth", str(max_hops),
             "--mode", "calls",
-            "--include-tests", "false",
+            "--include-tests", "true" if include_tests else "false",
         ]
         payload = self._run_or_classify("trace_path", flags)
         if not isinstance(payload, dict):
@@ -706,6 +712,13 @@ class CBMCLIAdapter:
         )
         truncated = len(relationships) > limit
         relationships = relationships[:limit]
+        tests_note = (
+            "Test-code relationships are included."
+            if include_tests
+            else "Test-code relationships are excluded by default; a "
+            "caller living in a test file is invisible until "
+            "include_tests is set."
+        )
         result = {
             "target": self._bounded_text(
                 strip_project_slug(target, slug), TRACE_MAX_FIELD_CHARS
@@ -719,12 +732,17 @@ class CBMCLIAdapter:
                 "returned": len(relationships),
                 "requested_limit": limit,
                 "requested_depth": max_hops,
+                "include_tests": include_tests,
                 "qualification": (
                     "No relationships were found in the current indexed "
-                    "graph; this does not prove that none exist."
+                    "graph; this does not prove that none exist. "
+                    + tests_note
+                    + " Verify important claims against current source."
                     if not relationships
-                    else "The bounded graph result may be incomplete; "
-                    "native file and symbol exploration remains available."
+                    else "The bounded graph result may be incomplete. "
+                    + tests_note
+                    + " Native file and symbol exploration remains "
+                    "available."
                 ),
             },
         }

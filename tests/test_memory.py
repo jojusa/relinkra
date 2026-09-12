@@ -8,6 +8,8 @@ import unittest
 from relinkra.engram_adapter import InMemoryStore, StoredRecord
 from relinkra.memory import (
     ENVELOPE_VERSION,
+    MEMORY_ID_RE,
+    STORE_PAGE_LIMIT,
     Memory,
     MemoryNotFoundError,
     MemoryService,
@@ -660,6 +662,344 @@ class TestMalformedStoredEnvelopes(unittest.TestCase):
         result = service.query(project_id=PID_A, scope="project_shared")
         self.assertEqual([m.title for m in result.memories], ["Good"])
         self.assertEqual(result.skipped_malformed, 2)
+
+
+class TestMemoryGet(unittest.TestCase):
+    """R6B: exact-id lookup is deterministic and window-independent."""
+
+    def test_exact_id_returns_the_exact_record(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service, title="Alpha", body="alpha body")
+        fetched = service.get(project_id=PID_A, memory_id=memory.memory_id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.to_dict(), memory.to_dict())
+
+    def test_same_id_is_deterministic(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service)
+        first = service.get(
+            project_id=PID_A, memory_id=memory.memory_id
+        ).to_dict()
+        second = service.get(
+            project_id=PID_A, memory_id=memory.memory_id
+        ).to_dict()
+        self.assertEqual(first, second)
+
+    def test_wrong_id_is_not_found(self):
+        service, _ = make_service()
+        save_shared(service)
+        self.assertIsNone(
+            service.get(project_id=PID_A, memory_id="mem_" + "9" * 16)
+        )
+
+    def test_blank_id_skips_the_store_entirely(self):
+        class CountingStore(InMemoryStore):
+            def __init__(self):
+                super().__init__()
+                self.searches = 0
+
+            def search_records(self, **kwargs):
+                self.searches += 1
+                return super().search_records(**kwargs)
+
+        store = CountingStore()
+        service, _ = make_service(store)
+        save_shared(service)
+        store.searches = 0  # save-time lookups do not count for get()
+        self.assertIsNone(service.get(project_id=PID_A, memory_id="   "))
+        self.assertEqual(store.searches, 0)
+
+    def test_canonical_ids_use_the_targeted_query_first(self):
+        class CountingStore(InMemoryStore):
+            def __init__(self):
+                super().__init__()
+                self.queries = []
+
+            def search_records(self, *, query, **kwargs):
+                self.queries.append(query)
+                return super().search_records(query=query, **kwargs)
+
+        store = CountingStore()
+        service, _ = make_service(store)
+        memory, _, _ = save_shared(service)
+        store.queries.clear()  # save-time lookups do not count for get()
+        service.get(project_id=PID_A, memory_id=memory.memory_id)
+        self.assertEqual(store.queries[0], memory.memory_id)
+
+    def test_non_canonical_ids_still_fall_back_to_the_scan(self):
+        service, store = make_service()
+        memory, _, _ = save_shared(service)
+        data = json.loads(memory.envelope_json())
+        data["memory_id"] = "legacy-id-1"
+        store.save_record(
+            title="legacy",
+            content=json.dumps(data),
+            storage_type="manual",
+            project=PID_A,
+            scope="project",
+            topic_key="",
+        )
+        fetched = service.get(project_id=PID_A, memory_id="legacy-id-1")
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.memory_id, "legacy-id-1")
+
+    def test_reaches_records_outside_the_match_all_page_window(self):
+        """The R6B dogfood failure: a record the fixed match-all page
+        cannot carry was unreachable. The targeted id query fixes it."""
+        tick = {"n": 0}
+
+        def clock():
+            tick["n"] += 1
+            n = tick["n"]
+            return (
+                f"2026-01-01T{n // 3600:02d}:"
+                f"{(n // 60) % 60:02d}:{n % 60:02d}+00:00"
+            )
+
+        ids = {"n": 0}
+
+        def id_gen():
+            ids["n"] += 1
+            return f"mem_{ids['n']:016x}"
+
+        service = MemoryService(
+            InMemoryStore(), clock=clock, id_generator=id_gen
+        )
+        oldest, _, _ = save_shared(
+            service, title="Oldest target", body="window target"
+        )
+        for i in range(STORE_PAGE_LIMIT + 20):
+            save_shared(service, title=f"Filler {i}", body=f"filler body {i}")
+
+        visible_ids = [
+            m.memory_id
+            for m in service.query(project_id=PID_A, limit=250).memories
+        ]
+        self.assertNotIn(
+            oldest.memory_id, visible_ids, "fixture must overflow the page"
+        )
+        fetched = service.get(project_id=PID_A, memory_id=oldest.memory_id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.memory_id, oldest.memory_id)
+
+    def test_identical_ids_in_two_projects_stay_isolated(self):
+        service, store = make_service()
+        memory, _, _ = save_shared(service)
+        data = json.loads(memory.envelope_json())
+        data["project_id"] = PID_B
+        store.save_record(
+            title="twin",
+            content=json.dumps(data),
+            storage_type="manual",
+            project=PID_B,
+            scope="project",
+            topic_key="",
+        )
+        own = service.get(project_id=PID_A, memory_id=memory.memory_id)
+        twin = service.get(project_id=PID_B, memory_id=memory.memory_id)
+        self.assertEqual(own.project_id, PID_A)
+        self.assertEqual(twin.project_id, PID_B)
+
+    def test_superseded_history_stays_addressable(self):
+        service, _ = make_service()
+        first, _, _ = save_shared(service, title="Eviction", body="LRU")
+        save_shared(service, title="Eviction", body="FIFO")
+        # History is append-only: the old envelope keeps its stored
+        # status, and the exact lookup must still reach the OLD record
+        # (the superseded one), not its replacement.
+        fetched = service.get(project_id=PID_A, memory_id=first.memory_id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.body, "LRU")
+        self.assertNotEqual(
+            fetched.memory_id,
+            service.query(project_id=PID_A, limit=10).memories[0].memory_id,
+        )
+
+    def test_diagnostics_count_an_unreadable_page(self):
+        target_id = "mem_" + "ab" * 8
+        store = InMemoryStore()
+        # Matches the targeted id query, but the transport cut it off:
+        # invalid JSON that ends with the CLI truncation marker. The
+        # truncated flag is a transport property, so the record is
+        # appended raw (save_record never sets it).
+        store._records.append(
+            StoredRecord(
+                record_id="1",
+                storage_type="manual",
+                title="cut",
+                content='{"v":"rlkmem1","memory_id":"'
+                + target_id
+                + '","body":"cut...',
+                project=PID_A,
+                scope="project",
+                timestamp="2026-01-01 00:00:01",
+                truncated=True,
+            )
+        )
+        service = MemoryService(store)
+        diagnostics: dict = {}
+        fetched = service.get(
+            project_id=PID_A, memory_id=target_id, diagnostics=diagnostics
+        )
+        self.assertIsNone(fetched)
+        # Both the targeted page and the match-all fallback hit the same
+        # unreadable record, and neither could parse it.
+        self.assertEqual(diagnostics["skipped_truncated"], 2)
+        self.assertEqual(diagnostics["skipped_malformed"], 0)
+
+    def test_diagnostics_stay_clean_on_a_found_record(self):
+        service, _ = make_service()
+        memory, _, _ = save_shared(service)
+        diagnostics: dict = {}
+        fetched = service.get(
+            project_id=PID_A, memory_id=memory.memory_id, diagnostics=diagnostics
+        )
+        self.assertIsNotNone(fetched)
+        self.assertEqual(diagnostics["skipped_truncated"], 0)
+        self.assertEqual(diagnostics["skipped_malformed"], 0)
+
+    def test_memory_id_shape_is_canonical(self):
+        self.assertTrue(MEMORY_ID_RE.match("mem_" + "ab" * 8))
+        self.assertFalse(MEMORY_ID_RE.match("mem_short"))
+        self.assertFalse(MEMORY_ID_RE.match("rlk_" + "ab" * 16))
+
+
+class TestQueryDeterminism(unittest.TestCase):
+    """Same store + same query + same arguments -> same ordered result."""
+
+    def test_repeated_queries_return_the_identical_order(self):
+        service, _ = make_service()
+        for i in range(8):
+            save_shared(service, title=f"D{i}", body="determinism filler")
+        first = [
+            m.memory_id
+            for m in service.query(project_id=PID_A, limit=50).memories
+        ]
+        second = [
+            m.memory_id
+            for m in service.query(project_id=PID_A, limit=50).memories
+        ]
+        self.assertEqual(first, second)
+
+    def test_timestamp_ties_break_on_memory_id(self):
+        service = MemoryService(
+            InMemoryStore(), clock=lambda: "2026-01-01T00:00:00+00:00"
+        )
+        for i in range(5):
+            save_shared(service, title=f"T{i}", body="tie filler")
+        ids = [m.memory_id for m in service.query(project_id=PID_A).memories]
+        self.assertEqual(ids, sorted(ids))
+
+    def test_ordering_is_oldest_first_and_limit_keeps_the_newest(self):
+        service, _ = make_service()
+        saved = []
+        for i in range(5):
+            memory, _, _ = save_shared(
+                service, title=f"L{i}", body="limit filler"
+            )
+            saved.append(memory)
+        result = service.query(project_id=PID_A, limit=2)
+        self.assertEqual(
+            [m.memory_id for m in result.memories],
+            [saved[3].memory_id, saved[4].memory_id],
+        )
+
+    def test_insertion_order_does_not_decide_result_order(self):
+        """Timestamps decide order, never the store's arrival order."""
+        frozen = "2026-01-01T00:00:00+00:00"
+        ids = {"n": 0}
+
+        def id_gen():
+            ids["n"] += 1
+            return f"mem_{ids['n']:016x}"
+
+        first = MemoryService(
+            InMemoryStore(), clock=lambda: frozen, id_generator=id_gen
+        )
+        for i in range(5):
+            save_shared(first, title=f"O{i}", body="order filler")
+        # A second store receiving the SAME records in REVERSE order
+        # must yield the same ordered result set.
+        second = MemoryService(
+            InMemoryStore(), clock=lambda: frozen, id_generator=id_gen
+        )
+        for memory in reversed(
+            first.query(
+                project_id=PID_A, include_history=True, limit=100
+            ).memories
+        ):
+            second.store.save_record(
+                title=memory.title,
+                content=memory.envelope_json(),
+                storage_type=storage_type_for(memory.memory_type),
+                project=PID_A,
+                scope="project",
+                topic_key=memory.topic_key,
+            )
+        a = [m.memory_id for m in first.query(project_id=PID_A, limit=50).memories]
+        b = [m.memory_id for m in second.query(project_id=PID_A, limit=50).memories]
+        self.assertEqual(a, b)
+
+
+class TestHandoffMirrorRetrieval(unittest.TestCase):
+    """Handoff mirrors stay addressable but stop competing by default.
+
+    The MCP layer excludes handoff-type mirrors from normal memory_search
+    (handoff_get is authoritative); the service default stays inclusive
+    so internal callers (handoff listing, context packets) are unchanged.
+    Storage and ids are untouched: the mirror is retrievable by exact id.
+    """
+
+    def setUp(self):
+        self.service, _ = make_service()
+
+    def _mirror(self, hex_slice="ab12cd34ef56"):
+        return self.service.save(
+            project_id=PID_A,
+            memory_type="handoff",
+            title=f"handoff {hex_slice} probe",
+            body=f'{{"v":"rlkho1","task":"probe {hex_slice}"}}',
+            repository_identity=REPO,
+            scope="project_shared",
+        )[0]
+
+    def test_default_query_keeps_mirrors_for_internal_callers(self):
+        decision, _, _ = save_shared(self.service, title="D", body="d")
+        mirror = self._mirror()
+        result = self.service.query(project_id=PID_A, limit=10)
+        ids = [m.memory_id for m in result.memories]
+        self.assertIn(decision.memory_id, ids)
+        self.assertIn(mirror.memory_id, ids)
+
+    def test_opt_out_hides_only_the_mirror(self):
+        decision, _, _ = save_shared(self.service, title="D", body="d")
+        mirror = self._mirror()
+        result = self.service.query(
+            project_id=PID_A, limit=10, include_handoff_mirrors=False
+        )
+        ids = [m.memory_id for m in result.memories]
+        self.assertIn(decision.memory_id, ids)
+        self.assertNotIn(mirror.memory_id, ids)
+
+    def test_mirror_remains_retrievable_by_exact_id(self):
+        mirror = self._mirror()
+        fetched = self.service.get(
+            project_id=PID_A, memory_id=mirror.memory_id
+        )
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.memory_type, "handoff")
+        self.assertIn("rlkho1", fetched.body)
+
+    def test_visible_channels_is_the_public_scope_policy(self):
+        self.assertEqual(
+            self.service.visible_channels("project_shared"), {"shared"}
+        )
+        self.assertEqual(
+            self.service.visible_channels("workspace_local", WID_1),
+            {"shared", scope_channel_for("workspace_local", WID_1)},
+        )
+        with self.assertRaises(MemoryValidationError):
+            self.service.visible_channels("workspace_local")
 
 
 if __name__ == "__main__":

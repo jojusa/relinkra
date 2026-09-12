@@ -62,7 +62,7 @@ Implemented methods:
 | `initialize` | Negotiates the protocol version and reports `serverInfo` (incl. `contractVersion`) |
 | `notifications/initialized` | Accepted, no response (JSON-RPC notification) |
 | `ping` | Liveness, returns `{}` |
-| `tools/list` | The eleven tools with their JSON Schemas |
+| `tools/list` | The twelve tools with their JSON Schemas |
 | `tools/call` | Dispatch to one application service |
 
 Protocol versions supported: `2024-11-05`, `2025-03-26`, `2025-06-18`.
@@ -108,7 +108,8 @@ wire name repeats the server namespace.
 |-----------|--------------|---------|
 | `project_resolve` | `relinkra.project.resolve` | Resolve logical project identity + active workspace |
 | `context_get` | `relinkra.context.get` | One deterministic Project Context Packet |
-| `memory_search` | `relinkra.memory.search` | Search shared project memory |
+| `memory_search` | `relinkra.memory.search` | Search shared project memory (deterministic order; handoff mirrors excluded by default) |
+| `memory_get` | `relinkra.memory.get` | Fetch exactly one memory by id (deterministic exact lookup) |
 | `memory_save` | `relinkra.memory.save` | Save a memory under R1C policy |
 | `code_resolve` | `relinkra.code.resolve` | Resolve file/symbol → portable code reference |
 | `code_architecture` | `relinkra.code.architecture` | Return compact advisory architecture orientation |

@@ -34,6 +34,7 @@ EXPECTED_MCP_TOOLS = {
     "project_resolve",
     "context_get",
     "memory_search",
+    "memory_get",
     "memory_save",
     "code_resolve",
     "code_architecture",

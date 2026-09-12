@@ -595,6 +595,83 @@ class TestAccountingOffline(unittest.TestCase):
         self.assertEqual(packet.diagnostics["skipped_truncated"], 1)
 
 
+class TestAdapterPageOrder(unittest.TestCase):
+    """R6B: the adapter enforces the newest-first page contract itself.
+
+    Backend result order is incidental (FTS ranking for HTTP reads,
+    output order for CLI reads); identical inputs must produce an
+    identical page order regardless of which tier served the read.
+    """
+
+    NEWER = StoredRecord(
+        record_id="2",
+        storage_type="manual",
+        title="newer",
+        content="c",
+        project="rlk_" + "b0c0ffee" * 4,
+        scope="project",
+        timestamp="2026-08-26 00:00:02",
+    )
+    OLDER = StoredRecord(
+        record_id="1",
+        storage_type="manual",
+        title="older",
+        content="c",
+        project="rlk_" + "b0c0ffee" * 4,
+        scope="project",
+        timestamp="2026-08-26 00:00:01",
+    )
+
+    def test_cli_page_is_reordered_newest_first(self):
+        adapter = EngramCLIAdapter(engram_bin="engram", http_url="")
+        out_of_order = "".join(
+            [
+                "[1] #1 (manual) — older\n",
+                f"    {self.OLDER.content}\n",
+                "    2026-08-26 00:00:01 | project: p | scope: project\n",
+                "[2] #2 (manual) — newer\n",
+                f"    {self.NEWER.content}\n",
+                "    2026-08-26 00:00:02 | project: p | scope: project\n",
+            ]
+        )
+        with mock.patch.object(adapter, "_run", return_value=out_of_order):
+            records = adapter.search_records(query="c", limit=10)
+        self.assertEqual(
+            [r.timestamp for r in records],
+            sorted((r.timestamp for r in records), reverse=True),
+        )
+        self.assertEqual([r.title for r in records], ["newer", "older"])
+
+    def test_http_page_cut_is_newest_first(self):
+        page = EngramCLIAdapter._filtered(
+            [self.OLDER, self.NEWER], storage_type=None, limit=10
+        )
+        self.assertEqual([r.record_id for r in page], ["2", "1"])
+        # A tie on timestamp still breaks deterministically on record id.
+        twin_a = StoredRecord(
+            record_id="a",
+            storage_type="manual",
+            title="twin-a",
+            content="c",
+            project=self.OLDER.project,
+            scope="project",
+            timestamp=self.NEWER.timestamp,
+        )
+        twin_b = StoredRecord(
+            record_id="b",
+            storage_type="manual",
+            title="twin-b",
+            content="c",
+            project=self.OLDER.project,
+            scope="project",
+            timestamp=self.NEWER.timestamp,
+        )
+        page = EngramCLIAdapter._filtered(
+            [twin_a, twin_b], storage_type=None, limit=10
+        )
+        self.assertEqual([r.record_id for r in page], ["b", "a"])
+
+
 class _NeverSpawnCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -160,10 +160,14 @@ TOOLS: List[dict] = [
         "read_only": True,
         "description": (
             "Search shared project memory for prior decisions, constraints, "
-            "discoveries, bugs, pending work, and handoffs. Use when "
-            "previous findings, earlier session conclusions, or existing "
-            "project knowledge may affect the current task. Agent-private "
-            "memory is never returned through this surface."
+            "discoveries, bugs, and pending work. Use when previous "
+            "findings, earlier session conclusions, or existing project "
+            "knowledge may affect the current task. Results are "
+            "deterministically ordered (oldest first, memory_id "
+            "tiebreak). Handoff mirror records are excluded by default — "
+            "handoff_get is authoritative for handoffs; pass "
+            "include_handoffs or filter memory_type=handoff to see them. "
+            "Agent-private memory is never returned through this surface."
         ),
         "inputSchema": {
             "type": "object",
@@ -189,6 +193,13 @@ TOOLS: List[dict] = [
                     "type": "boolean",
                     "description": "Include superseded records.",
                 },
+                "include_handoffs": {
+                    "type": "boolean",
+                    "description": (
+                        "Include handoff mirror records (default false; "
+                        "auto-included when memory_type is handoff)."
+                    ),
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Max results (1-100).",
@@ -196,6 +207,34 @@ TOOLS: List[dict] = [
                     "maximum": 100,
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memory_get",
+        "logical_name": "relinkra.memory.get",
+        "title": "Get one memory by id",
+        "read_only": True,
+        "description": (
+            "Fetch exactly one memory by its memory_id — deterministic "
+            "exact lookup, no fuzzy search fallback. Use to expand a "
+            "memory_id obtained from memory_search, a context packet, or "
+            "handoff related references. Returns found=false when no "
+            "matching record exists in the project (or it is outside the "
+            "caller's scope channels). Handoff mirror records are "
+            "retrievable here; handoff_get remains authoritative for "
+            "handoff workflow state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": _PROJECT_ID,
+                "workspace_id": _WORKSPACE_ID,
+                "memory_id": _string(
+                    "Exact memory id (mem_...). Required. No partial ids."
+                ),
+            },
+            "required": ["memory_id"],
             "additionalProperties": False,
         },
     },
@@ -305,7 +344,8 @@ TOOLS: List[dict] = [
             "analysis, or cross-module relationships around a change. "
             "Results may be incomplete or stale; an empty result is not a "
             "claim that no relationship exists — verify important claims "
-            "against current source."
+            "against current source. Test-code relationships are excluded "
+            "unless include_tests is set."
         ),
         "inputSchema": {
             "type": "object",
@@ -332,6 +372,14 @@ TOOLS: List[dict] = [
                     "description": "Maximum relationships (1-50; default 20).",
                     "minimum": 1,
                     "maximum": 50,
+                },
+                "include_tests": {
+                    "type": "boolean",
+                    "description": (
+                        "Include test-code relationships in the graph "
+                        "trace (default false: callers living in test "
+                        "files are invisible until this is set)."
+                    ),
                 },
             },
             "required": ["symbol"],
@@ -604,6 +652,7 @@ class MCPServer:
             "project_resolve": self.services.project_resolve,
             "context_get": self.services.context_get,
             "memory_search": self.services.memory_search,
+            "memory_get": self.services.memory_get,
             "memory_save": self.services.memory_save,
             "code_resolve": self.services.code_resolve,
             "code_architecture": self.services.code_architecture,

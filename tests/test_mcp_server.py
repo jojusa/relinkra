@@ -17,6 +17,7 @@ from pathlib import Path
 
 from relinkra.app_service import (
     CONTRACT_VERSION,
+    ERR_INVALID_INPUT,
     RelinkraServices,
     ServiceConfig,
 )
@@ -258,6 +259,7 @@ class SchemaTests(MCPTestCase):
                 "project_resolve",
                 "context_get",
                 "memory_search",
+                "memory_get",
                 "memory_save",
                 "code_resolve",
                 "code_architecture",
@@ -414,6 +416,7 @@ class ProtocolTests(MCPTestCase):
         by_name = {tool["name"]: tool for tool in TOOLS}
         read_only = {
             "project_resolve", "context_get", "memory_search",
+            "memory_get",
             "code_resolve", "code_architecture", "code_relationships",
             "git_context", "handoff_get", "health",
         }
@@ -1525,6 +1528,210 @@ class CrossAgentMCPTests(MCPTestCase):
         )
         self.assertNotIn(private.memory_id, json.dumps(fetched))
         self.assertNotIn("do-not-share", json.dumps(fetched))
+
+
+class MemoryRetrievalTests(MCPTestCase):
+    """memory_get + memory_search determinism and handoff-mirror policy.
+
+    R6B: exact-id lookup is deterministic and window-independent, and
+    handoff mirrors stop competing with canonical memories in normal
+    retrieval without any storage change.
+    """
+
+    def _decision(self):
+        return self.ok(
+            "memory_save",
+            memory_type="decision",
+            title="Token size probe",
+            body="canonical decision body for the probe",
+        )
+
+    def _handoff(self):
+        return self.ok(
+            "handoff_create",
+            source_agent="codex",
+            target_agent="next-agent",
+            task="KISOUMA duplicate payload probe",
+            summary="handoff body that must not double in retrieval",
+            include_git_state=False,
+        )["handoff"]
+
+    # -- memory_get -------------------------------------------------------
+
+    def test_memory_get_returns_the_exact_record(self):
+        saved = self._decision()
+        fetched = self.ok("memory_get", memory_id=saved["memory_id"])
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["memory_id"], saved["memory_id"])
+        self.assertEqual(fetched["memory"]["memory_id"], saved["memory_id"])
+        self.assertEqual(fetched["memory"]["memory_type"], "decision")
+        self.assertEqual(fetched["memory"]["title"], "Token size probe")
+        self.assertEqual(fetched["memory"]["body"], "canonical decision body for the probe")
+        self.assertEqual(fetched["memory"]["source"], "memory")
+        self.assertEqual(fetched["memory"]["project_id"], self.env.project_id)
+        self.assertIn("explain", fetched["memory"])
+
+    def test_memory_get_unknown_id_is_explicit_not_found(self):
+        payload = self.ok("memory_get", memory_id="mem_" + "0" * 16)
+        self.assertFalse(payload["found"])
+        self.assertEqual(payload["reason"], "not_found")
+        self.assertIsNone(payload["memory"])
+
+    def test_memory_get_rejects_an_empty_id(self):
+        error = self.err("memory_get", memory_id="   ")
+        self.assertEqual(error["code"], ERR_INVALID_INPUT)
+
+    def test_memory_get_is_deterministic_across_calls(self):
+        saved = self._decision()
+        first = json.dumps(
+            self.ok("memory_get", memory_id=saved["memory_id"]),
+            sort_keys=True,
+        )
+        second = json.dumps(
+            self.ok("memory_get", memory_id=saved["memory_id"]),
+            sort_keys=True,
+        )
+        self.assertEqual(first, second)
+
+    def test_memory_get_project_isolation(self):
+        saved = self._decision()
+        foreign = self._foreign_workspace()
+        payload = self.ok(
+            "memory_get",
+            project_id=foreign.project_id,
+            memory_id=saved["memory_id"],
+        )
+        self.assertFalse(payload["found"])
+        self.assertEqual(payload["reason"], "not_found")
+
+    def test_memory_get_hides_another_workspace_channel(self):
+        foreign_ws = "ws_" + "f" * 32
+        record = self.env.save(
+            memory_type="discovery",
+            title="workspace-local note",
+            body="walled off",
+            scope="workspace_local",
+            workspace_id=foreign_ws,
+        )
+        default_view = self.ok("memory_get", memory_id=record.memory_id)
+        self.assertFalse(default_view["found"])
+        self.assertEqual(default_view["reason"], "not_found")
+        scoped_view = self.ok(
+            "memory_get", memory_id=record.memory_id, workspace_id=foreign_ws
+        )
+        self.assertTrue(scoped_view["found"])
+        self.assertEqual(scoped_view["memory"]["body"], "walled off")
+
+    def test_memory_get_hides_agent_private_records(self):
+        private = self.env.save(
+            memory_type="discovery",
+            title="private scratchpad",
+            body="do-not-share",
+            scope="agent_private",
+            agent_type="claude",
+        )
+        payload = self.ok("memory_get", memory_id=private.memory_id)
+        self.assertFalse(payload["found"])
+        self.assertNotIn("do-not-share", json.dumps(payload))
+
+    def test_memory_get_surfaces_own_workspace_channel(self):
+        record = self.env.save(
+            memory_type="discovery",
+            title="own workspace note",
+            body="visible here",
+            scope="workspace_local",
+            workspace_id=self.env.workspace_id,
+        )
+        fetched = self.ok("memory_get", memory_id=record.memory_id)
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["memory"]["scope"], "workspace_local")
+
+    def test_memory_get_retrieves_superseded_history(self):
+        first = self.env.save(
+            memory_type="decision", title="Eviction order", body="LRU"
+        )
+        self.env.save(
+            memory_type="decision", title="Eviction order", body="FIFO"
+        )
+        # History is append-only (the stored status stays "active"), so
+        # the exact lookup proving itself means it reached the OLD body.
+        fetched = self.ok("memory_get", memory_id=first.memory_id)
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["memory"]["body"], "LRU")
+
+    def test_memory_get_marks_a_handoff_mirror(self):
+        handoff = self._handoff()
+        fetched = self.ok("memory_get", memory_id=handoff["memory_id"])
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["memory"]["memory_type"], "handoff")
+        self.assertEqual(fetched["memory"]["source"], "handoff_mirror")
+        self.assertIn("rlkho1", fetched["memory"]["body"])
+
+    # -- memory_search ordering + mirrors ---------------------------------
+
+    def test_memory_search_is_deterministically_ordered(self):
+        first = json.dumps(self.ok("memory_search", limit=100), sort_keys=True)
+        second = json.dumps(self.ok("memory_search", limit=100), sort_keys=True)
+        self.assertEqual(first, second)
+        payload = json.loads(first)
+        keys = [
+            (m["timestamp"], m["memory_id"]) for m in payload["memories"]
+        ]
+        self.assertEqual(keys, sorted(keys))
+        for memory in payload["memories"]:
+            self.assertIn(memory["source"], ("memory", "handoff_mirror"))
+
+    def test_normal_search_excludes_handoff_mirrors(self):
+        self._decision()
+        handoff = self._handoff()
+        found = self.ok("memory_search", query="probe")
+        self.assertEqual([m["source"] for m in found["memories"]], ["memory"])
+        self.assertNotIn("rlkho1", json.dumps(found))
+        # The mirror itself stays exactly retrievable by id.
+        fetched = self.ok("memory_get", memory_id=handoff["memory_id"])
+        self.assertTrue(fetched["found"])
+
+    def test_opt_in_search_includes_the_marked_mirror(self):
+        self._decision()
+        self._handoff()
+        found = self.ok("memory_search", query="probe", include_handoffs=True)
+        self.assertEqual(
+            sorted(m["source"] for m in found["memories"]),
+            ["handoff_mirror", "memory"],
+        )
+
+    def test_explicit_handoff_type_filter_includes_mirrors(self):
+        self._decision()
+        handoff = self._handoff()
+        found = self.ok("memory_search", memory_type="handoff")
+        # The seeded fixture also carries one handoff mirror; every
+        # returned record is a marked mirror.
+        self.assertGreaterEqual(found["count"], 2)
+        for memory in found["memories"]:
+            self.assertEqual(memory["source"], "handoff_mirror")
+        ids = [m["memory_id"] for m in found["memories"]]
+        self.assertIn(handoff["memory_id"], ids)
+
+    def test_normal_search_does_not_duplicate_the_handoff_payload(self):
+        """The R6B token-size regression: one handoff + one canonical
+        memory must not ship the handoff body twice in normal retrieval.
+
+        Measures serialized output size and duplicate-body count
+        deterministically; no quantitative product claim is derived
+        from this test.
+        """
+        self._decision()
+        handoff = self._handoff()
+        normal = self.ok("memory_search", query="probe")
+        expanded = self.ok("memory_search", query="probe", include_handoffs=True)
+        normal_text = json.dumps(normal, sort_keys=True)
+        expanded_text = json.dumps(expanded, sort_keys=True)
+        # The handoff_id is the mirror body's unique fingerprint: zero
+        # mirror bodies in normal retrieval, exactly one in the explicit
+        # opt-in (one stored mirror, shipped once).
+        self.assertEqual(normal_text.count(handoff["handoff_id"]), 0)
+        self.assertEqual(expanded_text.count(handoff["handoff_id"]), 1)
+        self.assertGreater(len(expanded_text), len(normal_text))
 
 
 if __name__ == "__main__":

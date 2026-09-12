@@ -337,8 +337,14 @@ class LinkageService:
         direction: str = "both",
         max_hops: int = 2,
         limit: int = 20,
+        include_tests: bool = False,
     ) -> dict:
-        """Read optional bounded callers/dependencies evidence."""
+        """Read optional bounded callers/dependencies evidence.
+
+        ``include_tests`` lifts the graph's test-code exclusion: by
+        default callers living in test files are invisible, which on an
+        inbound query is a coverage boundary, not a negative claim.
+        """
         authority = self.structural_evidence_authority()
         freshness = authority["freshness"]["state"]
         if freshness not in ("fresh", "stale"):
@@ -364,6 +370,7 @@ class LinkageService:
                 direction=direction,
                 max_hops=max_hops,
                 limit=limit,
+                include_tests=bool(include_tests),
             )
         except CBMAdapterError as exc:
             return {

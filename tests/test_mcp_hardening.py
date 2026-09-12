@@ -4,7 +4,7 @@ Offline and deterministic. Covers the areas R3 left unproven for
 long-running real-agent usage: JSON-RPC contract edges, recovery after a
 component comes back, concurrent handoff idempotency, reachability of
 handoffs past one store page, a systematic portable-wire audit of all
-eleven tools, and capability honesty.
+twelve tools, and capability honesty.
 
 Live process lifecycle (disconnect, EOF, broken pipe, restart) is proven
 against real subprocesses in test_mcp_proof.py.
@@ -302,6 +302,9 @@ class PortableWireAuditTests(HardeningTestCase):
                 memory_type="discovery",
                 title="audit discovery",
                 body="body",
+            ),
+            "memory_get": self.ok(
+                "memory_get", memory_id="mem_" + "0" * 16
             ),
             "code_resolve": self.ok(
                 "code_resolve", file="src/audit.py"

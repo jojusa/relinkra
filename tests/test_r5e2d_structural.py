@@ -149,6 +149,21 @@ class AdapterStructuralTests(unittest.TestCase):
             )
         self.assertEqual(result["relationships"], [])
         self.assertIn("does not prove", result["coverage"]["qualification"])
+        self.assertIn("include_tests", result["coverage"]["qualification"])
+        self.assertFalse(result["coverage"]["include_tests"])
+
+    def test_trace_include_tests_flips_the_cli_flag_and_coverage(self):
+        adapter = self.adapter()
+        with mock.patch.object(
+            adapter, "_run_or_classify", return_value=trace_payload()
+        ) as run:
+            result = adapter.trace_relationships(
+                function_name=TARGET, direction="inbound", include_tests=True
+            )
+        flags = run.call_args[0][1]
+        self.assertEqual(flags[flags.index("--include-tests") + 1], "true")
+        self.assertTrue(result["coverage"]["include_tests"])
+        self.assertIn("included", result["coverage"]["qualification"])
 
     def test_trace_outbound_maps_callees_to_dependencies(self):
         adapter = self.adapter()
@@ -275,6 +290,19 @@ class StructuralFallbackTests(unittest.TestCase):
 
         result = LinkageService(None, Stale()).architecture_orientation()
         self.assertEqual(result["freshness"]["state"], "stale")
+
+    def test_trace_forwards_include_tests_to_the_adapter(self):
+        fake = self.FakeCBM()
+        LinkageService(None, fake).trace_relationships(
+            function_name="src.service.Target.run",
+            direction="inbound",
+            include_tests=True,
+        )
+        self.assertEqual(fake.trace_calls[0]["include_tests"], True)
+        LinkageService(None, fake).trace_relationships(
+            function_name="src.service.Target.run", direction="inbound"
+        )
+        self.assertEqual(fake.trace_calls[1]["include_tests"], False)
 
 
 class BudgetStructuralTests(unittest.TestCase):

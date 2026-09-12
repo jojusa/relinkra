@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
 
 from .memory import (
+    MEMORY_ID_RE,
     STORE_PAGE_LIMIT,
     MemoryValidationError,
     redact_text,
@@ -44,10 +45,6 @@ HANDOFF_ID_PREFIX = "hof_"
 HANDOFF_ID_RE = re.compile(r"^hof_[0-9a-f]{32}$")
 _HANDOFF_NAMESPACE = b"relinkra/handoff/v1\x00"
 
-# memory_id is ``mem_`` + secrets.token_hex(8), i.e. 16 hex characters —
-# NOT the 32 used by ref_/pkt_/hof_ ids. The upper bound leaves room for
-# the generator to widen without invalidating stored handoffs.
-MEMORY_ID_RE = re.compile(r"^mem_[0-9a-f]{16,64}$")
 CODE_REF_ID_RE = re.compile(r"^ref_[0-9a-f]{32}$")
 PACKET_ID_RE = re.compile(r"^pkt_[0-9a-f]{32}$")
 
