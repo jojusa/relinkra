@@ -10,10 +10,19 @@ of search, reasoning, editing, and validation.
 
 ## Start here
 
-This checkout is the 0.1.3 release-preparation candidate. It is not yet
-published; the last public PyPI package is 0.1.2. Use the normal install path
-for the published package, or the maintainer source checkout when exercising
-this candidate.
+**Current stable release: 0.1.3 — available on PyPI.**
+
+The normal installation path is:
+
+```bash
+pip install relinkra
+```
+
+If you already have Relinkra installed:
+
+```bash
+pip install --upgrade relinkra
+```
 
 ### 1. Install
 
@@ -29,44 +38,63 @@ License](LICENSE). The project is hosted at
 
 ### 2. Add Relinkra to a project
 
-Run this inside an existing Git repository with at least one commit:
+Run Relinkra inside an existing Git repository with at least one commit:
 
 ```bash
+cd my-project
+
 relinkra version
 relinkra init
 relinkra status
 ```
 
-`init` is per repository/workspace and idempotent. It writes
-`.relinkra/config.json` and `.relinkra/registry.json`, then reuses that local
-identity on later commands.
+`relinkra init` is per repository/workspace and idempotent. It creates the local Relinkra project/workspace identity and reuses it on later commands.
 
-### Level A — Quick Start: connect one agent (0.1.3 release-preparation candidate)
+Relinkra writes local state under:
 
-Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
-`devin-desktop`:
+- `.relinkra/config.json`
+- `.relinkra/registry.json`
+
+These files are local workspace state and should not be committed.
+
+### Level A — Quick Start: connect one agent
+
+Replace `<agent>` with `codex`, `opencode`, `claude`, `devin-desktop`, or `zcode`.
 
 ```bash
-relinkra doctor
 relinkra connect codex
+relinkra doctor
 ```
 
-The normal front door performs inspection and planning, asks for confirmation
-before a write, and then uses the existing backup, validation, rollback, and
-restart guidance. If the registration is already valid for the workspace it
-is a verified no-op. Configuration presence is never proof that the host
-launched Relinkra.
+The normal front door safely inspects the existing host configuration, validates the workspace binding, and checks the required safety conditions before deciding whether any change is needed.
 
-Supported front-door targets are `codex`, `opencode`, `claude`,
-`devin-desktop`, and `zcode`. There is intentionally no `relinkra connect all`.
-This front door is part of the 0.1.3 release-preparation candidate and is not
-yet published. The last public 0.1.2 package does not expose it; use a source
-checkout to exercise this candidate.
+If a write is required, Relinkra:
 
-### Level B — Safe Advanced Connector Workflow (last-published 0.1.2)
+- shows the planned change;
+- asks for confirmation;
+- creates a backup;
+- preserves unrelated configuration;
+- validates the result;
+- keeps rollback available;
+- tells you when the host must be restarted or reloaded.
 
-Use these last-published 0.1.2 advanced commands when you need to inspect or
-control one stage:
+If the agent is already correctly connected to this workspace, the command completes as a safe no-op.
+
+Configuration presence is never treated as proof that the real host has launched Relinkra. After restarting or reloading the agent, use the verification workflow described below when you need host-side proof.
+
+Supported front-door targets are:
+
+- `codex`
+- `opencode`
+- `claude`
+- `devin-desktop`
+- `zcode`
+
+There is currently no `relinkra connect all`; connect each agent individually.
+
+### Level B — Safe Advanced Connector Workflow
+
+Use the advanced connector commands when you need to inspect or control each stage explicitly:
 
 ```bash
 relinkra connect list
@@ -78,8 +106,18 @@ relinkra connect rollback <agent>
 relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`inspect`, `check`, and `plan` are read-only. `apply` writes only after the
-existing safety gates; restart the host, then run `check` and `verify`.
+`inspect`, `check`, and `plan` are read-only.
+
+`apply` uses Relinkra's safety gates, backup, validation, concurrency protection, and rollback mechanisms before modifying supported host configuration.
+
+After applying a configuration change, restart or reload the host when requested, then use:
+
+```bash
+relinkra connect check <agent>
+relinkra connect verify <agent> --proof <proof-file>
+```
+
+Configuration presence is not treated as proof that the real host launched Relinkra.
 
 ### 4. Build the optional code graph
 
@@ -125,12 +163,11 @@ CBM or Engram for every task, or register CBM directly with an agent.
 
 ## Agent hosts
 
-The following connector IDs have configuration support in the 0.1.3
-release-preparation candidate. Every one is **experimental**: configuration
-and format support are distinct from proof that the real host launches Relinkra
-end to end.
+Relinkra 0.1.3 provides experimental configuration support for the following agent hosts.
 
-| Connector | Configuration target | Reload after `connect apply` |
+Configuration support is distinct from proof that the real host launched Relinkra end to end.
+
+| Connector | Configuration target | Reload after configuration |
 |---|---|---|
 | `codex` | Global user `~/.codex/config.toml` | Restart the Codex CLI. |
 | `opencode` | User `~/.config/opencode/opencode.json`; JSONC and workspace alternatives may also be recognized. | Restart OpenCode. |
@@ -138,7 +175,13 @@ end to end.
 | `zcode` | Workspace-local `.zcode/config.json`. | Restart ZCode. |
 | `devin-desktop` | User `%APPDATA%/Devin/mcp_config.json`; workspace-local files are also recognized. | Reload the Cascade/MCP panel. |
 
-For any host, inspect before changing it and verify after restarting:
+For normal setup, use the simplified front door:
+
+```bash
+relinkra connect <agent>
+```
+
+For advanced inspection and verification:
 
 ```bash
 relinkra connect inspect <agent>
@@ -146,8 +189,10 @@ relinkra connect check <agent>
 relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`relinkra connect rollback <agent>` restores a supported backup. The
-`relinkra connect generic` route is available for generic configuration work.
+`relinkra connect rollback <agent>` restores a supported Relinkra backup when available.
+
+The `relinkra connect generic` route is available for generic configuration work.
+
 `devin-cloud` is unsupported.
 
 ## Revision and generated-state hygiene
@@ -220,23 +265,16 @@ universal token-saving guarantee. Local or simple tasks can incur overhead
 from initialization, health checks, or optional backend inspection. The next
 validation step is Kisouma dogfood.
 
-## Relinkra 0.1.3 release-preparation candidate
-
-The 0.1.3 changes described here are in the release-preparation candidate and
-are not a claim that 0.1.3 has been published. The CBM lifecycle is `relinkra cbm setup`,
-`relinkra cbm index`, `relinkra cbm status`, and `relinkra cbm refresh`; stale
-registration guidance uses the real route `relinkra cbm index`.
-
 ## Platform and release truth
 
-- Version **0.1.3** is the release-preparation candidate; 0.1.2 remains the
-  last public PyPI release until publication.
-- Windows is certified for the product. Linux and macOS have CI coverage, but
-  exact-SHA/product certification language remains limited to the evidence
-  available for each platform.
-- CBM managed certification is Windows-focused; Linux/macOS degrade honestly.
-- The connector hosts above are experimental; configuration support is not a
-  claim of real-host launch certification.
+- Version **0.1.3** is the current stable public release on PyPI.
+- Install with `pip install relinkra`.
+- Upgrade with `pip install --upgrade relinkra`.
+- Windows is the currently certified product environment.
+- Linux and macOS are covered by CI, while platform-specific certification remains limited to the evidence available for each environment.
+- Managed CBM binary certification is Windows-focused; Linux and macOS degrade honestly when a certified CBM backend is unavailable.
+- Agent-host connectors are experimental: configuration support is not the same as real-host launch certification.
+- Relinkra does not claim universal token savings; production dogfooding is used to validate value on real projects.
 
 ## Learn more
 
