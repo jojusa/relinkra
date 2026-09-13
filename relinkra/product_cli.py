@@ -40,6 +40,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -2616,6 +2617,55 @@ def cmd_cbm_setup(args) -> int:
     return EXIT_ERROR
 
 
+def _cbm_index_summary(
+    result: Dict, revision: str, elapsed_seconds: float, *, refreshed: bool = False
+) -> str:
+    """One honest line about a successful index/refresh run.
+
+    Only fields the run actually produced: the backend's node/edge
+    counts, the workspace revision the graph was built against, and the
+    measured wall-clock time. There is no files-indexed figure — the CBM
+    0.9.0 index payload does not report one, and none is invented.
+    """
+    parts = [f"{result.get('nodes')} nodes", f"{result.get('edges')} edges"]
+    if refreshed:
+        parts.insert(0, "refreshed")
+    if revision:
+        parts.append(f"rev {revision[:12]}")
+    parts.append(f"{elapsed_seconds:.1f}s")
+    return f"Index: READY ({', '.join(parts)})"
+
+
+def _cbm_summary_extras(
+    freshness: Dict, revision: str, elapsed_seconds: float
+) -> Dict:
+    """Additive, always-honest summary fields for an index/refresh JSON.
+
+    ``freshness`` carries the real drift flags the classifier produced;
+    ``revision`` is included only when the workspace HEAD was actually
+    read (a missing fact is omitted, never invented); ``elapsed_seconds``
+    is the measured index run time.
+    """
+    extras: Dict[str, Any] = {
+        "freshness": {
+            "committed_drift": freshness["committed_drift"],
+            "worktree_drift": freshness["worktree_drift"],
+        },
+        "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
+    }
+    if revision:
+        extras["revision"] = revision
+    return extras
+
+
+def _cbm_workspace_revision(root: str) -> str:
+    """The workspace HEAD sha, or '' when git cannot answer right now."""
+    try:
+        return git_head_sha(str(root))
+    except (GitError, ValueError, OSError):
+        return ""
+
+
 def cmd_cbm_index(args) -> int:
     """Build the managed index and register the workspace mapping.
 
@@ -2641,6 +2691,7 @@ def cmd_cbm_index(args) -> int:
         )
         return EXIT_ERROR
     gitignore_warning = not cbm_indexing.gitignore_check(root).get("ignored")
+    index_started = time.monotonic()
     try:
         result = cbm_indexing.run_index(
             binary,
@@ -2655,6 +2706,7 @@ def cmd_cbm_index(args) -> int:
             "See docs/cbm-backend.md for the certified setup.",
         )
         return EXIT_ERROR
+    index_elapsed = time.monotonic() - index_started
     # Provenance already pinned this exact binary by hash, so a failed
     # version probe degrades to the certified version string — never to
     # a guess about an unverified executable.
@@ -2692,6 +2744,7 @@ def cmd_cbm_index(args) -> int:
         binary, root, record if isinstance(record, dict) else None
     )
     display = _cbm_display_state(freshness["state"])
+    revision = _cbm_workspace_revision(root)
     payload = {
         "action_performed": "index",
         "status": display,
@@ -2701,9 +2754,12 @@ def cmd_cbm_index(args) -> int:
         "quirk_recovery_used": False,
         "gitignore_warning": gitignore_warning,
     }
+    payload.update(
+        _cbm_summary_extras(freshness, revision, index_elapsed)
+    )
     lines = ["", "CBM: AVAILABLE", f"Index: {display}"]
     if display == "READY":
-        lines[2] = f"Index: READY ({result['nodes']} nodes, {result['edges']} edges)"
+        lines[2] = _cbm_index_summary(result, revision, index_elapsed)
     else:
         next_action = _cbm_next_action(display, freshness)
         if next_action:
@@ -2788,6 +2844,7 @@ def cmd_cbm_refresh(args) -> int:
         )
         return EXIT_ERROR
     try:
+        refresh_started = time.monotonic()
         outcome = cbm_indexing.refresh_with_quirk_recovery(
             binary,
             root,
@@ -2796,6 +2853,7 @@ def cmd_cbm_refresh(args) -> int:
             mode=args.mode,
             expected_sha256=refresh_sha256,
         )
+        refresh_elapsed = time.monotonic() - refresh_started
     except cbm_indexing.StaleAfterRefreshError as exc:
         _fail(
             sanitize_wire_text(str(exc)),
@@ -2858,10 +2916,21 @@ def cmd_cbm_refresh(args) -> int:
         "edges": result.get("edges"),
         "quirk_recovery_used": recovery_used,
     }
+    revision = _cbm_workspace_revision(root)
+    payload.update(_cbm_summary_extras(freshness, revision, refresh_elapsed))
     _emit(
         payload,
         args.json,
-        "\n".join(["", "CBM: AVAILABLE", "Index: READY (refreshed)", ""]),
+        "\n".join(
+            [
+                "",
+                "CBM: AVAILABLE",
+                _cbm_index_summary(
+                    result, revision, refresh_elapsed, refreshed=True
+                ),
+                "",
+            ]
+        ),
     )
     return EXIT_OK
 

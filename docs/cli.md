@@ -147,6 +147,16 @@ A missing engine is `WARN`, not `FAIL` — Relinkra is built to degrade.
 `FAIL` is reserved for "this cannot work": no git, no repository, a
 corrupt registry.
 
+Doctor's integration-trust stages read self-observed **runtime evidence**:
+one bounded file per host under `.relinkra/runtime-evidence/`, recorded by
+the MCP server while serving. Recording is best-effort under concurrency:
+two processes of the same host take a bounded per-host lock around each
+read-modify-write, so concurrent sessions preserve every distinct event;
+a writer that cannot take the lock in time skips its record (conservative
+under-reporting) rather than blocking serving or inflating trust. Locks
+die with their holding process, so an abandoned writer cannot wedge the
+store, and the lock files themselves are never rendered as evidence.
+
 ## `relinkra project`
 
 Logical identity for humans and scripts: project id, workspace id,

@@ -44,6 +44,37 @@ Not yet published; no version bump.
   workspace configuration can still be prepared, instead of a bare
   not-installed state.
 
+## Unreleased — R6F residual trust and local-state hardening
+
+Not yet published; no version bump.
+
+### Changed
+
+- Runtime-evidence recording takes a bounded per-host interprocess lock
+  around the read-modify-write critical section: two concurrent processes
+  of the same host can no longer overwrite each other's evidence. A
+  writer that cannot take the lock in time skips its record —
+  conservative under-reporting, never trust inflation, never blocked MCP
+  serving. OS-level locks die with their holding process, so an abandoned
+  writer cannot wedge the store.
+- Concurrent first-time startups no longer append duplicate `.relinkra/`
+  rules to `.git/info/exclude`: the check-then-append cycle runs under
+  the same bounded lock discipline (the lock file lives beside the
+  exclude file in the git directory and never dirties git status).
+- `relinkra cbm index` and a `relinkra cbm refresh` that reaches `READY`
+  report a concise successful-index summary: `nodes`, `edges`, the
+  workspace `revision`, `freshness` drift flags, and measured
+  `elapsed_seconds` (additive JSON fields; a files-indexed figure is not
+  reported by the backend and is not invented).
+
+### Documentation
+
+- The ignore-policy guidance now states truthfully, per path
+  (`.relinkra/`, `.codebase-memory/`, `.zcode/config.json` + lock,
+  `*.relinkra-backup*`), who owns it and whether it is ignored,
+  visible/untracked, or tracked unexpectedly — and a dirty `git status`
+  is attributed to Relinkra/ZCode only when the dirty paths are theirs.
+
 ## 0.1.3 — release-preparation candidate
 
 This candidate is not yet published.

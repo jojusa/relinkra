@@ -147,12 +147,30 @@ pip uninstall relinkra
 
 Uninstalling the package leaves project state and safety backups in place:
 
-- `.relinkra/` — project identity and registry.
+- `.relinkra/` — project identity, registry, and runtime evidence.
 - `.codebase-memory/` — optional CBM binaries, caches, and indexes.
+- `.zcode/config.json` and `.zcode/config.json.lock` — ZCode-owned
+  workspace state.
 - `*.relinkra-backup*` — host-configuration backups.
 
-These paths are gitignored. Remove them manually only when you intentionally
-want to discard local state or backups.
+Remove them manually only when you intentionally want to discard local
+state or backups.
+
+### Git ignore policy, truthfully
+
+Each path has a different owner and a different ignore story. Relinkra
+never edits a tracked `.gitignore` and never deletes host-owned files:
+
+| Path | Owner | Git state |
+| --- | --- | --- |
+| `.relinkra/` | Relinkra-managed local state | Ignored. Relinkra appends a `.relinkra/` rule to `.git/info/exclude` (repository-local, never committed, applies to every linked worktree) — and only if the tracked `.gitignore` does not already cover it. If that write could not happen, the directory shows as untracked (`?? .relinkra/`). |
+| `.codebase-memory/` | Relinkra-managed derived CBM state (optional backend) | Not ignored automatically. `relinkra cbm index` warns while it is untracked and never edits `.gitignore`; add the rule yourself if you want it out of `git status`. |
+| `.zcode/config.json`, `.zcode/config.json.lock` | ZCode-owned generated state | Depends on your ignore policy. `relinkra connect zcode` reports the real state — ignored, visible/untracked, or tracked unexpectedly — without changing anything. |
+| `*.relinkra-backup*` | Your host-config backups, written by `connect apply` | Not ignored automatically, and they live next to your host's config files (often outside any repository). Delete them once you are satisfied, or add your own ignore rule. |
+
+A dirty `git status` is only attributed to Relinkra or ZCode when the
+dirty paths are actually local state owned by one of them; unrelated
+changes are never reported as theirs.
 
 ## Next step
 

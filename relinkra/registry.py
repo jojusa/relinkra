@@ -8,11 +8,13 @@ rejected with RegistryError. No server, no dependencies.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
 import tempfile
-from typing import Optional
+import time
+from typing import Optional, Tuple
 
 from .identity import (
     AmbiguousIdentityError,
@@ -43,39 +45,129 @@ class RegistryError(Exception):
     """Raised when the registry file is malformed or fails validation."""
 
 
+#: Poll interval for a bounded (``timeout``) lock wait. Short enough
+#: that a writer waits at most this long past the moment the holder
+#: releases; long enough to stay invisible next to any real critical
+#: section.
+_LOCK_POLL_SECONDS = 0.05
+
+#: Errnos that mean "someone else holds the lock" — retryable under a
+#: bounded wait. Anything else means the platform cannot lock this file
+#: at all, which is the historical proceed-unlocked case. Built
+#: defensively: not every platform defines every errno name.
+_LOCK_BUSY_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        getattr(errno, "EDEADLK", None),
+        getattr(errno, "EDEADLOCK", None),
+    )
+    if value is not None
+)
+
+#: Sentinel returned by a failed non-blocking attempt when the lock is
+#: merely held elsewhere — distinct from "this platform cannot lock".
+_LOCK_BUSY = "busy"
+
+
+def _try_lock_once(fh) -> Optional[str]:
+    """One non-blocking acquisition attempt.
+
+    Returns the platform primitive name whose lock is HELD, ``None``
+    when the platform cannot lock this file at all, or the
+    :data:`_LOCK_BUSY` sentinel when another holder keeps the lock.
+    """
+    try:
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return "msvcrt"
+    except ImportError:
+        pass
+    except OSError as exc:
+        return _LOCK_BUSY if exc.errno in _LOCK_BUSY_ERRNOS else None
+    try:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return "fcntl"
+    except ImportError:
+        return None
+    except OSError as exc:
+        return _LOCK_BUSY if exc.errno in _LOCK_BUSY_ERRNOS else None
+
+
+def _acquire_lock_handle(fh, timeout: Optional[float]) -> Tuple[Optional[str], bool]:
+    """Take the advisory lock on an open lock-file handle.
+
+    Returns ``(locker, timed_out)``. ``locker`` names the platform
+    primitive whose lock is HELD (``"msvcrt"``/``"fcntl"``), or None
+    when locking is unavailable or failed — the historical best-effort
+    case, in which the critical section proceeds unlocked. ``timed_out``
+    is True ONLY when a bounded wait (``timeout``) expired with the lock
+    still held elsewhere: the one outcome a bounded caller must treat as
+    "skip the critical section" rather than proceed unlocked.
+    """
+    if timeout is None:
+        try:
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            return "msvcrt", False
+        except ImportError:
+            try:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                return "fcntl", False
+            except (ImportError, OSError):
+                return None, False
+        except OSError:
+            return None, False
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        outcome = _try_lock_once(fh)
+        if outcome is not _LOCK_BUSY:
+            return outcome, False
+        if time.monotonic() >= deadline:
+            return None, True
+        time.sleep(_LOCK_POLL_SECONDS)
+
+
 @contextlib.contextmanager
-def _interprocess_lock(registry_path: str):
+def _interprocess_lock(registry_path: str, *, timeout: Optional[float] = None):
     """Best-effort cross-platform advisory lock for registry mutation.
 
     Uses a lock file (``<registry>.lock``) alongside the registry:
     ``msvcrt.locking`` on Windows, ``fcntl.flock`` on POSIX. Best-effort:
     if the platform locking primitive is unavailable or fails, the
     critical section proceeds unlocked rather than failing the operation.
+    A lock held by a process that dies is released by the OS, and an
+    abandoned lock FILE is inert, so nothing here can wedge permanently.
+
+    With ``timeout=None`` (the default) acquisition blocks; the context
+    manager yields True. With a ``timeout``, acquisition is a bounded
+    non-blocking wait: the manager yields True when the critical section
+    may proceed — the lock is held, or the platform cannot lock at all
+    (proceed unlocked, as always) — and False only when the bounded wait
+    expired with the lock still held elsewhere. A caller that requires
+    mutual exclusion must then SKIP its critical section (conservative
+    degradation) instead of racing unlocked.
     """
+    registry_path = os.fspath(registry_path)
     lock_path = registry_path + ".lock"
     directory = os.path.dirname(os.path.abspath(registry_path))
     os.makedirs(directory, exist_ok=True)
     fh = open(lock_path, "a+b")
     locker = None
     try:
+        locker, timed_out = _acquire_lock_handle(fh, timeout)
         try:
-            import msvcrt
-
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-            locker = "msvcrt"
-        except ImportError:
-            try:
-                import fcntl
-
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                locker = "fcntl"
-            except (ImportError, OSError):
-                locker = None
-        except OSError:
-            locker = None
-        try:
-            yield
+            yield not timed_out
         finally:
             try:
                 if locker == "msvcrt":

@@ -25,6 +25,17 @@ Deliberate limits, in order of importance:
                       hosts recording concurrently cannot lose each
                       other's evidence the way a single shared file's
                       read-modify-write cycle could (R6E).
+    lock-guarded      two processes of the SAME host share one file and
+                      one read-modify-write cycle, so every writer takes
+                      a bounded per-host interprocess lock around it
+                      (R6F). Concurrent same-host sessions therefore
+                      preserve every distinct event and never decrease a
+                      counter; the one honest cost of the bound is that
+                      a writer locked out past its timeout skips its
+                      write — conservative under-reporting, never trust
+                      inflation, never blocked serving. Same-event
+                      ordering is latest-timestamp-wins-by-lock-order,
+                      not a global event log.
     revision-bound    each record carries the workspace revision it was
                       observed on, so doctor can tell current-revision
                       evidence from historical evidence. When the current
@@ -51,6 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from .safe_write import SafeWriteError, atomic_write_text, read_bounded_text
+from .registry import interprocess_lock
 
 SCHEMA_VERSION = "relinkra.runtime-evidence/v1"
 
@@ -114,6 +126,15 @@ EVENTS: tuple = (
 #: Revision shorthand length, matching the operator-proof store so the
 #: two evidence classes can be compared like for like.
 REVISION_LENGTH = 12
+
+#: Bound on waiting for another same-host process's evidence critical
+#: section (per-host lock around the read-modify-write, and the
+#: ``info/exclude`` append). Evidence must never block MCP serving: a
+#: writer that times out skips its write — conservative under-reporting
+#: — instead of racing unlocked and resurrecting the lost-update race
+#: the lock exists to close. OS-level locks are released automatically
+#: when a holder dies, so an abandoned writer cannot wedge this.
+EVIDENCE_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _utc_now() -> str:
@@ -469,7 +490,13 @@ class EvidenceRecorder:
     rewrites another host's bucket, so concurrent hosts (Codex and
     OpenCode recording at the same time, for instance) cannot lose each
     other's evidence: there is no shared read-modify-write cycle to
-    interleave.
+    interleave. Two processes of the SAME host DO share one file and one
+    read-modify-write cycle, so the recorder takes a bounded per-host
+    interprocess lock around it (R6F): the loser of a lock race skips
+    its write — evidence stays honest but may under-report — rather
+    than serving block or stale derived state clobber fresh events. The
+    lock is local-only, lives beside the host file, is never rendered
+    as evidence, and dies with its holding process.
     """
 
     def __init__(
@@ -479,11 +506,13 @@ class EvidenceRecorder:
         *,
         clock: Optional[Callable[[], str]] = None,
         revision: Optional[str] = None,
+        lock_timeout: Optional[float] = EVIDENCE_LOCK_TIMEOUT_SECONDS,
     ):
         self.workspace_root = str(workspace_root) if workspace_root else None
         self.host_id = resolve_host_id(host_id)
         self._clock = clock or _utc_now
         self._revision = short_revision(revision)
+        self._lock_timeout = lock_timeout
         self._pin: Optional[Dict[str, str]] = None
         self._pin_loaded = False
         self._exclude_checked = False
@@ -534,6 +563,23 @@ class EvidenceRecorder:
             return False
         self._ensure_git_excluded()
         path = host_evidence_path(self.workspace_root, self.bucket_id)
+        with interprocess_lock(path, timeout=self._lock_timeout) as acquired:
+            if not acquired:
+                # Another same-host writer held the lock past the bound.
+                # Skipping loses this event (conservative under-reporting)
+                # but never blocks serving, and never resurrects the
+                # lost-update race the per-host lock exists to close.
+                return False
+            return self._record_locked(event, detail, path)
+
+    def _record_locked(self, event: str, detail, path: str) -> bool:
+        """The read-modify-write critical section.
+
+        Every writer to THIS host's file takes the SAME per-host
+        interprocess lock, so two same-host processes can no longer
+        interleave read-modify-write and lose each other's events
+        (R6F). Cross-host writers use different files and never meet.
+        """
         try:
             text = read_bounded_text(path, max_bytes=MAX_FILE_BYTES)
             data = json.loads(text)
@@ -584,6 +630,16 @@ class EvidenceRecorder:
         whose ``commondir`` file names the shared ``.git``. The exclude
         belongs there — it applies to every worktree, and writing
         anywhere else would leave the worktree's status dirty (R6E).
+
+        The check-then-append cycle is guarded by the same interprocess
+        lock discipline as the evidence store (R6F): two first-time
+        startups could otherwise both observe the rule absent and both
+        append it. The lock is taken on the exclude file's own
+        ``<exclude>.lock`` sibling — inside the git directory, invisible
+        to git status, shared by every worktree of the repository. A
+        writer that cannot take it within the bound skips the append:
+        the rule arrives on a later startup, and no duplicate is
+        created.
         """
         if self._exclude_checked:
             return
@@ -595,25 +651,37 @@ class EvidenceRecorder:
         info_dir = os.path.join(common_dir, "info")
         exclude_path = os.path.join(info_dir, "exclude")
         try:
-            existing = ""
-            if os.path.isfile(exclude_path):
-                with open(exclude_path, "r", encoding="utf-8", errors="replace") as h:
-                    existing = h.read()
-                if _ignores_relinkra(existing):
+            with interprocess_lock(
+                exclude_path, timeout=self._lock_timeout
+            ) as acquired:
+                if not acquired:
+                    # Another startup is mid-append. Skipping leaves the
+                    # rule for a later startup; appending unlocked could
+                    # duplicate it.
                     return
-            # A tracked .gitignore covering the directory makes the
-            # exclude entry redundant. The worktree's own .gitignore is
-            # the one that governs what its status shows.
-            gitignore_path = os.path.join(root, ".gitignore")
-            if os.path.isfile(gitignore_path):
-                with open(gitignore_path, "r", encoding="utf-8", errors="replace") as h:
-                    if _ignores_relinkra(h.read()):
+                existing = ""
+                if os.path.isfile(exclude_path):
+                    with open(
+                        exclude_path, "r", encoding="utf-8", errors="replace"
+                    ) as h:
+                        existing = h.read()
+                    if _ignores_relinkra(existing):
                         return
-            os.makedirs(info_dir, exist_ok=True)
-            with open(exclude_path, "a", encoding="utf-8") as h:
-                if existing and not existing.endswith("\n"):
-                    h.write("\n")
-                h.write(".relinkra/\n")
+                # A tracked .gitignore covering the directory makes the
+                # exclude entry redundant. The worktree's own .gitignore
+                # is the one that governs what its status shows.
+                gitignore_path = os.path.join(root, ".gitignore")
+                if os.path.isfile(gitignore_path):
+                    with open(
+                        gitignore_path, "r", encoding="utf-8", errors="replace"
+                    ) as h:
+                        if _ignores_relinkra(h.read()):
+                            return
+                os.makedirs(info_dir, exist_ok=True)
+                with open(exclude_path, "a", encoding="utf-8") as h:
+                    if existing and not existing.endswith("\n"):
+                        h.write("\n")
+                    h.write(".relinkra/\n")
         except OSError:
             return
 

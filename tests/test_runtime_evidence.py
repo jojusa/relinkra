@@ -43,7 +43,7 @@ from relinkra.host_discovery import (
 from relinkra.identity import explicit_identity
 from relinkra.mcp_server import MCPServer
 from relinkra.product_cli import FAIL, PASS, PENDING, WARN, main
-from relinkra.registry import Registry
+from relinkra.registry import Registry, interprocess_lock
 from relinkra.runtime_evidence import (
     EVENT_CONTEXT_GET_CALLED,
     EVENT_INITIALIZE_OBSERVED,
@@ -90,6 +90,53 @@ def _real_git_repo(base: Path) -> Path:
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "fixture revision A")
     return repo
+
+
+#: R6F — child-process body for the same-host race regressions. Two
+#: processes rendezvous through ready files (a genuine cross-process
+#: barrier), then both hammer ONE host's evidence file: role ``a`` and
+#: role ``b`` record the events given on the command line.
+_R6F_SAME_HOST_SCRIPT = (
+    "import sys\n"
+    "import time\n"
+    "from pathlib import Path\n"
+    "from relinkra.runtime_evidence import EvidenceRecorder\n"
+    "ws, host_id, role, ready_dir, rounds, event_name = sys.argv[1:7]\n"
+    "rounds = int(rounds)\n"
+    "mine = Path(ready_dir) / (role + '.ready')\n"
+    "mine.write_text('1', encoding='utf-8')\n"
+    "other = Path(ready_dir) / ('b.ready' if role == 'a' else 'a.ready')\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not other.exists() and time.monotonic() < deadline:\n"
+    "    time.sleep(0.005)\n"
+    "recorder = EvidenceRecorder(ws, host_id, revision='a' * 40)\n"
+    "detail = {'tool': 'tool_' + role} if event_name == 'tool_invoked' else None\n"
+    "for _ in range(rounds):\n"
+    "    if not recorder.record(event_name, detail):\n"
+    "        sys.exit('record returned False in role ' + role)\n"
+    "    time.sleep(0.002)\n"
+)
+
+#: R6F — child-process body for the exclude race: two processes of two
+#: DIFFERENT hosts (distinct evidence files, shared common git dir)
+#: perform their first-time ``_ensure_git_excluded`` together.
+_R6F_EXCLUDE_SCRIPT = (
+    "import sys\n"
+    "import time\n"
+    "from pathlib import Path\n"
+    "from relinkra.runtime_evidence import EVENT_MCP_SERVER_STARTED,"
+    " EvidenceRecorder\n"
+    "ws, host_id, role, ready_dir = sys.argv[1:5]\n"
+    "mine = Path(ready_dir) / (role + '.ready')\n"
+    "mine.write_text('1', encoding='utf-8')\n"
+    "other = Path(ready_dir) / ('b.ready' if role == 'a' else 'a.ready')\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not other.exists() and time.monotonic() < deadline:\n"
+    "    time.sleep(0.005)\n"
+    "recorder = EvidenceRecorder(ws, host_id, revision='a' * 40)\n"
+    "if not recorder.record(EVENT_MCP_SERVER_STARTED):\n"
+    "    sys.exit('record returned False in role ' + role)\n"
+)
 
 
 class EvidenceStoreTests(unittest.TestCase):
@@ -1079,6 +1126,252 @@ class WorktreeHygieneTests(unittest.TestCase):
         self.assertEqual(_git(self.repo, "status", "--porcelain"), "")
         exclude_path = self.repo / ".git" / "info" / "exclude"
         self.assertIn(".relinkra/", exclude_path.read_text(encoding="utf-8"))
+
+
+class SameHostProcessRaceTests(unittest.TestCase):
+    """R6F — two processes of the SAME host share one evidence file.
+
+    R6E gave each host its own file, which stopped Codex and OpenCode
+    from clobbering each other. Two processes of one host still share
+    that host's file, and their read-modify-write cycles could
+    interleave: the last write won and the other process's fresh event
+    silently vanished (R6E-REVIEW N1). Every writer now takes a bounded
+    per-host interprocess lock around the critical section, so
+    concurrent same-host sessions preserve every distinct event and
+    count every observation.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6f-samehost-")
+        self.addCleanup(self._temp.cleanup)
+        self.base = Path(self._temp.name)
+
+    def _fresh_ws(self) -> Path:
+        ws = self.base / f"ws-{time.monotonic_ns()}"
+        ws.mkdir(parents=True)
+        (ws / ".git").mkdir()
+        return ws
+
+    def _run_pair(self, ws: Path, ready: Path, host: str, rounds: int,
+                  events: "tuple[str, str]") -> None:
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable, "-c", _R6F_SAME_HOST_SCRIPT,
+                    str(ws), host, role, str(ready), str(rounds), event,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            for role, event in zip(("a", "b"), events)
+        ]
+        for process in processes:
+            _, stderr = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, stderr)
+
+    def _codex_events(self, ws: Path) -> dict:
+        raw = Path(host_evidence_path(str(ws), "codex")).read_text(
+            encoding="utf-8"
+        )
+        data = json.loads(raw)  # valid JSON after every concurrent round
+        self.assertEqual(data["host_id"], "codex")  # correct host scope
+        return data["events"]
+
+    def test_two_same_host_processes_keep_both_distinct_events(self):
+        """Two Codex processes start past a rendezvous and each records
+        a distinct event repeatedly. After every round both events must
+        survive with exact counts — the pre-R6F lost-update failure."""
+        rounds = 10
+        for _ in range(3):
+            ws = self._fresh_ws()
+            ready = self.base / f"ready-{time.monotonic_ns()}"
+            ready.mkdir()
+            self._run_pair(
+                ws, ready, "codex", rounds,
+                (EVENT_PROJECT_RESOLVE_CALLED, EVENT_CONTEXT_GET_CALLED),
+            )
+            events = self._codex_events(ws)
+            self.assertEqual(
+                events[EVENT_PROJECT_RESOLVE_CALLED]["count"], rounds
+            )
+            self.assertEqual(events[EVENT_CONTEXT_GET_CALLED]["count"], rounds)
+            # No other host file exists, and the lock files beside the
+            # host file are never mistaken for evidence buckets.
+            names = sorted(
+                p.name
+                for p in (ws / ".relinkra" / "runtime-evidence").glob("*.json")
+            )
+            self.assertEqual(names, ["codex.json"])
+            summary = summarize_runtime_evidence(str(ws), "a" * 12)
+            self.assertTrue(summary["present"])
+            self.assertFalse(summary["invalid"])
+
+    def test_two_same_host_processes_count_every_observation(self):
+        """Both processes recording the SAME event: every observation is
+        counted (monotonically, none lost, none invented), and the
+        surviving detail is one of the two honestly observed tools."""
+        rounds = 10
+        ws = self._fresh_ws()
+        ready = self.base / f"ready-{time.monotonic_ns()}"
+        ready.mkdir()
+        self._run_pair(
+            ws, ready, "codex", rounds, (EVENT_TOOL_INVOKED, EVENT_TOOL_INVOKED)
+        )
+        events = self._codex_events(ws)
+        entry = events[EVENT_TOOL_INVOKED]
+        self.assertEqual(entry["count"], 2 * rounds)
+        self.assertIn(entry["detail"]["tool"], ("tool_a", "tool_b"))
+
+
+class LockDegradationTests(unittest.TestCase):
+    """R6F — a contested or broken lock degrades conservatively.
+
+    Evidence recording must never block MCP serving, never trust-inflate,
+    never leave a wedged lock. Losing a lock race skips the write:
+    missing evidence is the pre-existing quiet case, while an unlocked
+    write would resurrect the lost-update race the lock exists to close.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6f-lock-")
+        self.addCleanup(self._temp.cleanup)
+        self.ws = Path(self._temp.name) / "ws"
+        self.ws.mkdir()
+        (self.ws / ".git").mkdir()
+
+    def _evidence_file(self) -> Path:
+        return Path(host_evidence_path(str(self.ws), "codex"))
+
+    def test_contended_lock_skips_the_write_and_serving_continues(self):
+        path = self._evidence_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # A same-host writer is already inside its critical section
+        # (held on a second handle, the way a second process would).
+        with interprocess_lock(path, timeout=None) as held:
+            self.assertTrue(held)
+            recorder = EvidenceRecorder(
+                str(self.ws), "codex", revision="a" * 40, lock_timeout=0.05
+            )
+            # No exception escapes; nothing is written.
+            self.assertFalse(recorder.record(EVENT_MCP_SERVER_STARTED))
+            self.assertFalse(
+                path.exists(), "a skipped write must not create partial state"
+            )
+        # The lock was released, not wedged: the next write succeeds.
+        recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["events"][EVENT_MCP_SERVER_STARTED]["count"], 1)
+
+    def test_abandoned_lock_file_is_inert(self):
+        """A lock FILE left behind by a dead process carries no lock:
+        OS-level locks die with their holder, so recording proceeds."""
+        path = self._evidence_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Path(str(path) + ".lock").write_text("", encoding="utf-8")
+        recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertTrue(summary["present"])
+        self.assertFalse(summary["invalid"])
+        self.assertEqual(
+            summary["hosts"]["codex"]["events"][EVENT_MCP_SERVER_STARTED]["count"],
+            1,
+        )
+
+    def test_lock_files_are_never_evidence_buckets(self):
+        recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        lock = Path(host_evidence_path(str(self.ws), "codex") + ".lock")
+        self.assertTrue(lock.exists(), "the per-host lock lives beside the file")
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertEqual(set(summary["hosts"]), {"codex"})
+        self.assertFalse(summary["invalid"])
+
+
+class GitExcludeConcurrencyTests(unittest.TestCase):
+    """R6F — concurrent first-time startups must not append duplicate
+    ``.relinkra/`` rules to ``.git/info/exclude`` (R6E-REVIEW N2).
+
+    Two processes could both observe the rule absent and both append it.
+    The check-then-append cycle now runs under the repository-wide
+    exclude lock, so exactly one rule lands — with every pre-existing
+    comment and unrelated rule preserved and git status left clean.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6f-exclude-")
+        self.addCleanup(self._temp.cleanup)
+        self.base = Path(self._temp.name)
+        self.repo = _real_git_repo(self.base)
+        self.exclude = self.repo / ".git" / "info" / "exclude"
+
+    def _reset_exclude(self) -> None:
+        self.exclude.write_text(
+            "# git ls-files --others --exclude-standard\n"
+            "# a pre-existing unrelated local rule\n"
+            "*.local\n",
+            encoding="utf-8",
+        )
+
+    def _assert_one_rule(self) -> None:
+        content = self.exclude.read_text(encoding="utf-8")
+        self.assertEqual(content.count(".relinkra/"), 1)
+        self.assertIn("*.local", content, "unrelated rules survive")
+        self.assertIn("# git ls-files", content, "git's own comments survive")
+        self.assertEqual(
+            _git(self.repo, "status", "--porcelain"), "",
+            "the exclude lock file must never dirty git status",
+        )
+
+    def test_concurrent_processes_append_one_rule(self):
+        for _ in range(3):
+            self._reset_exclude()
+            ready = self.base / f"ready-{time.monotonic_ns()}"
+            ready.mkdir()
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable, "-c", _R6F_EXCLUDE_SCRIPT,
+                        str(self.repo.resolve()), host, role, str(ready),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                for role, host in zip(("a", "b"), ("codex", "zcode"))
+            ]
+            for process in processes:
+                _, stderr = process.communicate(timeout=120)
+                self.assertEqual(process.returncode, 0, stderr)
+            self._assert_one_rule()
+
+    def test_concurrent_threads_append_one_rule(self):
+        for _ in range(10):
+            self._reset_exclude()
+            barrier = threading.Barrier(2)
+            failures = []
+
+            def write(host: str) -> None:
+                recorder = EvidenceRecorder(
+                    str(self.repo.resolve()), host, revision="a" * 40
+                )
+                try:
+                    barrier.wait(timeout=30)
+                    if not recorder.record(EVENT_MCP_SERVER_STARTED):
+                        failures.append(host)
+                except Exception as exc:  # surfaced below, never raced on
+                    failures.append(f"{host}: {exc}")
+
+            threads = [
+                threading.Thread(target=write, args=(host,))
+                for host in ("codex", "zcode")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            self.assertEqual(failures, [])
+            self._assert_one_rule()
 
 
 if __name__ == "__main__":

@@ -81,6 +81,14 @@ database and its `-wal`/`-shm` companions.
 machine-readable result. `--mode fast` selects the supported fast lifecycle
 mode for `index` and `refresh`.
 
+A successful `index` (or a `refresh` that reached `READY`) reports a concise
+summary: `nodes` and `edges` counts from the backend payload, the workspace
+`revision` the graph was built against (omitted when git could not answer),
+the `freshness` drift flags (`committed_drift`/`worktree_drift`), and the
+measured `elapsed_seconds`. The backend does not report a files-indexed
+figure, so none is shown. These fields are additive; existing keys are
+unchanged.
+
 ## Registration remediation
 
 The supported registration route is `relinkra cbm index`. The 0.1.3

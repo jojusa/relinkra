@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
     import git_fixtures
 
 from relinkra import cbm_indexing, cbm_support, product_cli
-from relinkra.identity import canonicalize_path
+from relinkra.identity import canonicalize_path, git_head_sha
 from relinkra.product_cli import EXIT_ACTION_REQUIRED, EXIT_ERROR, EXIT_OK
 
 BIN = "C:/fake/codebase-memory-mcp.exe"
@@ -467,7 +467,10 @@ class CbmIndexTests(CBMCLITestCase):
             stack.enter_context(mock.patch.object(product_cli, "CBMCLIAdapter", _Probe))
             code, out, err = self.run_cli("cbm", "index")
             self.assertEqual(code, EXIT_OK, err)
-            self.assertIn("Index: READY (12 nodes, 30 edges)", out)
+            # The successful-index summary: nodes, edges, the revision the
+            # graph was built against, and the measured elapsed time.
+            self.assertIn("Index: READY (12 nodes, 30 edges, rev ", out)
+            self.assertIn("s)", out)
             # The slug never reaches human output.
             self.assertNotIn(PROJECT, out)
             self.assertIn(
@@ -486,9 +489,14 @@ class CbmIndexTests(CBMCLITestCase):
                 "edges": 30,
                 "quirk_recovery_used": False,
                 "gitignore_warning": True,
+                "freshness": {"committed_drift": False, "worktree_drift": False},
+                "revision": git_head_sha(str(self.repo)),
+                "elapsed_seconds": payload["elapsed_seconds"],
             },
         )
         self.assertTrue(payload["project_id"].startswith("rlk_"))
+        self.assertIsInstance(payload["elapsed_seconds"], float)
+        self.assertGreaterEqual(payload["elapsed_seconds"], 0.0)
         self.assertEqual(run_index.call_args.kwargs["expected_sha256"], CERTIFIED_SHA)
         register_args = register.call_args.args
         self.assert_path_equivalent(
@@ -635,7 +643,7 @@ class CbmRefreshTests(CBMCLITestCase):
             )
             code, out, err = self.run_cli("cbm", "refresh")
             self.assertEqual(code, EXIT_OK, err)
-            self.assertIn("Index: READY (refreshed)", out)
+            self.assertIn("Index: READY (refreshed, 5 nodes, 9 edges, rev ", out)
             code, out, _ = self.run_cli("cbm", "refresh", "--json")
             self.assertEqual(code, EXIT_OK)
         payload = json.loads(out)

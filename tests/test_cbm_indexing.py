@@ -939,7 +939,8 @@ class TestRealBinaryIndexingCycle(unittest.TestCase):
         #    keeps the stored head); either path must land on READY.
         code, out, err = self._cli("refresh")
         self.assertEqual(code, 0, err)
-        self.assertIn("Index: READY (refreshed)", out)
+        self.assertIn("Index: READY (refreshed, ", out)
+        self.assertIn(" rev ", out)  # revision + elapsed in the summary
 
         # 8. Deleting the derived db is an honest MISSING, never a lie.
         cache_dir = Path(self.repo) / ".codebase-memory" / "cache"

@@ -82,6 +82,26 @@ reports it cannot find git.
 
 **Fix:** install Git, open a new terminal, and re-run `relinkra doctor`.
 
+## Untracked local state in `git status`
+
+**Symptom:** `git status` shows `?? .relinkra/`, `?? .codebase-memory/`,
+or `?? .zcode/` as untracked.
+
+**Cause:** each path has a different ignore story. `.relinkra/` is kept
+out of status automatically — Relinkra writes the rule to
+`.git/info/exclude` (repository-local, never pushed) unless your tracked
+`.gitignore` already covers it. `.codebase-memory/` and ZCode-owned
+`.zcode/` workspace state are not ignored by Relinkra: it never edits a
+tracked `.gitignore` and never deletes host-owned files.
+
+**Fix:** decide the ignore policy yourself. Add the paths you want out
+of `git status` to your `.gitignore`, or commit them deliberately if
+your team shares that state. `relinkra connect zcode` reports the real
+git state of `.zcode/config.json` and its lock (ignored, visible, or
+tracked unexpectedly) without changing anything. A dirty `git status`
+is blamed on Relinkra or ZCode only when the dirty paths are actually
+theirs — unrelated changes are never attributed to them.
+
 ## CBM missing or incompatible
 
 **Symptom:** `doctor` WARNs on CBM ("no CBM adapter configured" or an
