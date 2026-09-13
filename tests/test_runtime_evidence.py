@@ -23,7 +23,10 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -52,8 +55,10 @@ from relinkra.runtime_evidence import (
     EvidenceRecorder,
     build_evidence_recorder,
     evidence_path,
+    host_evidence_path,
     load_store,
     resolve_host_id,
+    runtime_stage_claims,
     summarize_runtime_evidence,
 )
 
@@ -106,10 +111,11 @@ class EvidenceStoreTests(unittest.TestCase):
                 {"protocol_negotiated": "2025-06-18", "protocol_agreed": True},
             )
         )
-        path = evidence_path(str(self.ws))
+        path = host_evidence_path(str(self.ws), "codex")
         self.assertTrue(path.startswith(str(self.ws / ".relinkra")))
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        codex = data["hosts"]["codex"]["events"]
+        codex = data["events"]
+        self.assertEqual(data["host_id"], "codex")
         self.assertIn(EVENT_MCP_SERVER_STARTED, codex)
         self.assertEqual(codex[EVENT_MCP_SERVER_STARTED]["count"], 1)
         self.assertEqual(codex[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 12)
@@ -120,9 +126,14 @@ class EvidenceStoreTests(unittest.TestCase):
         self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         self.assertEqual(
-            data["hosts"]["codex"]["events"][EVENT_MCP_SERVER_STARTED]["count"], 2
+            data["events"][EVENT_MCP_SERVER_STARTED]["count"], 2
         )
-        self.assertEqual(len(data["hosts"]["codex"]["events"]), 2)
+        self.assertEqual(len(data["events"]), 2)
+        # Each host owns exactly one file; no shared file is written.
+        self.assertFalse(
+            Path(evidence_path(str(self.ws))).exists(),
+            "the legacy single-file store must not be written anymore",
+        )
 
     def test_unknown_events_and_details_are_dropped(self):
         recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
@@ -134,9 +145,11 @@ class EvidenceStoreTests(unittest.TestCase):
             )
         )
         data = json.loads(
-            Path(evidence_path(str(self.ws))).read_text(encoding="utf-8")
+            Path(host_evidence_path(str(self.ws), "codex")).read_text(
+                encoding="utf-8"
+            )
         )
-        detail = data["hosts"]["codex"]["events"][EVENT_TOOL_INVOKED]["detail"]
+        detail = data["events"][EVENT_TOOL_INVOKED]["detail"]
         self.assertEqual(detail["tool"], "context_get")
         self.assertLessEqual(len(detail["body"]), 128)
 
@@ -144,10 +157,14 @@ class EvidenceStoreTests(unittest.TestCase):
         recorder = EvidenceRecorder(str(self.ws), "", revision="a" * 40)
         recorder.record(EVENT_MCP_SERVER_STARTED)
         data = json.loads(
-            Path(evidence_path(str(self.ws))).read_text(encoding="utf-8")
+            Path(host_evidence_path(str(self.ws), HOST_UNKNOWN)).read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertIn(HOST_UNKNOWN, data["hosts"])
-        self.assertNotIn("codex", data["hosts"])
+        self.assertEqual(data["host_id"], HOST_UNKNOWN)
+        self.assertFalse(
+            Path(host_evidence_path(str(self.ws), "codex")).exists()
+        )
 
     def test_unrecognized_host_id_is_not_trusted(self):
         self.assertEqual(resolve_host_id("codex"), "codex")
@@ -157,22 +174,28 @@ class EvidenceStoreTests(unittest.TestCase):
         recorder = EvidenceRecorder(str(self.ws), "invented-host", revision="a" * 40)
         recorder.record(EVENT_MCP_SERVER_STARTED)
         data = json.loads(
-            Path(evidence_path(str(self.ws))).read_text(encoding="utf-8")
+            Path(host_evidence_path(str(self.ws), HOST_UNKNOWN)).read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertIn(HOST_UNKNOWN, data["hosts"])
-        self.assertNotIn("invented-host", data["hosts"])
+        self.assertEqual(data["host_id"], HOST_UNKNOWN)
+        # No file is ever named after an unvalidated host.
+        self.assertFalse(
+            (self.ws / ".relinkra" / "runtime-evidence" / "invented-host.json")
+            .exists()
+        )
 
-    def test_corrupt_store_is_rebuilt_not_propagated(self):
-        path = Path(evidence_path(str(self.ws)))
+    def test_corrupt_host_file_is_rebuilt_not_propagated(self):
+        path = Path(host_evidence_path(str(self.ws), "codex"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json", encoding="utf-8")
         recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
         self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
         data = json.loads(path.read_text(encoding="utf-8"))
-        self.assertIn(EVENT_MCP_SERVER_STARTED, data["hosts"]["codex"]["events"])
+        self.assertIn(EVENT_MCP_SERVER_STARTED, data["events"])
 
-    def test_summary_flags_corrupt_store_as_invalid(self):
-        path = Path(evidence_path(str(self.ws)))
+    def test_summary_flags_corrupt_host_file_as_invalid(self):
+        path = Path(host_evidence_path(str(self.ws), "codex"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json", encoding="utf-8")
         summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
@@ -452,7 +475,11 @@ class DoctorDogfoodTests(DogfoodCase):
             entry for entry in ladder if entry["stage"] == STAGE_HANDOFF_ROUND_TRIP
         )
         self.assertEqual(stage["state"], STAGE_PROVEN)
-        self.assertIn("read-back", stage["evidence"].lower())
+        # Truthful wording: no handoff-id correlation is persisted, so
+        # the claim says the routes were served, not that one write was
+        # matched to a read-back of that same write.
+        self.assertIn("read served", stage["evidence"].lower())
+        self.assertNotIn("read-back", stage["evidence"].lower())
 
     def test_operator_proof_is_visible_as_the_stronger_class(self):
         self.record("codex", self.codex_session_events())
@@ -532,7 +559,7 @@ class StaleEvidenceTests(DogfoodCase):
         )
         # Historical evidence is kept, not erased.
         self.assertTrue(
-            (self.root / ".relinkra" / "runtime-evidence.json").exists()
+            Path(host_evidence_path(str(self.root), "codex")).exists()
         )
 
 
@@ -687,6 +714,371 @@ class HostIdChannelTests(unittest.TestCase):
         from relinkra.runtime_evidence import HOST_ID_ENV
 
         self.assertEqual(HOST_ID_ENV, "RELINKRA_HOST_ID")
+
+
+class MultiHostEvidenceFileTests(unittest.TestCase):
+    """R6E — one bounded evidence file per host.
+
+    The pre-R6E store was one shared JSON file updated by
+    read-modify-write: concurrent Codex and OpenCode writers could
+    interleave and silently drop one host's bucket. With one file per
+    host there is no shared write target, so concurrent hosts cannot
+    lose each other's evidence. These tests prove that deterministically.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6e-multihost-")
+        self.addCleanup(self._temp.cleanup)
+        self.base = Path(self._temp.name)
+
+    def _fresh_ws(self) -> Path:
+        ws = self.base / f"ws-{time.monotonic_ns()}"
+        ws.mkdir(parents=True)
+        (ws / ".git").mkdir()
+        return ws
+
+    def test_concurrent_host_writers_keep_both_buckets(self):
+        """Two threads (Codex + OpenCode) recording past a shared
+        barrier, repeated: both buckets must survive fully."""
+        rounds_count = 25
+        for _ in range(5):
+            ws = self._fresh_ws()
+            barrier = threading.Barrier(2)
+
+            def write(host: str) -> None:
+                recorder = EvidenceRecorder(str(ws), host, revision="a" * 40)
+                barrier.wait(timeout=30)
+                for _ in range(rounds_count):
+                    self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+
+            threads = [
+                threading.Thread(target=write, args=(host,))
+                for host in ("codex", "opencode")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            summary = summarize_runtime_evidence(str(ws), "a" * 12)
+            for host in ("codex", "opencode"):
+                self.assertIn(host, summary["hosts"], f"{host} bucket lost")
+                bucket = summary["hosts"][host]["events"]
+                self.assertIn(EVENT_MCP_SERVER_STARTED, bucket)
+                self.assertEqual(
+                    bucket[EVENT_MCP_SERVER_STARTED]["count"],
+                    rounds_count,
+                    f"{host} lost updates to its own file",
+                )
+            self.assertFalse(summary["invalid"])
+            self.assertFalse(
+                Path(evidence_path(str(ws))).exists(),
+                "no shared single file may be written",
+            )
+
+    def test_concurrent_processes_keep_both_buckets(self):
+        """The same guarantee across real OS processes — the shape of
+        the failure the single shared file actually had."""
+        ws = self._fresh_ws()
+        script = (
+            "import sys\n"
+            "from relinkra.runtime_evidence import EvidenceRecorder,"
+            " EVENT_MCP_SERVER_STARTED\n"
+            "recorder = EvidenceRecorder(sys.argv[1], sys.argv[2],"
+            " revision='a' * 40)\n"
+            "for _ in range(15):\n"
+            "    recorder.record(EVENT_MCP_SERVER_STARTED)\n"
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(ws), host],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            for host in ("codex", "opencode")
+        ]
+        for process in processes:
+            _, stderr = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, stderr)
+        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        for host in ("codex", "opencode"):
+            self.assertIn(host, summary["hosts"])
+            bucket = summary["hosts"][host]["events"]
+            self.assertEqual(
+                bucket[EVENT_MCP_SERVER_STARTED]["count"], 15
+            )
+            self.assertEqual(
+                bucket[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 12
+            )
+
+    def test_legacy_single_file_evidence_remains_readable(self):
+        """Evidence written by the 0.1.3 layout stays visible, and new
+        evidence lands in the per-host layout beside it."""
+        ws = self._fresh_ws()
+        legacy_dir = ws / ".relinkra"
+        legacy_dir.mkdir()
+        legacy = {
+            "schema_version": "relinkra.runtime-evidence/v1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "hosts": {
+                "codex": {
+                    "events": {
+                        EVENT_MCP_SERVER_STARTED: {
+                            "observed_at": "2026-01-01T00:00:00+00:00",
+                            "revision": "a" * 12,
+                            "count": 3,
+                        }
+                    }
+                },
+                "opencode": {
+                    "events": {
+                        EVENT_MCP_SERVER_STARTED: {
+                            "observed_at": "2026-01-01T00:00:00+00:00",
+                            "revision": "a" * 12,
+                            "count": 2,
+                        }
+                    }
+                },
+            },
+        }
+        (legacy_dir / "runtime-evidence.json").write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        recorder = EvidenceRecorder(str(ws), "zcode", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        self.assertTrue(summary["present"])
+        self.assertFalse(summary["invalid"])
+        self.assertEqual(
+            summary["hosts"]["codex"]["events"][EVENT_MCP_SERVER_STARTED]["count"], 3
+        )
+        self.assertEqual(
+            summary["hosts"]["opencode"]["events"][EVENT_MCP_SERVER_STARTED]["count"], 2
+        )
+        self.assertIn("zcode", summary["hosts"])
+        # The legacy file is read, never rewritten.
+        self.assertEqual(
+            json.loads((legacy_dir / "runtime-evidence.json").read_text(
+                encoding="utf-8"
+            )),
+            legacy,
+        )
+        store = load_store(str(ws))
+        self.assertEqual(set(store["hosts"]), {"codex", "opencode", "zcode"})
+
+    def test_per_host_file_wins_over_legacy_bucket(self):
+        ws = self._fresh_ws()
+        legacy_dir = ws / ".relinkra"
+        legacy_dir.mkdir()
+        legacy = {
+            "schema_version": "relinkra.runtime-evidence/v1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "hosts": {
+                "codex": {
+                    "events": {
+                        EVENT_MCP_SERVER_STARTED: {
+                            "observed_at": "2026-01-01T00:00:00+00:00",
+                            "revision": "b" * 12,
+                            "count": 9,
+                        }
+                    }
+                }
+            },
+        }
+        (legacy_dir / "runtime-evidence.json").write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        recorder = EvidenceRecorder(str(ws), "codex", revision="a" * 40)
+        recorder.record(EVENT_MCP_SERVER_STARTED)
+        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        entry = summary["hosts"]["codex"]["events"][EVENT_MCP_SERVER_STARTED]
+        self.assertEqual(entry["revision"], "a" * 12)
+        self.assertEqual(entry["count"], 1)
+
+    def test_one_hosts_corrupt_file_does_not_block_the_other(self):
+        ws = self._fresh_ws()
+        evidence_dir = ws / ".relinkra" / "runtime-evidence"
+        evidence_dir.mkdir(parents=True)
+        (evidence_dir / "codex.json").write_text("{not json", encoding="utf-8")
+        recorder = EvidenceRecorder(str(ws), "opencode", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        self.assertIn("opencode", summary["hosts"])
+        self.assertNotIn("codex", summary["hosts"])
+        self.assertTrue(summary["invalid"])
+
+    def test_host_file_named_for_another_host_is_not_reattributed(self):
+        ws = self._fresh_ws()
+        evidence_dir = ws / ".relinkra" / "runtime-evidence"
+        evidence_dir.mkdir(parents=True)
+        payload = {
+            "schema_version": "relinkra.runtime-evidence/v1",
+            "host_id": "zcode",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "events": {
+                EVENT_MCP_SERVER_STARTED: {
+                    "observed_at": "2026-01-01T00:00:00+00:00",
+                    "revision": "a" * 12,
+                    "count": 1,
+                }
+            },
+        }
+        (evidence_dir / "codex.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        self.assertFalse(summary["present"])
+        self.assertTrue(summary["invalid"], "a mislabelled file is anomalous state")
+
+
+class UnknownRevisionTests(unittest.TestCase):
+    """R6E — an unreadable current revision yields ``unknown``, never
+    ``stale``. "Stale" would assert the evidence is historical, which is
+    exactly the fact nobody was able to establish."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6e-unknown-")
+        self.addCleanup(self._temp.cleanup)
+        self.ws = Path(self._temp.name) / "ws"
+        self.ws.mkdir()
+        (self.ws / ".git").mkdir()
+        recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+        recorder.record(EVENT_MCP_SERVER_STARTED)
+        recorder.record(
+            EVENT_INITIALIZE_OBSERVED,
+            {"protocol_negotiated": "2025-06-18", "protocol_agreed": True},
+        )
+        recorder.record(EVENT_TOOLS_LIST_OBSERVED)
+
+    def test_summary_state_is_unknown_not_stale(self):
+        summary = summarize_runtime_evidence(str(self.ws), "")
+        codex = summary["hosts"]["codex"]
+        self.assertEqual(codex["state"], "unknown")
+        self.assertEqual(codex["revision_relation"], "unknown")
+        self.assertTrue(codex["events"], "the evidence itself is kept")
+
+    def test_unknown_revision_proves_no_current_revision_stages(self):
+        summary = summarize_runtime_evidence(str(self.ws), "")
+        claims = runtime_stage_claims(summary, "")
+        # A launch is a fact about the host's history and survives.
+        self.assertIn("server_started", claims)
+        for stage in ("handshake", "protocol_agreed", "tools_visible"):
+            self.assertNotIn(stage, claims)
+
+    def test_doctor_reports_unknown_runtime_not_stale(self):
+        from unittest import mock
+
+        from relinkra.identity import GitError
+
+        # Drive the real doctor against a real repository whose HEAD
+        # cannot be read, with evidence recorded beforehand.
+        self._temp2 = tempfile.TemporaryDirectory(prefix="relinkra-r6e-doctor-")
+        self.addCleanup(self._temp2.cleanup)
+        base = Path(self._temp2.name)
+        self.repo = _real_git_repo(base)
+        self.root = self.repo.resolve()
+        revision = None
+        try:
+            from relinkra.identity import git_head_sha as _sha
+
+            revision = _sha(str(self.root))
+        except Exception:
+            revision = ""
+        recorder = EvidenceRecorder(str(self.root), "codex", revision=revision)
+        recorder.record(EVENT_MCP_SERVER_STARTED)
+        recorder.record(EVENT_INITIALIZE_OBSERVED, {"protocol_agreed": True})
+
+        home = base / "home"
+        home.mkdir()
+
+        def fake_current(workspace_root=None):
+            return DiscoveryEnvironment(
+                system=SYSTEM_WINDOWS if os.name == "nt" else SYSTEM_LINUX,
+                home=home,
+                env={},
+                workspace_root=Path(workspace_root) if workspace_root else None,
+                which=lambda name: None,
+            )
+
+        fixture = type(
+            "FixtureDiscoveryEnvironment", (),
+            {"current": staticmethod(fake_current)},
+        )
+        for module in (connect_cli, product_cli):
+            original = module.DiscoveryEnvironment
+            module.DiscoveryEnvironment = fixture
+            self.addCleanup(setattr, module, "DiscoveryEnvironment", original)
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with mock.patch(
+                "relinkra.product_cli.git_head_sha",
+                side_effect=GitError("head unreadable"),
+            ):
+                code = main(["doctor", "--path", str(self.repo), "--json"])
+        self.assertEqual(code, product_cli.EXIT_OK, err.getvalue())
+        payload = json.loads(out.getvalue())
+        row = next(a for a in payload["agents"] if a["agent"] == "codex")
+        self.assertEqual(row["runtime"], "unknown")
+
+
+class WorktreeHygieneTests(unittest.TestCase):
+    """R6E — runtime evidence must never dirty a linked worktree.
+
+    A linked worktree's ``.git`` is a FILE naming its administrative
+    directory; the repository-local exclude lives in the COMMON ``.git``
+    directory, and only writing there keeps ``git status`` clean.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6e-worktree-")
+        self.addCleanup(self._temp.cleanup)
+        self.base = Path(self._temp.name)
+        self.repo = _real_git_repo(self.base)
+
+    def test_linked_worktree_evidence_keeps_status_clean(self):
+        worktree = self.base / "wt"
+        _git(self.repo, "worktree", "add", str(worktree.resolve()), "-b", "wt-branch")
+        git_file = worktree / ".git"
+        self.assertTrue(git_file.is_file(), "fixture must be a linked worktree")
+        (worktree / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        _git(worktree, "add", ".")
+        _git(worktree, "commit", "-q", "-m", "worktree revision")
+
+        recorder = EvidenceRecorder(str(worktree.resolve()), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+
+        # The evidence file exists inside the worktree...
+        self.assertTrue(
+            Path(host_evidence_path(str(worktree.resolve()), "codex")).exists()
+        )
+        # ...the exclude went to the COMMON directory...
+        common_exclude = self.repo / ".git" / "info" / "exclude"
+        self.assertIn(".relinkra/", common_exclude.read_text(encoding="utf-8"))
+        # ...no tracked .gitignore was created or edited...
+        self.assertFalse((worktree / ".gitignore").exists())
+        self.assertFalse((self.repo / ".gitignore").exists())
+        # ...and BOTH worktrees report a clean status.
+        self.assertEqual(_git(worktree, "status", "--porcelain"), "")
+        self.assertEqual(_git(self.repo, "status", "--porcelain"), "")
+
+    def test_worktree_exclude_is_idempotent_and_preserves_comments(self):
+        worktree = self.base / "wt"
+        _git(self.repo, "worktree", "add", str(worktree.resolve()), "-b", "wt-branch-2")
+        recorder = EvidenceRecorder(str(worktree.resolve()), "codex", revision="a" * 40)
+        recorder.record(EVENT_MCP_SERVER_STARTED)
+        recorder._exclude_checked = False
+        recorder.record(EVENT_TOOL_INVOKED, {"tool": "context_get"})
+        exclude_path = self.repo / ".git" / "info" / "exclude"
+        content = exclude_path.read_text(encoding="utf-8")
+        self.assertEqual(content.count(".relinkra/"), 1)
+        self.assertIn("# git ls-files", content, "git's own comments survive")
+
+    def test_normal_repo_evidence_keeps_status_clean(self):
+        recorder = EvidenceRecorder(str(self.repo.resolve()), "opencode", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        self.assertEqual(_git(self.repo, "status", "--porcelain"), "")
+        exclude_path = self.repo / ".git" / "info" / "exclude"
+        self.assertIn(".relinkra/", exclude_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

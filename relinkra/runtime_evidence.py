@@ -19,14 +19,28 @@ Deliberate limits, in order of importance:
                       ``RELINKRA_HOST_ID``; anything else lands in a
                       separate ``host_unknown`` bucket and is never
                       attributed to a named host.
+    one file per host each host bucket is its own bounded file under
+                      ``.relinkra/runtime-evidence/<host>.json``. A writer
+                      never reads or rewrites another host's file, so two
+                      hosts recording concurrently cannot lose each
+                      other's evidence the way a single shared file's
+                      read-modify-write cycle could (R6E).
     revision-bound    each record carries the workspace revision it was
                       observed on, so doctor can tell current-revision
-                      evidence from historical evidence.
+                      evidence from historical evidence. When the current
+                      revision cannot be read at all, the relation is
+                      ``unknown`` — never ``stale``, which would claim a
+                      fact nobody established.
     non-secret        event names, timestamps, counters, protocol
                       versions and ids. No prompt text, no bodies, no
                       paths beyond the ids Relinkra already pins.
     compact           latest evidence per (host, event) plus a counter —
-                      never a log. The file cannot grow with usage.
+                      never a log. No file can grow with usage.
+
+The pre-R6E single-file layout (``.relinkra/runtime-evidence.json``) is
+still READ and merged into every summary, so evidence written by 0.1.3
+and early R6D builds remains visible. That legacy file is never written
+again; there is no migration step.
 """
 
 from __future__ import annotations
@@ -34,7 +48,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from .safe_write import SafeWriteError, atomic_write_text, read_bounded_text
 
@@ -44,10 +58,15 @@ SCHEMA_VERSION = "relinkra.runtime-evidence/v1"
 #: existing ``.relinkra/`` git-ignore rule, like the registry and the
 #: operator-proof store.
 CONFIG_DIR = ".relinkra"
-STORE_FILENAME = "runtime-evidence.json"
 
-#: Reading is bounded like every other persisted state read; the store is
-#: far smaller than this in practice.
+#: Directory holding one bounded evidence file per host.
+EVIDENCE_DIRNAME = "runtime-evidence"
+
+#: The pre-R6E single-file store. Read for compatibility; never written.
+LEGACY_FILENAME = "runtime-evidence.json"
+
+#: Reading is bounded like every other persisted state read; no file is
+#: larger than this in practice.
 MAX_FILE_BYTES = 256 * 1024
 MAX_HOSTS = 32
 MAX_DETAIL_CHARS = 128
@@ -117,9 +136,12 @@ def revision_relation(evidence_revision: str, current_revision: str) -> str:
                    enough to prove current-revision routing stages.
     ``older``    — real historical evidence, useful for "this host has
                    launched Relinkra before", never for current routing.
-    ``unknown``  — the evidence carries no revision (or the current one
-                   could not be read), so no current-revision claim is
-                   made from it.
+    ``unknown``  — neither side can be established: the evidence carries
+                   no revision, or the current one could not be read. No
+                   current-revision claim is made from it, and it is
+                   never reported as ``stale`` — "stale" asserts the
+                   evidence is historical, which is exactly the fact
+                   nobody was able to establish (R6E).
     """
     evidence_revision = short_revision(evidence_revision)
     current_revision = short_revision(current_revision)
@@ -155,8 +177,35 @@ def resolve_host_id(raw: Optional[str]) -> str:
     return ""
 
 
+def _validated_bucket_name(name: str) -> bool:
+    """True when ``name`` may own an evidence bucket: a registered
+    connector id, or the dedicated unknown bucket."""
+    return name == HOST_UNKNOWN or resolve_host_id(name) == name
+
+
 def evidence_path(workspace_root: str) -> str:
-    return os.path.join(str(workspace_root), CONFIG_DIR, STORE_FILENAME)
+    """The pre-R6E single-file store. Read for compatibility only."""
+    return os.path.join(str(workspace_root), CONFIG_DIR, LEGACY_FILENAME)
+
+
+def host_evidence_dir(workspace_root: str) -> str:
+    """The directory holding one evidence file per host."""
+    return os.path.join(str(workspace_root), CONFIG_DIR, EVIDENCE_DIRNAME)
+
+
+def host_evidence_path(workspace_root: str, host_id: str) -> str:
+    """The evidence file ONE host owns. Writers never touch another's."""
+    bucket = host_id if _validated_bucket_name(host_id) else HOST_UNKNOWN
+    return os.path.join(host_evidence_dir(workspace_root), f"{bucket}.json")
+
+
+def _empty_host_file(host_id: str) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "host_id": host_id,
+        "updated_at": "",
+        "events": {},
+    }
 
 
 def _empty_store() -> dict:
@@ -164,7 +213,8 @@ def _empty_store() -> dict:
 
 
 def normalize_store(data: Any) -> dict:
-    """Coerce a loaded store to the bounded, whitelisted shape.
+    """Coerce a loaded whole-store (legacy shape) to the bounded,
+    whitelisted shape.
 
     Unknown hosts, unknown events, oversized details and non-conforming
     values are dropped rather than preserved: the store can only ever
@@ -180,7 +230,7 @@ def normalize_store(data: Any) -> dict:
         for host_id, bucket in hosts_raw.items():
             if not isinstance(host_id, str) or not host_id:
                 continue
-            if host_id != HOST_UNKNOWN and resolve_host_id(host_id) != host_id:
+            if not _validated_bucket_name(host_id):
                 continue
             if len(hosts) >= MAX_HOSTS:
                 break
@@ -233,23 +283,103 @@ def _normalize_entry(entry: Any) -> dict:
     return normalized
 
 
-def load_store(workspace_root: Optional[str]) -> Optional[dict]:
-    """Read and normalize the store; None when there is none."""
+# Per-host file status codes, for callers that must distinguish "no
+# evidence" from "evidence exists but cannot be used".
+HOST_FILE_ABSENT = "absent"
+HOST_FILE_OK = "ok"
+HOST_FILE_INVALID = "invalid"
+
+
+def read_host_file(
+    workspace_root: Optional[str], host_id: str
+) -> Tuple[str, dict]:
+    """Read ONE host's evidence file.
+
+    Returns ``(status, bucket)``. The bucket is the whitelisted
+    ``{"events": ..., "project_id": ..., "workspace_id": ...}`` shape
+    the aggregate summaries attach under the host's name; it is empty
+    for every status other than ``ok``. The bucket key is the FILE's
+    name — a file whose embedded ``host_id`` disagrees with its own
+    filename is anomalous state, reported invalid rather than
+    attributed anywhere.
+
+    A file for an name that cannot own a bucket is not Relinkra state
+    at all and is ignored entirely.
+    """
+    if not workspace_root or not _validated_bucket_name(host_id):
+        return HOST_FILE_ABSENT, {}
+    path = host_evidence_path(workspace_root, host_id)
+    try:
+        text = read_bounded_text(path, max_bytes=MAX_FILE_BYTES)
+    except (OSError, ValueError, SafeWriteError):
+        return HOST_FILE_ABSENT, {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        # Exists but unreadable: an anomaly the summaries surface.
+        return HOST_FILE_INVALID, {}
+    if not isinstance(data, dict):
+        return HOST_FILE_INVALID, {}
+    embedded = data.get("host_id")
+    if isinstance(embedded, str) and embedded and embedded != host_id:
+        # The file says it belongs to another host. Never re-attribute
+        # it; the filename is the only identity anyone can rely on.
+        return HOST_FILE_INVALID, {}
+    bucket = _normalize_bucket(data)
+    for key in ("project_id", "workspace_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            bucket[key] = value[:MAX_DETAIL_CHARS]
+    updated = data.get("updated_at")
+    if isinstance(updated, str):
+        bucket["updated_at"] = updated[:MAX_DETAIL_CHARS]
+    return HOST_FILE_OK, bucket
+
+
+def host_file_invalid(workspace_root: Optional[str], host_id: str) -> bool:
+    """True when this host's file exists but cannot be used."""
+    status, _ = read_host_file(workspace_root, host_id)
+    return status == HOST_FILE_INVALID
+
+
+def _legacy_store_invalid(workspace_root: Optional[str]) -> bool:
+    """True when the legacy single-file store exists but cannot parse."""
     if not workspace_root:
-        return None
+        return False
     try:
         text = read_bounded_text(
             evidence_path(workspace_root), max_bytes=MAX_FILE_BYTES
         )
     except (OSError, ValueError, SafeWriteError):
-        return None
+        return False
     try:
-        data = json.loads(text)
+        json.loads(text)
     except ValueError:
-        # Corrupt state is treated as absent by the recorder (which
-        # rebuilds it) and flagged as invalid by doctor.
-        return None
-    return normalize_store(data)
+        return True
+    return False
+
+
+def _known_host_files(workspace_root: Optional[str]) -> Tuple[str, ...]:
+    """The host names present in the per-host directory, capped and
+    sorted for determinism."""
+    if not workspace_root:
+        return ()
+    directory = host_evidence_dir(workspace_root)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return ()
+    names = []
+    for entry in entries:
+        if not entry.endswith(".json"):
+            continue
+        name = entry[: -len(".json")]
+        if not isinstance(name, str) or not name:
+            continue
+        if not _validated_bucket_name(name):
+            continue
+        names.append(name)
+    return tuple(sorted(names)[:MAX_HOSTS])
 
 
 def _ignores_relinkra(text: str) -> bool:
@@ -275,6 +405,58 @@ def _sanitize_detail(detail: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     return clean
 
 
+def load_store(workspace_root: Optional[str]) -> Optional[dict]:
+    """Read and normalize the aggregate store; None when there is none.
+
+    The aggregate merges the per-host files with the legacy single-file
+    store, so evidence written before the per-host layout remains
+    visible. A per-host file wins over a same-named legacy bucket: the
+    newer, file-per-host evidence is the live record. Writers never
+    produce this shape — they write one host file each — so reading is
+    the only place the two layouts meet.
+    """
+    if not workspace_root:
+        return None
+    hosts: Dict[str, Any] = {}
+    any_evidence = False
+    latest_at = ""
+    # Legacy single-file store: read-only compatibility.
+    legacy_text = None
+    try:
+        legacy_text = read_bounded_text(
+            evidence_path(workspace_root), max_bytes=MAX_FILE_BYTES
+        )
+        any_evidence = True
+    except (OSError, ValueError, SafeWriteError):
+        legacy_text = None
+    if legacy_text is not None:
+        try:
+            data = json.loads(legacy_text)
+        except ValueError:
+            data = None
+        if data is not None:
+            normalized = normalize_store(data)
+            for host_id, bucket in normalized["hosts"].items():
+                hosts[host_id] = bucket
+            updated = normalized.get("updated_at") or ""
+            if updated > latest_at:
+                latest_at = updated
+    for name in _known_host_files(workspace_root):
+        status, bucket = read_host_file(workspace_root, name)
+        if status == HOST_FILE_OK:
+            any_evidence = True
+            hosts[name] = bucket
+            bucket_updated = bucket.get("updated_at") or ""
+            if bucket_updated > latest_at:
+                latest_at = bucket_updated
+    if not any_evidence and not hosts:
+        return None
+    store = _empty_store()
+    store["hosts"] = hosts
+    store["updated_at"] = latest_at
+    return store
+
+
 class EvidenceRecorder:
     """Best-effort writer of self-observed runtime evidence.
 
@@ -282,6 +464,12 @@ class EvidenceRecorder:
     path, full disk, hostile state file — is swallowed after one
     best-effort write. The worst outcome is missing evidence, which is
     exactly what doctor rendered before this module existed.
+
+    Each recorder owns exactly ONE file — its host's. It never reads or
+    rewrites another host's bucket, so concurrent hosts (Codex and
+    OpenCode recording at the same time, for instance) cannot lose each
+    other's evidence: there is no shared read-modify-write cycle to
+    interleave.
     """
 
     def __init__(
@@ -345,18 +533,19 @@ class EvidenceRecorder:
         if event not in EVENTS or not self.workspace_root:
             return False
         self._ensure_git_excluded()
-        path = evidence_path(self.workspace_root)
+        path = host_evidence_path(self.workspace_root, self.bucket_id)
         try:
             text = read_bounded_text(path, max_bytes=MAX_FILE_BYTES)
             data = json.loads(text)
         except (OSError, ValueError, SafeWriteError):
             # Absent or corrupt: rebuild from a clean skeleton rather
             # than propagating whatever damaged state was found.
-            data = _empty_store()
-        data = normalize_store(data)
+            data = _empty_host_file(self.bucket_id)
+        data = _normalize_host_file(data, self.bucket_id)
+        if data is None:
+            data = _empty_host_file(self.bucket_id)
 
-        bucket = data["hosts"].setdefault(self.bucket_id, {"events": {}})
-        events = bucket.setdefault("events", {})
+        events = data["events"]
         entry = events.get(event) if isinstance(events.get(event), dict) else {}
         entry["observed_at"] = self._clock()
         entry["revision"] = self._revision
@@ -371,9 +560,9 @@ class EvidenceRecorder:
             entry.pop("detail", None)
         events[event] = entry
 
-        for key, value in self._workspace_pin().items():
-            bucket[key] = value
         data["updated_at"] = self._clock()
+        for key, value in self._workspace_pin().items():
+            data[key] = value
 
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=1)
         atomic_write_text(path, payload)
@@ -389,15 +578,21 @@ class EvidenceRecorder:
         exclusion goes into ``.git/info/exclude`` — repository-local,
         never a tracked file, never pushed. Best effort only: any
         failure leaves git status as it was, and recording proceeds.
+
+        Linked worktrees are handled through the COMMON directory: a
+        ``.git`` FILE names the worktree's administrative directory,
+        whose ``commondir`` file names the shared ``.git``. The exclude
+        belongs there — it applies to every worktree, and writing
+        anywhere else would leave the worktree's status dirty (R6E).
         """
         if self._exclude_checked:
             return
         self._exclude_checked = True
         root = self.workspace_root
-        git_path = os.path.join(root, ".git")
-        if not os.path.isdir(git_path):
-            return  # worktree (.git file) or not a repo root: leave alone
-        info_dir = os.path.join(git_path, "info")
+        common_dir = _git_common_dir(root)
+        if not common_dir:
+            return  # not a repository we can describe: leave alone
+        info_dir = os.path.join(common_dir, "info")
         exclude_path = os.path.join(info_dir, "exclude")
         try:
             existing = ""
@@ -407,7 +602,8 @@ class EvidenceRecorder:
                 if _ignores_relinkra(existing):
                     return
             # A tracked .gitignore covering the directory makes the
-            # exclude entry redundant.
+            # exclude entry redundant. The worktree's own .gitignore is
+            # the one that governs what its status shows.
             gitignore_path = os.path.join(root, ".gitignore")
             if os.path.isfile(gitignore_path):
                 with open(gitignore_path, "r", encoding="utf-8", errors="replace") as h:
@@ -420,6 +616,91 @@ class EvidenceRecorder:
                 h.write(".relinkra/\n")
         except OSError:
             return
+
+
+def _git_common_dir(root: Optional[str]) -> Optional[str]:
+    """The repository-local directory holding ``info/exclude``.
+
+    Three layouts, resolved without spawning git:
+
+    ``.git/``      a normal repository — the ``.git`` directory itself.
+    ``.git`` file  a linked worktree — the file names the worktree's
+                   administrative directory (``gitdir:``), and that
+                   directory's ``commondir`` file names the shared
+                   ``.git``. Relative pointers are resolved against the
+                   directory that contains them.
+    none           not a repository root this module describes.
+
+    ``None`` means "cannot tell"; callers treat that as leave-alone.
+    """
+    if not root:
+        return None
+    git_path = os.path.join(str(root), ".git")
+    try:
+        if os.path.isdir(git_path):
+            return git_path
+        if not os.path.isfile(git_path):
+            return None
+        with open(git_path, "r", encoding="utf-8", errors="replace") as h:
+            first = h.readline().strip()
+        if not first.lower().startswith("gitdir:"):
+            return None
+        gitdir = first[len("gitdir:"):].strip()
+        if not gitdir:
+            return None
+        if not os.path.isabs(gitdir):
+            gitdir = os.path.normpath(os.path.join(str(root), gitdir))
+        if not os.path.isdir(gitdir):
+            return None
+        commondir_path = os.path.join(gitdir, "commondir")
+        if not os.path.isfile(commondir_path):
+            # A standalone .git file pointing at a full repository
+            # directory (some submodule layouts): the gitdir itself is
+            # the common dir when it holds an info/ directory.
+            if os.path.isdir(os.path.join(gitdir, "info")):
+                return gitdir
+            return None
+        with open(commondir_path, "r", encoding="utf-8", errors="replace") as h:
+            common = h.readline().strip()
+        if not common:
+            return None
+        if not os.path.isabs(common):
+            common = os.path.normpath(os.path.join(gitdir, common))
+        if not os.path.isdir(common):
+            return None
+        return common
+    except OSError:
+        return None
+
+
+def _normalize_host_file(data: Any, host_id: str) -> Optional[dict]:
+    """Coerce one host's file to the bounded, whitelisted shape.
+
+    Returns None for anything structurally unusable — the caller
+    rebuilds from a clean skeleton rather than propagating damaged
+    state. The embedded ``host_id``, when present, must agree with the
+    file's own name.
+    """
+    if not isinstance(data, dict):
+        return None
+    embedded = data.get("host_id")
+    if isinstance(embedded, str) and embedded and embedded != host_id:
+        return None
+    normalized = _empty_host_file(host_id)
+    events_raw = data.get("events")
+    if isinstance(events_raw, dict):
+        for event, entry in events_raw.items():
+            if event not in EVENTS:
+                continue
+            normalized["events"][event] = _normalize_entry(entry)
+    updated = data.get("updated_at")
+    if isinstance(updated, str):
+        normalized["updated_at"] = updated[:MAX_DETAIL_CHARS]
+    for key in ("project_id", "workspace_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            normalized[key] = value[:MAX_DETAIL_CHARS]
+    return normalized
 
 
 def build_evidence_recorder(
@@ -461,7 +742,7 @@ class HostRuntime:
     """One host bucket's self-observed evidence, classified for doctor."""
 
     host_id: str
-    state: str  # "observed" | "stale" | "pending"
+    state: str  # "observed" | "stale" | "unknown" | "pending"
     revision_relation: str  # "current" | "older" | "unknown" | ""
     last_observed_at: str
     revision: str
@@ -480,18 +761,25 @@ class HostRuntime:
 
 
 def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRuntime:
-    """Classify one bucket. Current-revision evidence dominates; older
-    evidence stays visible as historical, never promoted."""
+    """Classify one bucket.
+
+    Current-revision evidence dominates and is ``observed``. When the
+    current revision cannot be read (or an entry carries no revision),
+    the relation is ``unknown`` — evidence exists, but nothing can be
+    claimed about the current revision, and calling it ``stale`` would
+    assert a historical fact nobody established. Real historical
+    evidence (a readable revision that simply is not this one) stays
+    ``stale``: visible as history, never promoted.
+    """
     if not entries:
         return HostRuntime(
             host_id="", state="pending", revision_relation="",
             last_observed_at="", revision="", events={},
         )
     latest_at = ""
-    latest_relation = "older"
+    latest_revision = ""
     seen_current = False
     seen_unknown = False
-    latest_revision = ""
     for entry in entries.values():
         observed_at = str(entry.get("observed_at") or "")
         if observed_at > latest_at:
@@ -503,13 +791,15 @@ def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRunti
         elif relation == "unknown":
             seen_unknown = True
     if seen_current:
-        latest_relation = "current"
+        state, relation = "observed", "current"
     elif seen_unknown:
-        latest_relation = "unknown"
+        state, relation = "unknown", "unknown"
+    else:
+        state, relation = "stale", "older"
     return HostRuntime(
         host_id="",
-        state="observed" if seen_current else "stale",
-        revision_relation=latest_relation,
+        state=state,
+        revision_relation=relation,
         last_observed_at=latest_at,
         revision=latest_revision,
         events=dict(entries),
@@ -524,13 +814,14 @@ def summarize_runtime_evidence(
     The result is plain data (dicts of primitives) so it can ride inside
     the routing assessment payload unchanged.
     """
+    invalid = _store_invalid(workspace_root)
     loaded = load_store(workspace_root)
     if loaded is None:
         # Absent is the quiet case; a file that exists but cannot be
         # parsed is an anomaly doctor should name.
         return {
             "present": False,
-            "invalid": _store_invalid(workspace_root),
+            "invalid": invalid,
             "hosts": {},
         }
     hosts: Dict[str, dict] = {}
@@ -546,26 +837,26 @@ def summarize_runtime_evidence(
         hosts[host_id] = summary
     return {
         "present": bool(hosts),
-        "invalid": _store_invalid(workspace_root),
+        "invalid": invalid,
         "current_revision": short_revision(current_revision),
         "hosts": hosts,
     }
 
 
 def _store_invalid(workspace_root: Optional[str]) -> bool:
-    """True when a store exists but cannot be parsed (anomalous state)."""
+    """True when evidence state exists but cannot be used (anomalous).
+
+    Covers the legacy single-file store and every per-host file: any
+    existing evidence file that cannot be parsed, or that names a
+    different host than its own file, makes the store anomalous.
+    """
     if not workspace_root:
         return False
-    try:
-        text = read_bounded_text(
-            evidence_path(workspace_root), max_bytes=MAX_FILE_BYTES
-        )
-    except (OSError, ValueError, SafeWriteError):
-        return False
-    try:
-        json.loads(text)
-    except ValueError:
+    if _legacy_store_invalid(workspace_root):
         return True
+    for name in _known_host_files(workspace_root):
+        if host_file_invalid(workspace_root, name):
+            return True
     return False
 
 
@@ -591,7 +882,9 @@ def runtime_stage_claims(summary: dict, current_revision: str = "") -> dict:
     True only for what was directly observed on the current revision. The
     one deliberate exception is the server-start claim: a launch is a
     fact about the host's history, so historical evidence still proves
-    it — with the revision relation named in the evidence string.
+    it — with the revision relation named in the evidence string. When
+    the current revision cannot be read, only the launch claim survives:
+    "unknown" evidence never proves current-revision stages.
 
     Claims from the ``host_unknown`` bucket are included here: the ladder
     speaks for the workspace, and "some process launched Relinkra and
@@ -712,22 +1005,27 @@ def runtime_stage_claims(summary: dict, current_revision: str = "") -> dict:
                     f"revision {entry.get('revision') or 'unknown'})",
                 )
 
-    # A handoff round trip needs BOTH halves observed on the current
-    # revision. One create alone is a write nobody read back.
+    # Both halves observed on the current revision. No handoff-id
+    # correlation is persisted, so the honest wording is "write and read
+    # served": the server observed a write route and a read route. It
+    # did NOT correlate one write with one read-back of that write
+    # (R6E) — only an operator proof asserts an actual round trip.
     create = claims.get("handoff_create")
     fetch = claims.get("handoff_get")
     if create and create[0] and fetch and fetch[0]:
         claims["handoff_round_trip"] = (
             True,
-            f"self-observed handoff write and read-back; {create[1]}; {fetch[1]}",
+            f"self-observed handoff write and read served; {create[1]}; {fetch[1]}",
         )
 
     return claims
 
 
 def handoff_round_trip_observed(summary: dict, current_revision: str = "") -> bool:
-    """True when both halves of a handoff round trip were self-observed
-    on the current revision. One create alone never proves the trip."""
+    """True when both handoff route halves (write and read) were
+    self-observed on the current revision. One create alone never
+    proves even that; no self-observed claim proves an actual
+    correlated round trip — that is operator-proof territory."""
     claims = runtime_stage_claims(summary, current_revision)
     trip = claims.get("handoff_round_trip")
     return bool(trip and trip[0])

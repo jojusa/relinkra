@@ -1083,6 +1083,11 @@ class OpenCodeDoctorPerHostTests(ConnectApplyOpenCodeCase):
         self.assertFalse(hosts["claude"]["locally_verified"])
         code, out, _ = self.run_cli("check", "opencode")
         self.assertEqual(code, EXIT_OK)
+        # R6E: compact by default — the global per-host table is
+        # verbose-only detail.
+        self.assertNotIn("Per-host verification", out)
+        code, out, _ = self.run_cli("check", "opencode", "--verbose")
+        self.assertEqual(code, EXIT_OK)
         self.assertIn("Per-host verification", out)
         self.assertIn("opencode", out)
         self.assertIn("claude", out)

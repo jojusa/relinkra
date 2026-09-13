@@ -830,12 +830,52 @@ AGENT_GUIDANCE = (
     "read, edit, test, and validation tools remain fully available."
 )
 
+#: R6E routing order, in one compact rule. Relinkra-first: the cheap
+#: shared tools answer project questions before broad exploration.
+#: Source-authoritative: Relinkra evidence is advisory; source and git
+#: decide. Expand-on-demand: heavier tools are pulled in only for what
+#: the cheaper step did not answer.
+ROUTING_ORDER_TEXT = (
+    "For project questions, work in this order: project_resolve, then the "
+    "active handoff or context_get, then memory if needed, then CBM code "
+    "relationships, and native source/search tools as needed. Relinkra "
+    "evidence is advisory; source code and git are authoritative, and "
+    "deeper tools are pulled in only for what the cheaper step did not "
+    "answer. Native tools are never blocked."
+)
+
+#: R6E Engram coexistence. Relinkra's context_get already routes through
+#: the shared memory backend, so querying Engram directly for the same
+#: orientation duplicates work and token cost. Direct Engram stays fully
+#: available — this is a recommendation about the default path, not a
+#: restriction.
+ENGRAM_COEXISTENCE_TEXT = (
+    "For normal project context, use Relinkra first and do not duplicate "
+    "the same retrieval through direct Engram. Direct Engram remains fully "
+    "available and is the right path for Gentleman/SDD state, explicitly "
+    "Engram-only workflows, and information Relinkra does not expose."
+)
+
 AGENT_INSTRUCTIONS: Tuple[AgentInstruction, ...] = (
     AgentInstruction(
         "when_relinkra_helps",
         AGENT_GUIDANCE,
         "A compact host-neutral rule improves tool discoverability without "
         "forcing every request through Relinkra or replacing native tools.",
+    ),
+    AgentInstruction(
+        "relinkra_first_routing",
+        ROUTING_ORDER_TEXT,
+        "A stated order turns Relinkra-first from a slogan into a default "
+        "an agent can follow, without blocking or inflating native tools.",
+    ),
+    AgentInstruction(
+        "engram_coexistence",
+        ENGRAM_COEXISTENCE_TEXT,
+        "Relinkra already routes to the shared memory backend, so a "
+        "default that avoids duplicate direct retrieval saves tokens and "
+        "keeps one attribution path, while Engram-only workflows keep "
+        "their direct route.",
     ),
 )
 
@@ -988,8 +1028,10 @@ __all__ = [
     "ENGRAM_SHARED_SEPARATED",
     "ENGRAM_UNAVAILABLE",
     "ENGRAM_UNKNOWN",
+    "ENGRAM_COEXISTENCE_TEXT",
     "INSTRUCTION_VERSION",
     "AGENT_GUIDANCE",
+    "ROUTING_ORDER_TEXT",
     "MANAGED_MODE_REQUIREMENTS",
     "METRICS_TRUST_STATES",
     "OBSERVABILITY_HOST_CONFIG",

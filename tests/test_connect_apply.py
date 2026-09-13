@@ -1510,7 +1510,15 @@ class CheckVerificationSectionTests(ConnectApplyCase):
         self.claude_config(
             {"mcpServers": {MANAGED_SERVER_NAME: self.registered_claude_entry()}}
         )
-        code, out, _ = self.run_cli("check", "claude")
+        # R6E: the default check output is compact and host-local; the
+        # persisted-evidence detail lives behind --verbose.
+        code, compact, _ = self.run_cli("check", "claude")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("✓ Config valid", compact)
+        self.assertNotIn("Verification", compact)
+        self.assertNotIn("Per-host verification", compact)
+
+        code, out, _ = self.run_cli("check", "claude", "--verbose")
         self.assertEqual(code, EXIT_OK)
         self.assertIn("Verification", out)
         self.assertIn("absent", out)

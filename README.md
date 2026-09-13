@@ -58,9 +58,11 @@ is a verified no-op. Configuration presence is never proof that the host
 launched Relinkra.
 
 Supported front-door targets are `codex`, `opencode`, `claude`,
-`devin-desktop`, and `zcode`. There is intentionally no `relinkra connect all`.
-This front door is part of the 0.1.3 release-preparation candidate and is not
-yet published. The last public 0.1.2 package does not expose it; use a source
+`devin-desktop`, and `zcode`. To connect every supported host in one
+command, use `relinkra connect all` (see [Multiagent onboarding and
+routing](#multiagent-onboarding-and-routing-r6e) below). This front door
+is part of the 0.1.3 release-preparation candidate and is not yet
+published. The last public 0.1.2 package does not expose it; use a source
 checkout to exercise this candidate.
 
 ### Level B — Safe Advanced Connector Workflow (last-published 0.1.2)
@@ -150,6 +152,91 @@ relinkra connect verify <agent> --proof <proof-file>
 `relinkra connect generic` route is available for generic configuration work.
 `devin-cloud` is unsupported.
 
+## Multiagent onboarding and routing (R6E)
+
+### Connect all
+
+`relinkra connect all` walks every default target — `codex`, `opencode`,
+`claude`, `devin-desktop`, `zcode` — through its OWN per-agent pipeline:
+inspect, check, plan, preflight, confirmation, apply, and restart guidance.
+It is a driver over the per-agent safety, never a weaker batch path:
+
+- already-valid hosts are safe no-ops;
+- every write asks per host (`apply?`); declining one host writes nothing
+  for it and does not affect the others;
+- a refused or malformed host fails closed and is reported, without
+  marking the others successful;
+- each apply owns its own backup and rollback; there is no cross-host
+  rollback;
+- non-interactive runs (nobody to answer the confirmation) decline every
+  write; there is deliberately no consent flag that bypasses the
+  per-host confirmation.
+
+The summary table reports each host's config state, workspace match,
+runtime evidence, and outcome. Repeating `connect all` is idempotent.
+
+### Compact check
+
+`relinkra connect check <agent>` is concise and host-local by default:
+
+```
+Codex CLI
+✓ Config valid
+✓ Workspace matches
+○ Runtime pending
+
+Next: start/restart Codex CLI
+```
+
+Use `--verbose` for the full report (findings, persisted verification
+evidence, and the per-host sections). The JSON payload always carries the
+full detail.
+
+### Inspect workspace match
+
+`relinkra connect inspect <agent>` exposes `workspace_matches`
+(`true`, `false`, or unknown) directly, so you do not need inspect plus
+check to learn whether a registration points at the current workspace.
+
+### Host runtime states
+
+Runtime evidence is displayed with honest categories: `attested` (an
+operator-recorded proof), `observed` (self-observed on the current
+revision), `stale` (explicitly historical), `unknown` (evidence exists
+but the current revision could not be read to classify it), and
+`pending` (nothing observed yet). Self-observed evidence is never
+displayed as externally attested, and one host's evidence is never
+attributed to another host. When the current Git revision cannot be
+read, the relation is `unknown`, never `stale`.
+
+Evidence storage is one bounded file per host
+(`.relinkra/runtime-evidence/<host>.json`), so concurrent hosts cannot
+lose each other's evidence, and the pre-R6E single-file store remains
+readable. No migration is required.
+
+### ZCode generated state
+
+`connect check zcode` and `connect inspect zcode` classify ZCode's
+workspace-local generated state (`.zcode/config.json` and
+`.zcode/config.json.lock`). When both files are git-ignored and Git is
+clean, the state is reported as healthy (PASS) instead of a generic
+warning. Only a real hygiene problem — generated state showing in Git
+status — warns. Relinkra never deletes the lock file and never edits
+`.gitignore`.
+
+### Relinkra-first routing and Engram coexistence
+
+`connect list` and `connect all` surface the routing guidance:
+
+- **Order:** `project_resolve` → active handoff / `context_get` → memory
+  if needed → CBM code relationships → native source/search as needed.
+  Relinkra-first, source-authoritative, expand-on-demand; native tools
+  are never blocked.
+- **Engram:** use Relinkra first for normal project context and do not
+  duplicate the same retrieval through direct Engram. Direct Engram
+  remains fully available for Gentleman/SDD state, explicitly
+  Engram-only workflows, and information Relinkra does not expose.
+
 ## Revision and generated-state hygiene
 
 Relinkra keeps the registered workspace snapshot separate from live Git. In
@@ -163,8 +250,11 @@ state is explicitly unknown/degraded.
 `.zcode/config.json.lock` is ZCode-owned generated state: Relinkra detects and
 reports it but never deletes it. Relinkra does not silently edit `.gitignore`;
 review Git ownership/ignore policy explicitly before committing workspace
-state. `.relinkra/`, `.codebase-memory/`, and `*.relinkra-backup*` remain local
-state. Engram remains an independent optional coexistence path.
+state (see [ZCode generated state](#zcode-generated-state) for the R6E
+healthy/unhygienic classification). `.relinkra/`, `.codebase-memory/`, and
+`*.relinkra-backup*` remain local state; runtime evidence lives under
+`.relinkra/runtime-evidence/` and never dirties a linked worktree's Git
+status. Engram remains an independent optional coexistence path.
 
 ## Project-local state
 

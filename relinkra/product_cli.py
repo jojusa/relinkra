@@ -928,7 +928,10 @@ def _runtime_evidence_check(assessment) -> Optional[Check]:
     Absent evidence is PENDING (nothing exercised yet). Evidence that
     exists but cannot be parsed is WARN (an anomalous state on disk).
     Healthy evidence passes with each host's revision relation named, so
-    current-revision and historical evidence are never conflated.
+    current-revision, historical and unclassifiable evidence are never
+    conflated: ``observed`` proves the current revision, ``stale`` is
+    explicitly historical, and ``unknown`` means evidence exists while
+    the current revision could not be read to compare it against.
     """
     runtime = getattr(assessment, "runtime_evidence", None)
     if runtime is None:
@@ -938,10 +941,10 @@ def _runtime_evidence_check(assessment) -> Optional[Check]:
         return Check(
             "Runtime evidence",
             WARN,
-            "the runtime evidence file could not be parsed; it will be "
+            "the runtime evidence store could not be parsed; it will be "
             "rebuilt the next time the Relinkra server runs",
-            "No action is required — the file rebuilds automatically the "
-            "next time a host launches Relinkra.",
+            "No action is required — the evidence store rebuilds "
+            "automatically the next time a host launches Relinkra.",
         )
     if not hosts:
         return Check(
@@ -959,8 +962,17 @@ def _runtime_evidence_check(assessment) -> Optional[Check]:
             label = "unknown host"
         state = host.get("state") or "pending"
         relation = host.get("revision_relation") or ""
-        suffix = f", {relation} revision" if relation and state != "pending" else ""
-        parts.append(f"{label}: {state}{suffix}")
+        if state == "observed":
+            parts.append(f"{label}: observed, {relation or 'unknown'} revision")
+        elif state == "stale":
+            parts.append(f"{label}: historical ({relation or 'stale'} revision)")
+        elif state == "unknown":
+            parts.append(
+                f"{label}: evidence present, current revision could not be "
+                "read to classify it"
+            )
+        else:
+            parts.append(f"{label}: {state}")
     return Check(
         "Runtime evidence",
         PASS,
@@ -1946,7 +1958,7 @@ def _agents_table(assessment) -> List[dict]:
         if state == "observed" and relation == "older":
             label = "stale"
         elif state == "observed" and relation == "unknown":
-            label = "observed"
+            label = "unknown"
         table.append(
             {
                 "agent": "unknown host",
@@ -1959,11 +1971,14 @@ def _agents_table(assessment) -> List[dict]:
 
 
 def _runtime_label(verification_row: dict, runtime_host: Optional[dict]) -> str:
-    """One host's runtime column: attested > observed > stale > pending.
+    """One host's runtime column: attested > observed > stale > unknown >
+    pending.
 
     An operator proof is the stronger evidence class, so it wins the
     label when both exist; the JSON row keeps the raw verification
-    status either way.
+    status either way. Self-observed evidence is never rendered as
+    ``attested`` — that label is reserved for recorded operator proofs,
+    and one host's evidence never labels another host.
     """
     if verification_row.get("locally_verified") or (
         verification_row.get("verification_status") == "valid"
@@ -1976,6 +1991,8 @@ def _runtime_label(verification_row: dict, runtime_host: Optional[dict]) -> str:
         return "observed"
     if state == "stale":
         return "stale"
+    if state == "unknown":
+        return "unknown"
     return "pending"
 
 

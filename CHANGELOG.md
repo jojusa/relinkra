@@ -3,6 +3,47 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased — R6E multiagent UX and routing
+
+Not yet published; no version bump.
+
+### Added
+
+- `relinkra connect all`: a multiagent front door that runs every default
+  target (`codex`, `opencode`, `claude`, `devin-desktop`, `zcode`) through
+  its own per-agent inspect/check/plan/preflight/confirmation/apply
+  pipeline, with a per-host summary table, per-host confirmation, and
+  fail-closed behavior for refused or malformed hosts.
+- `connect check --verbose` for the full report; the default check output
+  is now compact and host-local (config, workspace, generated state,
+  runtime evidence, one next action).
+- `connect inspect` now exposes `workspace_matches` directly.
+- Relinkra-first routing order and Engram coexistence guidance, surfaced
+  in `connect list` and `connect all` output and the agent-instruction
+  contract.
+
+### Changed
+
+- Runtime evidence moved to one bounded file per host
+  (`.relinkra/runtime-evidence/<host>.json`): concurrent hosts can no
+  longer lose each other's evidence through a shared-file
+  read-modify-write. The pre-R6E single-file store remains readable; no
+  migration is required.
+- An unreadable current Git revision now reports runtime evidence as
+  `unknown`, never `stale`, and proves no current-revision stages.
+- Runtime evidence exclude handling covers linked worktrees by writing
+  the repository-local exclude into the Git common directory, keeping
+  worktree status clean.
+- The self-observed handoff claim is worded truthfully as "handoff write
+  and read served" — no handoff-id correlation is persisted.
+- ZCode generated state (`.zcode/config.json`, `.zcode/config.json.lock`)
+  is classified: git-ignored and Git-clean is healthy (no warning);
+  generated state showing in Git warns precisely. Relinkra still never
+  deletes the lock file or edits `.gitignore`.
+- A missing host executable is reported together with the fact that
+  workspace configuration can still be prepared, instead of a bare
+  not-installed state.
+
 ## 0.1.3 — release-preparation candidate
 
 This candidate is not yet published.

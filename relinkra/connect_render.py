@@ -13,10 +13,12 @@ command rather than reaching the user.
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from .backend_policy import (
     AGENT_INSTRUCTIONS,
+    ENGRAM_COEXISTENCE_TEXT,
+    ROUTING_ORDER_TEXT,
     STAGE_NOT_PROVEN,
     STAGE_PROVEN,
     STAGE_UNVERIFIED,
@@ -24,6 +26,8 @@ from .backend_policy import (
 from .connector import (
     MANAGED_SERVER_NAME,
     PLAN_READY,
+    REGISTRATION_ABSENT,
+    REGISTRATION_ALREADY_CONNECTED,
     CapabilityMatrix,
     ConnectorPlan,
     ConnectorReport,
@@ -50,6 +54,19 @@ def _bullets(title: str, items: Sequence[str]) -> List[str]:
     if not items:
         return []
     return [title, *[f"  - {item}" for item in items], ""]
+
+
+def _guidance_footer(lines: List[str]) -> List[str]:
+    """The R6E routing guidance, concise and host-neutral.
+
+    Surfaced in normal-user connect output so the guidance lives where
+    onboarding happens, not only in docs or agent-instruction payloads.
+    """
+    lines.append("Routing guidance (Relinkra-first):")
+    lines.append(f"  {ROUTING_ORDER_TEXT}")
+    lines.append(f"  {ENGRAM_COEXISTENCE_TEXT}")
+    lines.append("")
+    return lines
 
 
 def render_list(reports: Sequence[ConnectorReport]) -> str:
@@ -95,6 +112,8 @@ def render_list(reports: Sequence[ConnectorReport]) -> str:
         )
         lines.append("")
     lines.append("Next: 'relinkra connect inspect <agent>' or 'connect generic'.")
+    lines.append("")
+    lines.extend(_guidance_footer([]))
     return "\n".join(lines)
 
 
@@ -108,7 +127,13 @@ def _render_capabilities(capabilities: CapabilityMatrix) -> List[str]:
     return lines
 
 
-def render_inspect(spec, report: ConnectorReport, *, reveal: bool = False) -> str:
+def render_inspect(
+    spec,
+    report: ConnectorReport,
+    *,
+    reveal: bool = False,
+    workspace_matches: Optional[bool] = None,
+) -> str:
     lines = ["", f"{report.display_name} ({report.connector_id})", ""]
     rows = [
         ("Support", report.support_status),
@@ -117,6 +142,13 @@ def render_inspect(spec, report: ConnectorReport, *, reveal: bool = False) -> st
         ("Executable", "found on PATH" if report.executable_found else "not on PATH"),
         ("Transport", report.transport),
     ]
+    if workspace_matches is not None:
+        rows.append(
+            (
+                "Workspace",
+                "matches" if workspace_matches else "differs",
+            )
+        )
     if report.aliases:
         rows.append(("Aliases", ", ".join(report.aliases)))
     if report.env_keys:
@@ -204,6 +236,143 @@ def render_plan(plan: ConnectorPlan) -> str:
     )
     lines.append("This command wrote nothing. Planning is always read-only.")
     lines.append("")
+    return "\n".join(lines)
+
+
+_GLYPH_OK = "✓"
+_GLYPH_ATTENTION = "✗"
+_GLYPH_PENDING = "○"
+
+#: The runtime-evidence display row per host state. ``observed`` is
+#: self-observed current-revision evidence and is never rendered as an
+#: externally attested fact; ``stale`` is explicitly historical;
+#: ``unknown`` means evidence exists while the current revision could
+#: not be read to classify it.
+_RUNTIME_ROWS = {
+    "observed": f"{_GLYPH_OK} Runtime observed",
+    "stale": f"{_GLYPH_PENDING} Runtime historical (stale)",
+    "unknown": f"{_GLYPH_PENDING} Runtime unknown",
+    "pending": f"{_GLYPH_PENDING} Runtime pending",
+}
+
+_HOST_RUNTIME_ROWS = {
+    "observed": "observed",
+    "stale": "stale",
+    "unknown": "unknown",
+    "pending": "pending",
+}
+
+
+def _check_next_line(spec, result, runtime) -> str:
+    """Exactly one next action for the compact check output."""
+    agent = spec.connector_id
+    host = spec.display_name
+    if result.valid and result.registration_state == REGISTRATION_ALREADY_CONNECTED:
+        state = (runtime or {}).get("state") or "pending"
+        if state == "observed":
+            return f"Next: no action needed — {host} is connected and observed."
+        if state == "stale":
+            return (
+                f"Next: start/restart {host} on this revision to refresh "
+                "runtime evidence."
+            )
+        if state == "unknown":
+            return (
+                f"Next: start/restart {host}; runtime evidence could not "
+                "be classified."
+            )
+        return f"Next: start/restart {host}"
+    if result.registration_state == REGISTRATION_ABSENT:
+        return f"Next: run 'relinkra connect {agent}' to register {host}."
+    return f"Next: run 'relinkra connect plan {agent}' to see what would change."
+
+
+def render_check_compact(spec, result, *, runtime=None, generated_state=None) -> str:
+    """The R6E concise host-local check output.
+
+    Everything here is about THIS host only — no global tables, no
+    per-host verification sections for hosts the user did not ask about.
+    Those stay in ``--verbose`` and in the JSON payload.
+    """
+    lines = ["", spec.display_name]
+    if result.valid and result.registration_state == REGISTRATION_ALREADY_CONNECTED:
+        lines.append(f"{_GLYPH_OK} Config valid")
+    elif result.registration_state == REGISTRATION_ABSENT:
+        lines.append(f"{_GLYPH_PENDING} Registration absent")
+    else:
+        lines.append(f"{_GLYPH_ATTENTION} Config needs attention")
+        for finding in result.findings:
+            lines.append(f"    - {finding}")
+    if result.matches_workspace is True:
+        lines.append(f"{_GLYPH_OK} Workspace matches")
+    elif result.matches_workspace is False:
+        lines.append(f"{_GLYPH_ATTENTION} Workspace differs")
+
+    status = (generated_state or {}).get("status") or "absent"
+    if status == "healthy":
+        lines.append(f"{_GLYPH_OK} Generated state Git-clean")
+    elif status == "unhygienic":
+        lines.append(f"{_GLYPH_ATTENTION} Generated state shows in Git")
+    elif status == "unknown":
+        lines.append(f"{_GLYPH_PENDING} Generated state unknown")
+
+    state = (runtime or {}).get("state") or "pending"
+    lines.append(_RUNTIME_ROWS.get(state, _RUNTIME_ROWS["pending"]))
+
+    for warning in result.warnings:
+        lines.append(f"! {warning.code}: {warning.message}")
+
+    lines.append("")
+    lines.append(_check_next_line(spec, result, runtime))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_all(rows: Sequence[dict], *, footer: bool = True) -> str:
+    """The ``connect all`` summary table plus per-host detail.
+
+    One row per host, outcome-honest: ``apply?`` means the host needs a
+    decision, and applied/declined/refused/failed are what actually
+    happened for THAT host — one host's failure never reads as another
+    host's success. The table is rendered twice in interactive runs:
+    before the confirmations (with ``apply?`` rows) and once more with
+    final outcomes; the pre-decision rendering omits the footer.
+    """
+    header = ("Agent", "Config", "Workspace", "Runtime", "Action")
+    table = [header]
+    for row in rows:
+        table.append(
+            (
+                row["display_name"],
+                row["config"],
+                row["workspace"],
+                _HOST_RUNTIME_ROWS.get(row["runtime"], row["runtime"]),
+                row["action"],
+            )
+        )
+    widths = [
+        max(len(str(row[index])) for row in table) + 2 for index in range(len(header))
+    ]
+    lines = ["", "Relinkra connect all", ""]
+    for row in table:
+        lines.append(
+            "".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip()
+        )
+    lines.append("")
+
+    details = [row for row in rows if row.get("detail")]
+    if details:
+        for row in details:
+            lines.append(f"  {row['connector_id']}: {row['detail']}")
+        lines.append("")
+
+    if footer:
+        lines.extend(_guidance_footer([]))
+        lines.append(
+            "No host was written without its own confirmation, and one host's "
+            "outcome never changes another host's."
+        )
+        lines.append("")
     return "\n".join(lines)
 
 

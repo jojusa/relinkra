@@ -467,7 +467,10 @@ class AgentContractTests(unittest.TestCase):
 
     def test_every_required_instruction_is_present(self):
         ids = {item.instruction_id for item in AGENT_INSTRUCTIONS}
-        self.assertEqual(ids, {"when_relinkra_helps"})
+        self.assertEqual(
+            ids,
+            {"when_relinkra_helps", "relinkra_first_routing", "engram_coexistence"},
+        )
         text = AGENT_INSTRUCTIONS[0].text.lower()
         for phrase in (
             "shared project context layer",
@@ -487,6 +490,35 @@ class AgentContractTests(unittest.TestCase):
             "current source",
         ):
             self.assertIn(phrase, text)
+
+    def test_relinka_first_routing_preserves_the_three_properties(self):
+        routing = next(
+            item
+            for item in AGENT_INSTRUCTIONS
+            if item.instruction_id == "relinkra_first_routing"
+        )
+        text = routing.text.lower()
+        # Relinkra-first: a stated order starting with the shared tools.
+        self.assertIn("project_resolve", text)
+        self.assertIn("context_get", text)
+        # Source-authoritative: advisory evidence, decisive source.
+        self.assertIn("advisory", text)
+        self.assertIn("authoritative", text)
+        # Expand-on-demand without blocking native tools.
+        self.assertIn("never blocked", text)
+
+    def test_engram_coexistence_discourages_duplicate_retrieval_only(self):
+        coexistence = next(
+            item
+            for item in AGENT_INSTRUCTIONS
+            if item.instruction_id == "engram_coexistence"
+        )
+        text = coexistence.text.lower()
+        self.assertIn("relinkra first", text)
+        self.assertIn("do not duplicate", text)
+        # Direct Engram stays legitimate for its own workflows.
+        self.assertIn("fully available", text)
+        self.assertIn("gentleman/sdd", text)
 
     def test_every_instruction_carries_a_rationale(self):
         for item in AGENT_INSTRUCTIONS:

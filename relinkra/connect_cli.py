@@ -43,6 +43,7 @@ user's terminal.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -52,7 +53,9 @@ from .backend_policy import agent_instruction_document
 from .config_merge import MergeError
 from .connect_render import (
     render_apply,
+    render_all,
     render_check,
+    render_check_compact,
     render_generic,
     render_inspect,
     render_list,
@@ -72,6 +75,9 @@ from .connect_verification import (
 )
 from .connector import (
     PLAN_READY,
+    REGISTRATION_ALREADY_CONNECTED,
+    REGISTRATION_ABSENT,
+    REGISTRATION_NEEDS_UPDATE,
     ConnectorReport,
     ConnectorWarning,
     UnknownConnectorError,
@@ -99,6 +105,7 @@ from .connectors import (
 )
 from .handoff import contains_absolute_path
 from .host_discovery import DiscoveryEnvironment
+from .runtime_evidence import summarize_runtime_evidence
 from .safe_write import SafeWriteError, read_bounded_text
 from .backend_policy import ROUTE_MANAGED
 from .product_cli import (
@@ -171,25 +178,171 @@ def _launch_for(root, connector_id: Optional[str] = None) -> Any:
     return resolve_launch(root, registry_path(root) if root else None)
 
 
-def _add_generated_state_guidance(spec, root, inspection) -> None:
-    """Report ZCode generated-state ownership without changing Git/files."""
-    if spec.connector_id != "zcode" or root is None:
-        return
+_GIT_PROBE_TIMEOUT = 15.0
+
+
+def _git_run(root, *argv: str) -> Optional[str]:
+    """Run one read-only git probe, or None when git cannot answer.
+
+    Used only for the ZCode generated-state classification; every
+    failure — missing git, timeout, non-zero exit — is reported as
+    "unknown" by the callers, never raised into the command.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *argv],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_GIT_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _git_path_ignored(root, rel_path: str) -> Optional[bool]:
+    """Whether git ignores ``rel_path``. None when git cannot answer.
+
+    ``check-ignore`` exits 1 for "not ignored" — that is a successful
+    answer (False), not a failure.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--", rel_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_GIT_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def zcode_generated_state(root) -> dict:
+    """Classify ZCode's workspace-local generated state. Read-only.
+
+    ``healthy``    config.json and config.json.lock exist, both are
+                   git-ignored, and neither shows in git status — the
+                   host owns its files and git is clean. Not a warning.
+    ``unhygienic`` generated state exists but shows in git status — a
+                   real hygiene problem, worth a warning.
+    ``unknown``    git could not answer; the cautious legacy warning
+                   stays rather than claiming a clean bill of health.
+    ``absent``     no generated state to classify.
+
+    Relinkra never deletes the lock file and never edits .gitignore here.
+    """
+    result = {
+        "status": "absent",
+        "config_present": False,
+        "lock_present": False,
+        "config_ignored": None,
+        "lock_ignored": None,
+        "git_dirty": None,
+    }
+    if root is None:
+        return result
+    config = Path(root) / ".zcode" / "config.json"
     lock = Path(root) / ".zcode" / "config.json.lock"
-    if lock.exists():
+    result["config_present"] = config.exists()
+    result["lock_present"] = lock.exists()
+    if not result["config_present"] and not result["lock_present"]:
+        return result
+    if result["config_present"]:
+        result["config_ignored"] = _git_path_ignored(root, ".zcode/config.json")
+    if result["lock_present"]:
+        result["lock_ignored"] = _git_path_ignored(root, ".zcode/config.json.lock")
+    status_out = _git_run(
+        root, "status", "--porcelain", "--", ".zcode/config.json",
+        ".zcode/config.json.lock",
+    )
+    if status_out is not None:
+        result["git_dirty"] = bool(status_out.strip())
+    known_ignores = [
+        value for value in (result["config_ignored"], result["lock_ignored"])
+        if value is not None
+    ]
+    if len(known_ignores) != bool(result["config_present"]) + bool(
+        result["lock_present"]
+    ):
+        result["status"] = "unknown"
+        return result
+    if result["git_dirty"] is None:
+        result["status"] = "unknown"
+        return result
+    if all(known_ignores) and not result["git_dirty"]:
+        result["status"] = "healthy"
+    else:
+        result["status"] = "unhygienic"
+    return result
+
+
+def _add_generated_state_guidance(spec, root, inspection) -> dict:
+    """Report ZCode generated-state ownership without changing Git/files.
+
+    Healthy generated state (both generated files git-ignored, git
+    status clean) is the PASS case and warns about nothing. Only a real
+    hygiene problem — generated state showing in git status — warns.
+    When git cannot answer, the cautious legacy wording stays.
+    """
+    state = {"status": "absent"}
+    if spec.connector_id != "zcode" or root is None:
+        return state
+    state = zcode_generated_state(root)
+    if state["status"] == "healthy":
+        return state
+    if state["status"] == "unhygienic":
+        inspection.warn(
+            "zcode_generated_state_git_dirty",
+            "ZCode's workspace-local generated state currently shows in "
+            "git status. Decide the ignore policy yourself; Relinkra does "
+            "not delete the lock file and does not edit .gitignore.",
+        )
+        return state
+    if state["lock_present"]:
         inspection.warn(
             "zcode_lock_present",
             "ZCode's workspace-local config lock is present; it is host-owned "
             "generated state. Relinkra will not delete it or edit .gitignore.",
         )
-    config = Path(root) / ".zcode" / "config.json"
-    if config.exists():
+    if state["config_present"]:
         inspection.warn(
             "zcode_workspace_state",
             "ZCode configuration is workspace-local generated state. Review "
             "Git ownership/ignore policy yourself; Relinkra does not silently "
             "edit .gitignore.",
         )
+    return state
+
+
+#: R6E — the note that resolves the ready/not_installed contradiction:
+#: a missing executable says nothing about the workspace configuration
+#: a plan can still prepare.
+HOST_NOT_DETECTED_CODE = "host_not_detected"
+HOST_NOT_DETECTED_NOTE = (
+    "Host executable not detected. "
+    "Workspace configuration can still be prepared."
+)
+
+
+def _add_discovery_note(spec, inspection) -> None:
+    """Say plainly when the host binary is absent but the workspace
+    configuration can still be prepared."""
+    if not spec.locations or inspection.executable:
+        return
+    inspection.warn(HOST_NOT_DETECTED_CODE, HOST_NOT_DETECTED_NOTE)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +359,7 @@ def cmd_list(args) -> int:
     for spec in CONNECTORS:
         inspection = inspect_connector(spec, env)
         _add_generated_state_guidance(spec, root, inspection)
+        _add_discovery_note(spec, inspection)
         # Planned here too, not only in `connect plan`: without it the
         # "registration planned" capability could never be true and the
         # column would be decorative. Planning is free — the config was
@@ -221,6 +375,7 @@ def cmd_list(args) -> int:
         "real_host_launch_proven": any(
             report.capabilities.real_host_launch_proven for report in reports
         ),
+        "agent_instructions": agent_instruction_document(),
     }
     return _emit(
         payload, render_list(reports), as_json=args.json, allow_paths=False
@@ -240,18 +395,49 @@ def cmd_inspect(args) -> int:
         _launch_for(root, spec.connector_id) if root is not None else None
     )
     inspection = inspect_connector(spec, env)
-    _add_generated_state_guidance(spec, root, inspection)
+    generated_state = _add_generated_state_guidance(spec, root, inspection)
+    _add_discovery_note(spec, inspection)
+
+    # R6E: answer "does the registration point at THIS workspace?"
+    # directly, so a user does not need inspect + check just to learn
+    # it. Same engine check uses; read-only, and None (unknown) when
+    # there is no registration or no workspace to compare against.
+    workspace_matches = None
+    if root is not None and launch is not None:
+        unreadable_scope_finding, shadow_hints = authoritative_scope_status(
+            spec,
+            env,
+            target_path=preferred_connector_target_path(spec, inspection),
+        )
+        check_result = check_registration(
+            spec,
+            inspection,
+            launch,
+            shadow_hints=shadow_hints,
+            authoritative_scope_finding=unreadable_scope_finding or "",
+            legacy_scope_findings=legacy_scope_findings(spec, env),
+        )
+        workspace_matches = check_result.matches_workspace
+
     plan = build_plan(spec, inspection, launch) if launch else None
     report = build_report(spec, inspection, launch, plan)
 
     reveal = bool(getattr(args, "reveal_paths", False))
     payload = report.to_dict()
     payload["format_evidence"] = spec.format_evidence
+    payload["workspace_matches"] = workspace_matches
+    if spec.connector_id == "zcode":
+        payload["zcode_generated_state"] = generated_state
     if reveal:
         payload["locations"] = [loc.to_machine_dict() for loc in report.locations]
     return _emit(
         payload,
-        render_inspect(spec, report, reveal=reveal),
+        render_inspect(
+            spec,
+            report,
+            reveal=reveal,
+            workspace_matches=workspace_matches,
+        ),
         as_json=args.json,
         allow_paths=reveal,
     )
@@ -282,6 +468,7 @@ def cmd_plan(args) -> int:
     launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
     _add_generated_state_guidance(spec, root, inspection)
+    _add_discovery_note(spec, inspection)
     plan = build_plan(spec, inspection, launch)
 
     payload = plan.to_dict()
@@ -296,6 +483,25 @@ def cmd_plan(args) -> int:
     # A blocked or unavailable plan ran fine; it is the OUTCOME that
     # needs a person, which is exactly what exit 2 means here.
     return EXIT_ACTION_REQUIRED
+
+
+def _confirm_write(spec, args) -> bool:
+    """The per-host write confirmation, shared by the front door and
+    ``connect all``. A declined or unreadable answer writes nothing:
+    there is deliberately no flag that turns this off."""
+    prompt = (
+        f"Relinkra will update the {spec.display_name} configuration after "
+        "the existing inspect/plan checks."
+    )
+    if args.json:
+        print(prompt, file=sys.stderr)
+    else:
+        print(prompt)
+    try:
+        answer = input("" if args.json else "Continue and write the configuration? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def cmd_connect(args) -> int:
@@ -323,6 +529,7 @@ def cmd_connect(args) -> int:
     launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
     _add_generated_state_guidance(spec, root, inspection)
+    _add_discovery_note(spec, inspection)
     plan = build_plan(spec, inspection, launch)
     if plan.status != PLAN_READY:
         payload = plan.to_dict()
@@ -386,19 +593,7 @@ def cmd_connect(args) -> int:
             allow_paths=False,
         )
 
-    prompt = (
-        f"Relinkra will update the {spec.display_name} configuration after "
-        "the existing inspect/plan checks."
-    )
-    if args.json:
-        print(prompt, file=sys.stderr)
-    else:
-        print(prompt)
-    try:
-        answer = input("" if args.json else "Continue and write the configuration? [y/N] ")
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-    if answer.strip().lower() not in {"y", "yes"}:
+    if not _confirm_write(spec, args):
         payload = plan.to_dict()
         payload.update({"front_door": True, "confirmation": "declined"})
         return _emit(
@@ -422,6 +617,265 @@ def cmd_connect(args) -> int:
     if code != EXIT_OK:
         return code
     return _write_exit_code(result)
+
+
+# ---------------------------------------------------------------------------
+# Connect all — the multiagent front door (R6E)
+# ---------------------------------------------------------------------------
+
+#: The default multiagent target set. Each host still runs through its
+#: own inspect/plan/preflight/confirmation/apply pipeline; ``all`` is a
+#: driver over the per-agent safety, never a weaker batch path.
+CONNECT_ALL_TARGETS = ("codex", "opencode", "claude", "devin-desktop", "zcode")
+
+#: Per-host outcomes. ``apply?`` is the pre-confirmation classification;
+#: every other outcome is final for the run.
+OUTCOME_NO_OP = "no-op"
+OUTCOME_APPLY = "apply?"
+OUTCOME_APPLIED = "applied"
+OUTCOME_DECLINED = "declined"
+OUTCOME_REFUSED = "refused"
+OUTCOME_FAILED = "failed"
+OUTCOME_UNAVAILABLE = "unavailable"
+
+_GOOD_OUTCOMES = (OUTCOME_NO_OP, OUTCOME_APPLIED)
+
+
+def _evaluate_host(agent: str, root, env) -> dict:
+    """Run ONE host through the read-only half of its pipeline and
+    classify it. Never writes, never prompts.
+
+    Reuses exactly the same inspect -> check -> plan -> preflight
+    authority the single-host front door uses, so ``connect all`` cannot
+    classify a host more optimistically than ``connect <agent>`` would.
+    Any unexpected error fails THAT host closed and leaves the others
+    untouched.
+    """
+    row = {
+        "connector_id": agent,
+        "display_name": agent,
+        "classification": "",
+        "config": "-",
+        "workspace": "-",
+        "runtime": "pending",
+        "action": OUTCOME_FAILED,
+        "detail": "",
+        "warnings": [],
+        "restart_instruction": "",
+        "_spec": None,
+        "_launch": None,
+        "_inspection": None,
+        "_plan": None,
+    }
+    try:
+        spec = resolve_connector(agent)
+        launch = _launch_for(root, spec.connector_id)
+        inspection = inspect_connector(spec, env)
+        generated_state = _add_generated_state_guidance(spec, root, inspection)
+        _add_discovery_note(spec, inspection)
+        unreadable_scope_finding, shadow_hints = authoritative_scope_status(
+            spec,
+            env,
+            target_path=preferred_connector_target_path(spec, inspection),
+        )
+        check_result = check_registration(
+            spec,
+            inspection,
+            launch,
+            shadow_hints=shadow_hints,
+            authoritative_scope_finding=unreadable_scope_finding or "",
+            legacy_scope_findings=legacy_scope_findings(spec, env),
+        )
+        plan = build_plan(spec, inspection, launch)
+        preflight = connector_safety_preflight(
+            spec,
+            launch,
+            env,
+            inspection=inspection,
+            plan=plan,
+        )
+    except Exception as exc:
+        # One host failing to evaluate must not fail the run: it is
+        # reported as that host's outcome, and the others continue.
+        row["classification"] = "failed"
+        row["detail"] = f"evaluation failed: {exc.__class__.__name__}"
+        return row
+
+    row["_spec"] = spec
+    row["_launch"] = launch
+    row["_inspection"] = inspection
+    row["_plan"] = plan
+    row["display_name"] = spec.display_name
+    row["restart_instruction"] = spec.restart_instruction
+    row["warnings"] = [warning.to_dict() for warning in inspection.warnings]
+    if spec.connector_id == "zcode":
+        row["zcode_generated_state"] = generated_state
+
+    state = check_result.registration_state
+    if not check_result.findings and state == REGISTRATION_ALREADY_CONNECTED:
+        config_label = "valid"
+    elif state == REGISTRATION_ABSENT:
+        config_label = "absent"
+    elif state == REGISTRATION_NEEDS_UPDATE:
+        config_label = "needs_update"
+    elif state == "conflict":
+        config_label = "conflict"
+    else:
+        config_label = "invalid"
+    row["config"] = config_label
+
+    if check_result.matches_workspace is True:
+        row["workspace"] = "matches"
+    elif check_result.matches_workspace is False:
+        row["workspace"] = "differs"
+
+    if preflight.refused:
+        row["classification"] = "unsafe/refused"
+        row["action"] = OUTCOME_REFUSED
+        row["detail"] = preflight.refusal_reason
+    elif plan.status != PLAN_READY:
+        row["classification"] = "unavailable"
+        row["action"] = OUTCOME_UNAVAILABLE
+        row["detail"] = plan.unavailable_reason
+    elif config_label == "valid" and plan.idempotent and preflight.no_op_verified:
+        row["classification"] = "already_valid"
+        row["action"] = OUTCOME_NO_OP
+    elif config_label in ("absent", "needs_update", "invalid"):
+        row["classification"] = config_label
+        row["action"] = OUTCOME_APPLY
+    else:
+        # Valid-looking config whose plan would still change something:
+        # ask, exactly like the single-host front door would.
+        row["classification"] = "needs_update"
+        row["action"] = OUTCOME_APPLY
+
+    if not row["detail"] and any(
+        warning["code"] == HOST_NOT_DETECTED_CODE for warning in row["warnings"]
+    ):
+        row["detail"] = HOST_NOT_DETECTED_NOTE
+    return row
+
+
+def cmd_all(args) -> int:
+    """Safely connect every supported agent host at once.
+
+    Each host runs its OWN inspect -> check -> plan -> preflight ->
+    confirmation -> apply pipeline — the same code path as
+    ``connect <agent>``, never a weaker batch shortcut:
+
+    - already valid hosts are safe no-ops;
+    - every write asks per host, interactively; a non-interactive run
+      (no one to answer) declines every write rather than inventing a
+      consent flag — nothing is written without an explicit per-host
+      confirmation;
+    - a refused, malformed or unsafe host is reported and does not
+      affect the others;
+    - one host's failure never marks another host successful, and no
+      cross-host rollback is attempted: each apply owns its own backup
+      and rollback, as in the single-host path.
+
+    Exit 0 when every host ended applied or no-op; exit 2 when any host
+    needs a human decision.
+    """
+    root, env = _environment(args)
+    if root is None:
+        _fail(
+            "Not inside a git repository.",
+            "Run 'relinkra connect all' from inside a git repository.",
+        )
+        return EXIT_ERROR
+
+    try:
+        runtime_summary = summarize_runtime_evidence(
+            str(root), _current_revision_for(root)
+        )
+    except Exception:
+        runtime_summary = {"hosts": {}}
+    runtime_hosts = runtime_summary.get("hosts") or {}
+
+    rows = []
+    for agent in CONNECT_ALL_TARGETS:
+        row = _evaluate_host(agent, root, env)
+        runtime_host = runtime_hosts.get(agent) or {}
+        row["runtime"] = runtime_host.get("state") or "pending"
+        rows.append(row)
+
+    # The pre-decision table: the user sees what each host needs BEFORE
+    # any confirmation is asked (human output only; JSON consumers read
+    # the final payload). Printing is audited like every other render —
+    # a path leak skips the pre-table instead of reaching the terminal.
+    if not args.json:
+        pre_table = render_all(rows, footer=False)
+        leaked = contains_absolute_path(pre_table) or any(
+            contains_absolute_path(item) for item in iter_strings(rows)
+        )
+        if not leaked:
+            print(pre_table)
+
+    # Phase 2: per-host confirmation and apply, in the fixed target
+    # order. A declined host mutates nothing; a failed host does not
+    # stop the others.
+    for row in rows:
+        if row["action"] != OUTCOME_APPLY:
+            continue
+        spec = row["_spec"]
+        if not _confirm_write(spec, args):
+            row["action"] = OUTCOME_DECLINED
+            row["detail"] = "Confirmation declined; no file was changed."
+            continue
+        try:
+            result = apply_connector(
+                spec,
+                row["_launch"],
+                env,
+                inspection=row["_inspection"],
+                plan=row["_plan"],
+            )
+        except Exception as exc:
+            row["action"] = OUTCOME_FAILED
+            row["detail"] = f"apply failed: {exc.__class__.__name__}"
+            continue
+        if result.ok and not result.change_required:
+            row["action"] = OUTCOME_NO_OP
+            row["detail"] = (
+                "Already up to date when apply re-checked the real file."
+            )
+        elif result.ok:
+            row["action"] = OUTCOME_APPLIED
+            row["detail"] = spec.restart_instruction
+        elif result.refused:
+            row["action"] = OUTCOME_REFUSED
+            row["detail"] = result.refusal_reason
+        else:
+            row["action"] = OUTCOME_FAILED
+            row["detail"] = result.error or "the apply did not succeed"
+
+    # The private carry-through objects never reach the payload.
+    for row in rows:
+        for key in ("_spec", "_launch", "_inspection", "_plan"):
+            row.pop(key, None)
+
+    payload = {
+        "targets": list(CONNECT_ALL_TARGETS),
+        "hosts": rows,
+        "written": [
+            row["connector_id"]
+            for row in rows
+            if row["action"] == OUTCOME_APPLIED
+        ],
+        "agent_instructions": agent_instruction_document(),
+    }
+    code = _emit(
+        payload,
+        render_all(rows),
+        as_json=args.json,
+        allow_paths=False,
+    )
+    if code != EXIT_OK:
+        return code
+    if all(row["action"] in _GOOD_OUTCOMES for row in rows):
+        return EXIT_OK
+    return EXIT_ACTION_REQUIRED
 
 
 def _verification_section(root, host: str, fingerprint: str) -> dict:
@@ -470,14 +924,53 @@ def _apply_capable_host_ids() -> Tuple[str, ...]:
     return tuple(spec.connector_id for spec in CONNECTORS if spec.apply_available)
 
 
+def _current_revision_for(root) -> str:
+    """The workspace revision, or '' when git cannot provide one.
+
+    An empty result binds nothing: evidence is reported as ``unknown``
+    relative to the current revision, never as ``stale``.
+    """
+    try:
+        from .identity import git_head_sha
+
+        return git_head_sha(str(root)) or ""
+    except Exception:
+        return ""
+
+
+def _host_runtime_state(root, connector_id: str) -> dict:
+    """One host's self-observed runtime evidence, classified.
+
+    Read-only and failure-safe: evidence that cannot be summarized is
+    reported as pending rather than disturbing ``check``.
+    """
+    try:
+        summary = summarize_runtime_evidence(str(root), _current_revision_for(root))
+    except Exception:
+        return {}
+    host = (summary or {}).get("hosts", {}).get(connector_id) or {}
+    return {
+        "state": host.get("state") or "pending",
+        "revision_relation": host.get("revision_relation") or "",
+        "last_observed_at": host.get("last_observed_at") or "",
+        "source": host.get("source") or "self_observed",
+    }
+
+
 def cmd_check(args) -> int:
     """Validate an existing registration without modifying it.
 
-    Also reports the persisted host-verification evidence, honestly:
-    config-side validity decides the exit code, and the host side is a
-    reported state (absent/stale/expired/valid), never an inference from
-    file existence. Every apply-capable host gets its own row; they are
-    never collapsed into one boolean.
+    The default output is concise and host-local (config, workspace,
+    generated state, runtime evidence, one next action). ``--verbose``
+    restores the full report — findings, the persisted host-verification
+    evidence, and the per-host sections for every apply-capable host.
+    The JSON payload always carries the full detail, so no API consumer
+    loses information to the compact default.
+
+    Config-side validity decides the exit code, and the host side is a
+    reported state (pending/observed/stale/unknown), never an inference
+    from file existence. Self-observed runtime evidence is displayed as
+    exactly that — never as an externally attested fact.
     """
     try:
         spec = resolve_connector(args.agent)
@@ -495,7 +988,8 @@ def cmd_check(args) -> int:
 
     launch = _launch_for(root, spec.connector_id)
     inspection = inspect_connector(spec, env)
-    _add_generated_state_guidance(spec, root, inspection)
+    generated_state = _add_generated_state_guidance(spec, root, inspection)
+    _add_discovery_note(spec, inspection)
     unreadable_scope_finding, shadow_hints = authoritative_scope_status(
         spec,
         env,
@@ -515,20 +1009,29 @@ def cmd_check(args) -> int:
         host_id: _verification_section(root, host_id, fingerprint)
         for host_id in _apply_capable_host_ids()
     }
+    runtime = _host_runtime_state(root, spec.connector_id)
 
     payload = result.to_dict()
     payload["verification"] = verification
     payload["host_verification_sections"] = host_verification
-    code = _emit(
-        payload,
-        render_check(
+    payload["runtime"] = runtime
+    if spec.connector_id == "zcode":
+        payload["zcode_generated_state"] = generated_state
+    verbose = bool(getattr(args, "verbose", False))
+    if verbose:
+        rendered = render_check(
             result,
             verification=verification,
             host_verification_sections=host_verification,
-        ),
-        as_json=args.json,
-        allow_paths=False,
-    )
+        )
+    else:
+        rendered = render_check_compact(
+            spec,
+            result,
+            runtime=runtime,
+            generated_state=generated_state,
+        )
+    code = _emit(payload, rendered, as_json=args.json, allow_paths=False)
     if code != EXIT_OK:
         return code
     return EXIT_OK if result.valid else EXIT_ACTION_REQUIRED
@@ -814,9 +1317,10 @@ def cmd_generic(args) -> int:
 #: (name, handler, help, takes_agent, extra_flags)
 _COMMANDS = (
     ("list", cmd_list, "list known connectors and their proven state", False, ()),
+    ("all", cmd_all, "safely connect every supported host (per-agent checks and confirmations)", False, ()),
     ("inspect", cmd_inspect, "read-only discovery for one host", True, ("reveal",)),
     ("plan", cmd_plan, "show a deterministic mutation plan", True, ("dry-run",)),
-    ("check", cmd_check, "validate an existing registration", True, ()),
+    ("check", cmd_check, "validate an existing registration", True, ("verbose",)),
     (
         "routing",
         cmd_routing,
@@ -874,6 +1378,13 @@ def register(subparsers) -> None:
                 "--reveal-paths",
                 action="store_true",
                 help="include machine-local paths and environment values",
+            )
+        if "verbose" in extras:
+            command.add_argument(
+                "--verbose",
+                action="store_true",
+                help="full detail: findings, verification evidence and the "
+                "per-host sections",
             )
         if "dry-run" in extras:
             command.add_argument(
