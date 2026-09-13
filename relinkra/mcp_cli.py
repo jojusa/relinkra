@@ -15,6 +15,7 @@ from typing import Optional
 
 from .app_service import RelinkraServices, ServiceConfig
 from .mcp_server import MCPServer
+from .runtime_evidence import build_evidence_recorder
 from .workspace_resolution import resolve_registry_path, resolve_workspace_root
 
 ENV_PREFIX = "RELINKRA_"
@@ -174,7 +175,15 @@ def main(argv: Optional[list] = None) -> int:
 
     args = build_parser().parse_args(argv)
     services = build_services(args)
-    server = MCPServer(services)
+    # Host attribution is opt-in at launch: a connector configuration may
+    # export RELINKRA_HOST_ID so the server knows which host launched it.
+    # Anything absent or unrecognised records as host_unknown — the
+    # process name and argv are never used to guess.
+    recorder = build_evidence_recorder(
+        services.config.workspace_root,
+        _env("HOST_ID"),
+    )
+    server = MCPServer(services, evidence_recorder=recorder)
     try:
         return server.serve()
     except KeyboardInterrupt:

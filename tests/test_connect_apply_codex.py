@@ -73,6 +73,7 @@ from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    PENDING,
     WARN,
     WorkspaceConfig,
     main,
@@ -1357,7 +1358,9 @@ class CodexDoctorPerHostTests(ConnectApplyCodexCase):
         self.assertTrue(claude["locally_verified"])
 
         checks = {check["name"]: check for check in payload["checks"]}
-        self.assertEqual(checks["Host verification"]["status"], WARN)
+        # Claude's valid evidence does not degrade, and Codex's absent
+        # evidence is an unexercised host, not a broken one: PENDING.
+        self.assertEqual(checks["Host verification"]["status"], PENDING)
 
 
 class CodexFrontDoorSafetyTests(ConnectApplyCodexCase):

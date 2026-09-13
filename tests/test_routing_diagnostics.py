@@ -63,6 +63,7 @@ from relinkra.product_cli import (
     EXIT_OK,
     FAIL,
     PASS,
+    PENDING,
     WARN,
     main,
     routing_checks,
@@ -319,9 +320,13 @@ class DoctorTrustTests(RoutingCLICase):
     def test_configuration_presence_is_not_promoted_to_pass(self):
         self.claude({"relinkra": RELINKRA_ENTRY})
         checks = self.doctor_checks()
-        self.assertEqual(checks["Context routing"]["status"], WARN)
-        self.assertEqual(checks["Metrics trust"]["status"], WARN)
-        self.assertEqual(checks["Integration trust"]["status"], WARN)
+        # Configuration alone never reads as healthy. On this fixture the
+        # workspace is also un-initialized, so Relinkra's health is
+        # degraded and the route warns; a healthy-but-unexercised route
+        # renders PENDING instead — either way, never PASS.
+        self.assertNotEqual(checks["Context routing"]["status"], PASS)
+        self.assertNotEqual(checks["Metrics trust"]["status"], PASS)
+        self.assertNotEqual(checks["Integration trust"]["status"], PASS)
 
     def test_the_ladder_names_the_stages_that_are_not_proven(self):
         self.claude({"relinkra": RELINKRA_ENTRY})
@@ -381,7 +386,7 @@ class DoctorTrustTests(RoutingCLICase):
         checks = self.doctor_checks()
         self.assertEqual(checks["CBM ownership"]["status"], WARN)
         self.assertIn("disagrees", checks["CBM ownership"]["action"])
-        _, out, _ = self.run_cli("doctor")
+        _, out, _ = self.run_cli("doctor", "--verbose")
         self.assertIn("Routing notes", out)
         self.assertIn("disagrees with what it launches", out)
 
@@ -487,14 +492,22 @@ class CheckRenderingTests(unittest.TestCase):
     def test_no_routing_check_can_produce_a_fail(self):
         for route in (ROUTE_UNVERIFIED, ROUTE_MIXED, ROUTE_MANAGED):
             for check in self._checks(context_route=route).values():
-                self.assertIn(check.status, (PASS, WARN), check.name)
+                self.assertIn(check.status, (PASS, PENDING, WARN), check.name)
 
-    def test_an_unproven_ladder_stage_keeps_integration_trust_at_warn(self):
+    def test_an_unexercised_ladder_stage_keeps_integration_trust_pending(self):
+        # Nobody has exercised the rung: not proven, but nothing wrong.
         checks = self._checks(ladder=TrustLadder((TrustStage("a", None),)))
-        self.assertEqual(checks["Integration trust"].status, WARN)
+        self.assertEqual(checks["Integration trust"].status, PENDING)
         self.assertEqual(
             TrustLadder((TrustStage("a", None),)).stages[0].state, "unverified"
         )
+
+    def test_a_ladder_stage_reported_not_achieved_warns(self):
+        # Recorded evidence actively reporting a stage as failed is a
+        # real conflict with readiness, distinct from PENDING.
+        checks = self._checks(ladder=TrustLadder((TrustStage("a", False),)))
+        self.assertEqual(checks["Integration trust"].status, WARN)
+        self.assertIn("not achieved", checks["Integration trust"].detail)
 
     def test_a_proven_ladder_reports_proven(self):
         ladder = TrustLadder((TrustStage("a", True),))

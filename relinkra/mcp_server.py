@@ -41,6 +41,19 @@ from .app_service import (
     ServiceError,
 )
 from .backend_policy import agent_instruction_text
+from .runtime_evidence import (
+    EVENT_CBM_ACTIVITY,
+    EVENT_CONTEXT_GET_CALLED,
+    EVENT_HANDOFF_CREATE_CALLED,
+    EVENT_HANDOFF_GET_CALLED,
+    EVENT_INITIALIZE_OBSERVED,
+    EVENT_MCP_SERVER_STARTED,
+    EVENT_MEMORY_ACTIVITY,
+    EVENT_PROJECT_RESOLVE_CALLED,
+    EVENT_TOOLS_LIST_OBSERVED,
+    EVENT_TOOL_INVOKED,
+    EvidenceRecorder,
+)
 
 SERVER_NAME = "relinkra"
 
@@ -534,6 +547,22 @@ TOOLS: List[dict] = [
 
 TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
 
+#: Which successful tool calls prove which served route, beyond the
+#: generic "a tool was invoked" event. One call can advance at most one
+#: route event; ``git_context`` and ``health`` prove dispatch only.
+_TOOL_EVIDENCE_EVENTS = {
+    "project_resolve": EVENT_PROJECT_RESOLVE_CALLED,
+    "context_get": EVENT_CONTEXT_GET_CALLED,
+    "handoff_create": EVENT_HANDOFF_CREATE_CALLED,
+    "handoff_get": EVENT_HANDOFF_GET_CALLED,
+    "memory_search": EVENT_MEMORY_ACTIVITY,
+    "memory_get": EVENT_MEMORY_ACTIVITY,
+    "memory_save": EVENT_MEMORY_ACTIVITY,
+    "code_resolve": EVENT_CBM_ACTIVITY,
+    "code_architecture": EVENT_CBM_ACTIVITY,
+    "code_relationships": EVENT_CBM_ACTIVITY,
+}
+
 
 class ProtocolError(Exception):
     """A JSON-RPC level failure (bad envelope, unknown method, bad params)."""
@@ -636,10 +665,22 @@ def _check_bounds(key: str, spec: dict, value: Any) -> Any:
 
 
 class MCPServer:
-    """MCP stdio server bound to one RelinkraServices facade."""
+    """MCP stdio server bound to one RelinkraServices facade.
 
-    def __init__(self, services: RelinkraServices):
+    ``evidence_recorder`` is optional and injectable. When supplied, the
+    server persists minimal self-observed evidence (server start,
+    handshake, tools/list, successful tool calls) so trust can survive
+    the session; recording is best-effort and never perturbs serving.
+    """
+
+    def __init__(
+        self,
+        services: RelinkraServices,
+        *,
+        evidence_recorder: Optional[EvidenceRecorder] = None,
+    ):
         self.services = services
+        self._evidence = evidence_recorder
         self.protocol_version = PREFERRED_PROTOCOL_VERSION
         self.initialized = False
         self._handlers: Dict[str, Callable[[dict], dict]] = {
@@ -672,6 +713,20 @@ class MCPServer:
         else:
             self.protocol_version = PREFERRED_PROTOCOL_VERSION
         self.initialized = True
+        if self._evidence is not None:
+            # The handshake happened the moment we answer it. Whether the
+            # versions AGREED is a separate, narrower fact: a request for
+            # an unsupported version gets our preferred one back, and the
+            # host may still refuse it — so agreement is recorded as its
+            # own detail, never implied by the handshake.
+            self._evidence.record(
+                EVENT_INITIALIZE_OBSERVED,
+                {
+                    "protocol_requested": requested[:128],
+                    "protocol_negotiated": self.protocol_version,
+                    "protocol_agreed": requested in SUPPORTED_PROTOCOL_VERSIONS,
+                },
+            )
         return {
             "protocolVersion": self.protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
@@ -684,6 +739,8 @@ class MCPServer:
         }
 
     def _handle_tools_list(self, params: dict) -> dict:
+        if self._evidence is not None:
+            self._evidence.record(EVENT_TOOLS_LIST_OBSERVED)
         return {
             "tools": [
                 {
@@ -734,6 +791,14 @@ class MCPServer:
             return self._tool_result(
                 ServiceError(ERR_INTERNAL, str(exc)).to_dict(), is_error=True
             )
+        # Evidence records the SUCCESSFUL serving of a route. A call that
+        # failed before or inside the tool proves dispatch, not service,
+        # and is deliberately not recorded.
+        if self._evidence is not None:
+            self._evidence.record(EVENT_TOOL_INVOKED, {"tool": name})
+            route_event = _TOOL_EVIDENCE_EVENTS.get(name)
+            if route_event is not None:
+                self._evidence.record(route_event)
         return self._tool_result(payload, is_error=False)
 
     @staticmethod
@@ -830,6 +895,10 @@ class MCPServer:
         """
         stdin = stdin if stdin is not None else sys.stdin
         stdout = stdout if stdout is not None else sys.stdout
+        if self._evidence is not None:
+            # The server is up and serving. Recorded once per process, at
+            # the moment the stdio loop begins.
+            self._evidence.record(EVENT_MCP_SERVER_STARTED)
         while True:
             try:
                 raw = stdin.readline()

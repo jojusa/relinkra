@@ -55,7 +55,12 @@ from .app_service import (
 )
 from .backend_detection import assess_workspace
 from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
-from .connectors import resolve_launch
+from .connect_verification import (
+    STATUS_EXPIRED,
+    STATUS_INVALID,
+    STATUS_STALE_FINGERPRINT,
+)
+from .connectors import CONNECTORS, resolve_launch
 from .handoff import contains_absolute_path
 from .host_discovery import DiscoveryEnvironment
 from .identity import (
@@ -86,6 +91,11 @@ MIN_PYTHON = (3, 9)
 PASS = "PASS"
 WARN = "WARN"
 FAIL = "FAIL"
+#: Doctor-only presentation state: the stage has not been exercised or
+#: not yet proven, as opposed to WARN, which names a condition that is
+#: actually degraded, anomalous, stale or risky. Never used outside
+#: doctor/check rendering — the MCP freshness model is untouched.
+PENDING = "PENDING"
 
 _BUILD_PROVENANCE_STATEMENT = (
     "Source commit and archive SHA-256 are intentionally external "
@@ -782,18 +792,17 @@ _TRUST_ACTION = {
 def routing_checks(assessment) -> List[Check]:
     """Render one routing assessment as the compatibility section.
 
-    Every check here is PASS or WARN, never FAIL. A user who deliberately
-    exposes CBM has a working machine and a topology Relinkra disagrees
-    with; failing their ``doctor`` over it would turn a policy opinion
-    into a broken exit code. What Relinkra will not do is call it healthy.
+    Every check here is PASS, PENDING or WARN, never FAIL. A user who
+    deliberately exposes CBM has a working machine and a topology
+    Relinkra disagrees with; failing their ``doctor`` over it would turn
+    a policy opinion into a broken exit code. What Relinkra will not do
+    is call it healthy. States that merely have not been exercised yet —
+    no host has launched the server, no route has been served — render
+    as PENDING, so an untouched workspace reads as "nothing proven yet",
+    not as a machine full of warnings.
     """
     checks = [
-        Check(
-            "Context routing",
-            PASS if assessment.context_route == backend_policy.ROUTE_MANAGED else WARN,
-            _ROUTE_DETAIL.get(assessment.context_route, assessment.context_route),
-            assessment.route_remediation,
-        ),
+        _context_routing_check(assessment),
         Check(
             "CBM ownership",
             PASS if assessment.cbm_ownership in _HEALTHY_CBM_OWNERSHIP else WARN,
@@ -821,18 +830,142 @@ def routing_checks(assessment) -> List[Check]:
             _duplicate_detail(assessment),
             _duplicate_action(assessment),
         ),
-        Check(
-            "Metrics trust",
-            PASS if assessment.metrics_trust == backend_policy.TRUST_HIGH else WARN,
-            _TRUST_DETAIL.get(assessment.metrics_trust, assessment.metrics_trust),
-            _TRUST_ACTION.get(assessment.metrics_trust, ""),
-        ),
+        _metrics_trust_check(assessment),
         _ladder_check(assessment.ladder),
     ]
     host_verification = getattr(assessment, "host_verification", ()) or ()
     if host_verification:
         checks.append(_host_verification_check(host_verification))
+    runtime_check = _runtime_evidence_check(assessment)
+    if runtime_check is not None:
+        checks.append(runtime_check)
     return checks
+
+
+def _context_routing_check(assessment) -> Check:
+    """The context route, as actually observed.
+
+    A managed topology passes outright. Routes with a real defect
+    (mixture, bypass, degradation) warn. The unverified route is where
+    self-observed runtime evidence matters: if Relinkra's own MCP server
+    watched a context packet get served on the current revision, context
+    demonstrably flows through Relinkra — the check passes with that
+    evidence named. Without any observation it is PENDING, not WARN:
+    nothing is wrong; nothing has been proven yet either.
+    """
+    route = assessment.context_route
+    if route == backend_policy.ROUTE_MANAGED:
+        return Check(
+            "Context routing",
+            PASS,
+            _ROUTE_DETAIL[route],
+        )
+    if route in (
+        backend_policy.ROUTE_MIXED,
+        backend_policy.ROUTE_BYPASSED,
+        backend_policy.ROUTE_DEGRADED,
+    ):
+        return Check(
+            "Context routing",
+            WARN,
+            _ROUTE_DETAIL.get(route, route),
+            assessment.route_remediation,
+        )
+    served = _runtime_context_served(assessment)
+    if served:
+        return Check(
+            "Context routing",
+            PASS,
+            f"context served through Relinkra ({served})",
+        )
+    return Check(
+        "Context routing",
+        PENDING,
+        _ROUTE_DETAIL.get(route, route),
+        assessment.route_remediation or backend_policy.REMEDIATION_UNVERIFIED,
+    )
+
+
+def _runtime_context_served(assessment) -> str:
+    """Evidence text when a context packet was served on this revision."""
+    runtime = getattr(assessment, "runtime_evidence", None) or {}
+    try:
+        from .runtime_evidence import runtime_stage_claims
+
+        claims = runtime_stage_claims(runtime)
+    except Exception:
+        return ""
+    claim = claims.get("context_get")
+    if claim and claim[0]:
+        return claim[1]
+    return ""
+
+
+def _metrics_trust_check(assessment) -> Check:
+    """Attribution readiness. Unverified is PENDING — attribution is not
+    broken, it simply has no observed route to attribute against yet."""
+    trust = assessment.metrics_trust
+    if trust == backend_policy.TRUST_HIGH:
+        return Check("Metrics trust", PASS, _TRUST_DETAIL[trust])
+    if trust == backend_policy.TRUST_UNVERIFIED:
+        return Check(
+            "Metrics trust",
+            PENDING,
+            _TRUST_DETAIL[trust],
+            _TRUST_ACTION[trust],
+        )
+    return Check(
+        "Metrics trust",
+        WARN,
+        _TRUST_DETAIL.get(trust, trust),
+        _TRUST_ACTION.get(trust, ""),
+    )
+
+
+def _runtime_evidence_check(assessment) -> Optional[Check]:
+    """One row for self-observed runtime evidence, per host.
+
+    Absent evidence is PENDING (nothing exercised yet). Evidence that
+    exists but cannot be parsed is WARN (an anomalous state on disk).
+    Healthy evidence passes with each host's revision relation named, so
+    current-revision and historical evidence are never conflated.
+    """
+    runtime = getattr(assessment, "runtime_evidence", None)
+    if runtime is None:
+        return None
+    hosts = runtime.get("hosts") or {}
+    if runtime.get("invalid"):
+        return Check(
+            "Runtime evidence",
+            WARN,
+            "the runtime evidence file could not be parsed; it will be "
+            "rebuilt the next time the Relinkra server runs",
+            "No action is required — the file rebuilds automatically the "
+            "next time a host launches Relinkra.",
+        )
+    if not hosts:
+        return Check(
+            "Runtime evidence",
+            PENDING,
+            "no self-observed runtime evidence yet; it is recorded "
+            "automatically when a host launches and uses Relinkra",
+            "Start a host that runs Relinkra and use it, then re-run "
+            "'relinkra doctor'.",
+        )
+    parts = []
+    for host_id, host in sorted(hosts.items()):
+        label = host_id
+        if host_id == "host_unknown":
+            label = "unknown host"
+        state = host.get("state") or "pending"
+        relation = host.get("revision_relation") or ""
+        suffix = f", {relation} revision" if relation and state != "pending" else ""
+        parts.append(f"{label}: {state}{suffix}")
+    return Check(
+        "Runtime evidence",
+        PASS,
+        "self-observed runtime evidence — " + "; ".join(parts),
+    )
 
 
 def _host_verification_check(host_verification) -> Check:
@@ -841,8 +974,21 @@ def _host_verification_check(host_verification) -> Check:
     Each apply-capable host's local operational evidence is assessed
     independently; the row is PASS only when EVERY host holds valid
     local evidence, and the detail names each host's own status so one
-    host's proof can never read as another's.
+    host's proof can never read as another's. Hosts with no evidence at
+    all are PENDING — an unexercised host is not a degraded one — while
+    evidence that is stale, expired or invalid is a real anomaly and
+    warns.
     """
+    anomalous = [
+        row
+        for row in host_verification
+        if row.get("verification_status")
+        in (
+            STATUS_STALE_FINGERPRINT,
+            STATUS_EXPIRED,
+            STATUS_INVALID,
+        )
+    ]
     if all(row.get("locally_verified") for row in host_verification):
         return Check(
             "Host verification",
@@ -854,9 +1000,18 @@ def _host_verification_check(host_verification) -> Check:
         f"{row.get('connector_id', '?')}: {row.get('verification_status', 'absent')}"
         for row in host_verification
     )
+    if anomalous:
+        return Check(
+            "Host verification",
+            WARN,
+            f"local host evidence per host — {detail}",
+            "Record fresh evidence with 'relinkra connect verify <agent> "
+            "--proof <file>'. Configuration presence is never treated as "
+            "host proof.",
+        )
     return Check(
         "Host verification",
-        WARN,
+        PENDING,
         f"local host evidence per host — {detail}",
         "Run the host, then record evidence with 'relinkra connect verify "
         "<agent> --proof <file>'. Configuration presence is never treated "
@@ -948,6 +1103,11 @@ def _ladder_check(ladder) -> Check:
     twelve rows: the useful question is "how far does the evidence
     actually go", and a wall of WARNs answers it worse than one line that
     says where the evidence stops.
+
+    Unproven rungs split two ways. A rung nobody has exercised yet
+    (state ``unverified``) is PENDING — nothing is wrong, it is simply
+    not proven. A rung the recorded evidence actively reports as NOT
+    achieved (state ``not_proven``) contradicts readiness and warns.
     """
     # Keyed off all_proven rather than "no unproven stages", because an
     # EMPTY ladder has no unproven stages and has also proven nothing.
@@ -963,16 +1123,59 @@ def _ladder_check(ladder) -> Check:
     if not ladder.stages:
         return Check(
             "Integration trust",
-            WARN,
+            PENDING,
             "no integration evidence was gathered",
             "Run 'relinkra connect routing' for detail.",
         )
-    names = ", ".join(stage.stage for stage in unproven)
+    not_achieved = tuple(
+        stage
+        for stage in unproven
+        if stage.state == backend_policy.STAGE_NOT_PROVEN
+        # Topology rungs (config present, registration detected) and the
+        # three structural rungs each have a dedicated rendering — the
+        # Context routing / CBM ownership / Metrics trust checks — with
+        # the right severity for their state. Counting them here as
+        # "not achieved" makes the ladder row warn about the same thing
+        # twice, and turns a merely-unwired workspace into warnings. The
+        # remaining not-proven rungs are the ones RECORDED EVIDENCE
+        # actively reports as failed — a genuine conflict with readiness.
+        and stage.stage
+        not in (
+            backend_policy.STAGE_CONFIGURATION_PRESENT,
+            backend_policy.STAGE_REGISTRATION_DETECTED,
+            backend_policy.STAGE_CONTEXT_ROUTE_MANAGED,
+            backend_policy.STAGE_BACKEND_BYPASS_ABSENT,
+            backend_policy.STAGE_METRICS_TRUSTWORTHY,
+        )
+    )
+    awaiting = tuple(
+        stage for stage in unproven if stage.state == backend_policy.STAGE_UNVERIFIED
+    )
+    proven_count = len(ladder.stages) - len(unproven)
+    detail = f"{proven_count}/{len(ladder.stages)} stages proven"
+    if awaiting:
+        detail += (
+            "; pending: "
+            + ", ".join(stage.stage for stage in awaiting)
+        )
+    if not_achieved:
+        detail += (
+            "; not achieved: "
+            + ", ".join(stage.stage for stage in not_achieved)
+        )
+    if not_achieved:
+        return Check(
+            "Integration trust",
+            WARN,
+            detail,
+            "Recorded evidence reports stages as not achieved. Re-run the "
+            "host and record fresh evidence with 'relinkra connect verify "
+            "<agent> --proof <file>'.",
+        )
     return Check(
         "Integration trust",
-        WARN,
-        f"{len(ladder.stages) - len(unproven)}/{len(ladder.stages)} stages "
-        f"proven; not proven: {names}",
+        PENDING,
+        detail,
         "Configuration presence is never treated as readiness. Register "
         "Relinkra with a host, start it, and re-run 'relinkra doctor'.",
     )
@@ -997,6 +1200,17 @@ def assess_routing_for(
 
     env = DiscoveryEnvironment.current(workspace_root=root)
     launch = resolve_launch(root, registry_path(root))
+    # Self-observed runtime evidence is only trusted as CURRENT-revision
+    # evidence when the revision it was observed on matches the one being
+    # diagnosed now. Unreadable revision conservatively binds nothing.
+    current_revision = str(
+        (resolved.project or {}).get("current_revision") or ""
+    )
+    if not current_revision:
+        try:
+            current_revision = git_head_sha(str(root))
+        except (GitError, ValueError, OSError):
+            current_revision = ""
     return assess_workspace(
         env,
         health=health if health is not None else resolved.health,
@@ -1005,6 +1219,7 @@ def assess_routing_for(
             resolved.config is not None and resolved.config.advanced_direct_cbm
         ),
         verification_fingerprint=launch_fingerprint(launch),
+        current_revision=current_revision,
     )
 
 
@@ -1606,6 +1821,7 @@ def cmd_doctor(args) -> int:
 
     counts = {
         PASS: sum(1 for c in checks if c.status == PASS),
+        PENDING: sum(1 for c in checks if c.status == PENDING),
         WARN: sum(1 for c in checks if c.status == WARN),
         FAIL: sum(1 for c in checks if c.status == FAIL),
     }
@@ -1614,7 +1830,7 @@ def cmd_doctor(args) -> int:
 
     lines = ["", "Relinkra doctor", ""]
     for check in checks:
-        lines.append(f"{check.status:<5}{check.name}")
+        lines.append(f"{check.status:<7}{check.name}")
         if check.detail:
             lines.append(f"      {sanitize_wire_text(check.detail)}")
         if check.action and check.status != PASS:
@@ -1631,11 +1847,345 @@ def cmd_doctor(args) -> int:
             lines.append(f"      {sanitize_wire_text(note)}")
     lines.append("")
     lines.append(
-        f"{counts[PASS]} passed, {counts[WARN]} warning(s), {counts[FAIL]} failed"
+        f"{counts[PASS]} passed, {counts[PENDING]} pending, "
+        f"{counts[WARN]} warning(s), {counts[FAIL]} failed"
     )
     lines.append("")
-    _emit(payload, args.json, "\n".join(lines))
+    verbose_text = "\n".join(lines)
+
+    # Compact and verbose come from the SAME payload — the compact view
+    # is a projection of the full check list, never a second opinion.
+    agents = _agents_table(assessment)
+    payload["agents"] = agents
+    next_action = _compact_next_action(checks, assessment)
+    payload["next_action"] = next_action
+
+    compact_text = _render_compact_doctor(
+        resolved, checks, assessment, agents, next_action, counts
+    )
+    if args.json:
+        _emit(payload, True, verbose_text)
+    elif getattr(args, "verbose", False):
+        _emit(payload, False, verbose_text)
+    else:
+        _emit(payload, False, compact_text)
     return EXIT_ACTION_REQUIRED if counts[FAIL] else EXIT_OK
+
+
+#: Check groups folded into single Core rows in the compact view. The
+#: row shows the WORST status in the group and that check's detail, so
+#: a compact row can always be expanded by re-running with --verbose.
+_COMPACT_CORE_GROUPS = [
+    ("Git", ("Git executable", "Git repository")),
+    ("Project identity", ("Project identity",)),
+    ("Registered revision", ("Registered revision",)),
+    ("CBM", (
+        "CBM provenance",
+        "CBM version",
+        "CBM index",
+        "CBM graph",
+        "CBM query",
+        "CBM index freshness",
+        "CBM",
+    )),
+    ("Engram", ("Engram",)),
+]
+
+_STATUS_ORDER = (FAIL, WARN, PENDING, PASS)
+
+
+def _worst_status(statuses: List[str]) -> str:
+    for status in _STATUS_ORDER:
+        if status in statuses:
+            return status
+    return PENDING
+
+
+def _agents_table(assessment) -> List[dict]:
+    """One row per apply-capable host, plus unknown-host runtime evidence.
+
+    Config presence and runtime observation are different facts about a
+    host and are never merged into one column. Runtime evidence recorded
+    without a host identity stays in its own row — it must never be read
+    as evidence about a named host.
+    """
+    if assessment is None:
+        return []
+    rows_by_id = {
+        row.get("connector_id"): row
+        for row in (getattr(assessment, "host_verification", ()) or ())
+    }
+    runtime_hosts = (getattr(assessment, "runtime_evidence", None) or {}).get(
+        "hosts"
+    ) or {}
+    table: List[dict] = []
+    for spec in CONNECTORS:
+        if not spec.apply_available:
+            continue
+        host_id = spec.connector_id
+        row = rows_by_id.get(host_id) or {}
+        if row.get("managed_registration"):
+            config = "valid"
+        elif row.get("config_present"):
+            config = "unregistered"
+        else:
+            config = "absent"
+        table.append(
+            {
+                "agent": host_id,
+                "config": config,
+                "runtime": _runtime_label(row, runtime_hosts.get(host_id)),
+                "verification_status": row.get("verification_status", ""),
+            }
+        )
+    unknown = runtime_hosts.get("host_unknown")
+    if unknown:
+        state = unknown.get("state") or "pending"
+        relation = unknown.get("revision_relation") or ""
+        label = "observed" if state == "observed" else state
+        if state == "observed" and relation == "older":
+            label = "stale"
+        elif state == "observed" and relation == "unknown":
+            label = "observed"
+        table.append(
+            {
+                "agent": "unknown host",
+                "config": "-",
+                "runtime": label if state != "pending" else "pending",
+                "verification_status": "",
+            }
+        )
+    return table
+
+
+def _runtime_label(verification_row: dict, runtime_host: Optional[dict]) -> str:
+    """One host's runtime column: attested > observed > stale > pending.
+
+    An operator proof is the stronger evidence class, so it wins the
+    label when both exist; the JSON row keeps the raw verification
+    status either way.
+    """
+    if verification_row.get("locally_verified") or (
+        verification_row.get("verification_status") == "valid"
+    ):
+        return "attested"
+    if not runtime_host:
+        return "pending"
+    state = runtime_host.get("state") or "pending"
+    if state == "observed":
+        return "observed"
+    if state == "stale":
+        return "stale"
+    return "pending"
+
+
+_COMPACT_INTEGRATION_LABELS = {
+    "project resolution": None,  # computed from runtime evidence
+    "context routing": "Context routing",
+    "handoff round-trip": backend_policy.STAGE_HANDOFF_ROUND_TRIP,
+    "metrics attribution": "Metrics trust",
+}
+
+
+def _integration_rows(assessment, checks: List[Check]) -> List[tuple]:
+    """The four compact Integration rows, derived from the same ladder
+    and checks the verbose view prints in full."""
+    rows: List[tuple] = []
+    by_name = {check.name: check for check in checks}
+
+    # Project resolution: proven when Relinkra itself served a
+    # project_resolve on the current revision, or an operator proof
+    # records the required tools as callable.
+    status, detail = PENDING, "not yet exercised by any host"
+    claims = _runtime_claims_for(assessment)
+    claim = claims.get("project_resolve")
+    if claim and claim[0]:
+        status, detail = PASS, claim[1]
+    else:
+        for row in (getattr(assessment, "host_verification", ()) or ()):
+            stages = row.get("stages") or {}
+            if row.get("verification_status") == "valid" and stages.get(
+                "tools_callable"
+            ):
+                status = PASS
+                detail = (
+                    "operator-recorded local evidence "
+                    f"({row.get('connector_id', '?')}); not independently attested"
+                )
+                break
+    rows.append(("project resolution", status, detail))
+
+    context_check = by_name.get("Context routing")
+    if context_check is not None:
+        rows.append(("context routing", context_check.status, context_check.detail))
+
+    ladder = getattr(assessment, "ladder", None)
+    stage = ladder.by_stage().get(backend_policy.STAGE_HANDOFF_ROUND_TRIP) if ladder else None
+    if stage is None:
+        rows.append(("handoff round-trip", PENDING, "no ladder was assessed"))
+    elif stage.proven:
+        rows.append(("handoff round-trip", PASS, stage.evidence))
+    elif stage.state == backend_policy.STAGE_NOT_PROVEN:
+        rows.append(("handoff round-trip", WARN, stage.evidence))
+    else:
+        # The unverified rung's evidence string enumerates every host's
+        # absence — useful in verbose, noise in compact.
+        rows.append(("handoff round-trip", PENDING, "not yet exercised by any host"))
+
+    metrics_check = by_name.get("Metrics trust")
+    if metrics_check is not None:
+        rows.append(
+            ("metrics attribution", metrics_check.status, metrics_check.detail)
+        )
+    return rows
+
+
+def _runtime_claims_for(assessment) -> dict:
+    runtime = getattr(assessment, "runtime_evidence", None) or {}
+    try:
+        from .runtime_evidence import runtime_stage_claims
+
+        return runtime_stage_claims(runtime)
+    except Exception:
+        return {}
+
+
+def _compact_next_action(checks: List[Check], assessment) -> str:
+    """The single highest-value next action, in priority order.
+
+    Real failures first, then real warnings, then the pending states in
+    the order a user can act on them: exercise a host, then exercise a
+    handoff round trip. Everything else keeps its detail for --verbose.
+    """
+    fails = [check for check in checks if check.status == FAIL]
+    if fails:
+        return fails[0].action or (
+            f"Resolve the '{fails[0].name}' failure; run 'relinkra doctor "
+            "--verbose' for detail."
+        )
+    warns = [check for check in checks if check.status == WARN]
+    if warns:
+        return warns[0].action or (
+            f"Review the '{warns[0].name}' warning; run 'relinkra doctor "
+            "--verbose' for detail."
+        )
+
+    runtime = (getattr(assessment, "runtime_evidence", None) or {}).get("hosts") or {}
+    observed_named = [
+        host_id
+        for host_id, host in runtime.items()
+        if host_id != "host_unknown" and host.get("state") == "observed"
+    ]
+    if not observed_named:
+        if "host_unknown" in runtime:
+            return (
+                "Runtime evidence was recorded without host identity. Set "
+                "RELINKRA_HOST_ID=<agent> in the host's MCP server "
+                "environment, restart the host, and use Relinkra from it."
+            )
+        named = ""
+        for row in (getattr(assessment, "host_verification", ()) or ()):
+            if row.get("managed_registration"):
+                named = str(row.get("connector_id") or "")
+                break
+        target = named or "your configured host"
+        return (
+            f"Start {target} (or restart it) and use Relinkra from that "
+            "host; runtime evidence is recorded automatically. Then run "
+            "'relinkra doctor'."
+        )
+    ladder = getattr(assessment, "ladder", None)
+    if ladder is not None:
+        stage = ladder.by_stage().get(backend_policy.STAGE_HANDOFF_ROUND_TRIP)
+        if stage is not None and not stage.proven:
+            return (
+                "Exercise a handoff round trip from the connected host "
+                "(handoff_create, then handoff_get) if multi-agent trust "
+                "matters for this workspace."
+            )
+    pendings = [
+        check for check in checks if check.status == PENDING and check.action
+    ]
+    if pendings:
+        return pendings[0].action
+    return "No action required. Run 'relinkra doctor --verbose' for the full report."
+
+
+def _render_compact_doctor(
+    resolved: "Resolved",
+    checks: List[Check],
+    assessment,
+    agents: List[dict],
+    next_action: str,
+    counts: Dict[str, int],
+) -> str:
+    """The default doctor view: short, grouped, one next action.
+
+    Every row here is a projection of the full check list — the same
+    statuses, the same details — grouped the way a person scans them.
+    Nothing in compact mode contradicts --verbose, because both render
+    from the same checks.
+    """
+    by_name = {check.name: check for check in checks}
+    project_label = ""
+    if resolved.config is not None and resolved.config.project_id:
+        project_label = resolved.config.project_id
+    lines = ["Relinkra doctor" + (f" — {project_label}" if project_label else ""), ""]
+
+    lines.append("Core")
+    consumed = set()
+    for label, names in _COMPACT_CORE_GROUPS:
+        group = [by_name[name] for name in names if name in by_name]
+        if not group:
+            continue
+        worst = _worst_status([check.status for check in group])
+        source = next(
+            (check for check in group if check.status == worst), group[0]
+        )
+        detail = f" — {sanitize_wire_text(source.detail)}" if source.detail else ""
+        lines.append(f"{worst:<8}{label}{detail}")
+        consumed.update(check.name for check in group)
+
+    if agents:
+        lines.append("")
+        lines.append("Agents")
+        width = max(len(str(row["agent"])) for row in agents)
+        config_width = max(
+            len("Config"), *(len(str(row["config"])) for row in agents)
+        ) + 2
+        lines.append(f"{'Agent':<{width}}   {'Config':<{config_width}}Runtime")
+        for row in agents:
+            lines.append(
+                f"{row['agent']:<{width}}   {row['config']:<{config_width}}{row['runtime']}"
+            )
+
+    lines.append("")
+    lines.append("Integration")
+    for label, status, detail in _integration_rows(assessment, checks):
+        suffix = f" — {sanitize_wire_text(detail)}" if detail else ""
+        lines.append(f"{status:<8}{label}{suffix}")
+
+    warnings = [
+        check
+        for check in checks
+        if check.status in (WARN, FAIL) and check.name not in consumed
+    ]
+    if warnings:
+        lines.append("")
+        lines.append("Warnings")
+        for check in warnings:
+            detail = f" — {sanitize_wire_text(check.detail)}" if check.detail else ""
+            lines.append(f"{check.status:<8}{check.name}{detail}")
+
+    lines.append("")
+    lines.append(
+        f"{counts[PASS]} passed, {counts[PENDING]} pending, "
+        f"{counts[WARN]} warning(s), {counts[FAIL]} failed"
+    )
+    lines.append("")
+    lines.append(f"Next: {sanitize_wire_text(next_action)}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def cmd_project(args) -> int:
@@ -2384,6 +2934,14 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--json", action="store_true", help="emit machine-readable JSON"
         )
+        if name == "doctor":
+            # Compact by default; the full per-check report is one flag
+            # away. JSON output carries the full payload either way.
+            command.add_argument(
+                "--verbose",
+                action="store_true",
+                help="print the full per-check diagnostic report",
+            )
         command.set_defaults(func=handler)
 
     # The cbm family (R5E.2B): one nested subcommand set so the

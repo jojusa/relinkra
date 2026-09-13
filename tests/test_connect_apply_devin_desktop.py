@@ -71,6 +71,7 @@ from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    PENDING,
     WARN,
     WorkspaceConfig,
     main,
@@ -1104,7 +1105,7 @@ class DevinDesktopDoctorTests(ConnectApplyDevinDesktopCase):
         for value in row["stages"].values():
             self.assertIsNone(value)
         checks = {check["name"]: check for check in payload["checks"]}
-        self.assertEqual(checks["Host verification"]["status"], WARN)
+        self.assertEqual(checks["Host verification"]["status"], PENDING)
         self.assertIn("devin-desktop: absent", checks["Host verification"]["detail"])
 
     def test_check_surfaces_devin_desktop_in_the_per_host_rows(self):

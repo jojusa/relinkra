@@ -30,6 +30,7 @@ from relinkra.product_cli import (
     EXIT_OK,
     FAIL,
     PASS,
+    PENDING,
     WARN,
     WorkspaceConfig,
     check_registered_revision,
@@ -591,7 +592,7 @@ class DoctorTests(CLITestCase):
     def test_doctor_warns_on_missing_engram(self):
         self.engram = False
         self.init()
-        code, out, _ = self.run_cli("doctor")
+        code, out, _ = self.run_cli("doctor", "--verbose")
         self.assertEqual(code, EXIT_OK)
         self.assertIn(WARN, out)
         self.assertIn("Engram", out)
@@ -603,7 +604,7 @@ class DoctorTests(CLITestCase):
         with mock.patch.object(
             product_cli.cbm_support, "platform_tag", return_value="windows-amd64"
         ):
-            code, out, _ = self.run_cli("doctor")
+            code, out, _ = self.run_cli("doctor", "--verbose")
         self.assertEqual(code, EXIT_OK)
         self.assertIn("relinkra cbm setup", out)
 
@@ -612,7 +613,7 @@ class DoctorTests(CLITestCase):
         with mock.patch.object(
             product_cli.cbm_support, "platform_tag", return_value="linux-amd64"
         ):
-            code, out, _ = self.run_cli("doctor")
+            code, out, _ = self.run_cli("doctor", "--verbose")
         self.assertEqual(code, EXIT_OK)
         self.assertIn("No certified code-index release", out)
         self.assertNotIn("relinkra cbm setup", out)
@@ -623,7 +624,8 @@ class DoctorTests(CLITestCase):
         code, out, _ = self.run_cli("doctor", path=plain)
         self.assertEqual(code, EXIT_ACTION_REQUIRED)
         self.assertIn(FAIL, out)
-        self.assertIn("Git repository", out)
+        self.assertIn("Git", out)
+        self.assertIn("not inside a git repository", out)
 
     def test_doctor_fails_on_a_corrupt_registry(self):
         self.init()
@@ -649,10 +651,11 @@ class DoctorTests(CLITestCase):
     def test_doctor_json_summary_matches_checks(self):
         self.init()
         payload = json.loads(self.run_cli("doctor", "--json")[1])
-        counts = {PASS: 0, WARN: 0, FAIL: 0}
+        counts = {PASS: 0, PENDING: 0, WARN: 0, FAIL: 0}
         for check in payload["checks"]:
             counts[check["status"]] += 1
         self.assertEqual(payload["summary"]["pass"], counts[PASS])
+        self.assertEqual(payload["summary"]["pending"], counts[PENDING])
         self.assertEqual(payload["summary"]["warn"], counts[WARN])
         self.assertEqual(payload["summary"]["fail"], counts[FAIL])
         self.assertEqual(payload["ok"], counts[FAIL] == 0)

@@ -57,6 +57,7 @@ from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    PENDING,
     WARN,
     WorkspaceConfig,
     main,
@@ -288,7 +289,8 @@ class DiscoveryContractTests(DevinDesktopCase):
         )
         if verification is not None:
             self.assertIn("devin-desktop: absent", verification["detail"])
-            self.assertEqual(verification["status"], WARN)
+            # Absent evidence is an unexercised host: PENDING, never ready.
+            self.assertEqual(verification["status"], PENDING)
 
 
 class PrecedenceTests(DevinDesktopCase):
@@ -608,7 +610,7 @@ class SurfaceContractTests(DevinDesktopCase):
             (c for c in doctor["checks"] if c["name"] == "Host verification"), None
         )
         self.assertIsNotNone(verification)
-        self.assertEqual(verification["status"], WARN)
+        self.assertEqual(verification["status"], PENDING)
         self.assertIn("devin-desktop: absent", verification["detail"])
 
     def test_apply_is_open_since_gate_b_and_writes_the_current_target(self):

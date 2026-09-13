@@ -905,6 +905,13 @@ class RoutingAssessment:
     #: Per-host verification rows (one per apply-capable connector), so
     #: doctor and check can show each host's evidence independently.
     host_verification: Tuple[dict, ...] = ()
+    #: Self-observed runtime evidence summary (R6D), classified against
+    #: the current revision. Empty when no workspace was assessed. This
+    #: is evidence Relinkra's own MCP server recorded; it is a weaker
+    #: class than an operator proof and never promotes route or metrics
+    #: classification — only the host-side ladder rungs it directly
+    #: observed.
+    runtime_evidence: Optional[dict] = None
     #: Everything worth telling the user, in priority order.
     remediation: Tuple[str, ...] = ()
     #: The single remediation that addresses the ROUTE specifically.
@@ -935,6 +942,7 @@ class RoutingAssessment:
             "trust_ladder": self.ladder.to_dict(),
             "hosts": list(self.hosts),
             "host_verification": list(self.host_verification),
+            "runtime_evidence": self.runtime_evidence or {},
             "remediation": list(self.remediation),
             "route_remediation": self.route_remediation,
             "notes": list(self.notes),

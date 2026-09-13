@@ -738,6 +738,14 @@ def cmd_routing(args) -> int:
     launch = _launch_for(root)
     config = WorkspaceConfig.load(root)
 
+    current_revision = ""
+    try:
+        from .identity import git_head_sha
+
+        current_revision = git_head_sha(str(root))
+    except Exception:
+        current_revision = ""
+
     try:
         assessment = assess_workspace(
             env,
@@ -747,6 +755,7 @@ def cmd_routing(args) -> int:
                 config is not None and config.advanced_direct_cbm
             ),
             verification_fingerprint=launch_fingerprint(launch),
+            current_revision=current_revision,
         )
     except Exception as exc:
         # Same guard ``doctor`` has, for the same reason. This command

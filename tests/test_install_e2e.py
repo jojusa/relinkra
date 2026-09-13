@@ -442,7 +442,7 @@ class CleanInstallTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         checks = payload["checks"]
         self.assertTrue(checks, "doctor reported no checks")
-        counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
+        counts = {"PASS": 0, "PENDING": 0, "WARN": 0, "FAIL": 0}
         for check in checks:
             for key in ("name", "status", "detail"):
                 self.assertIn(key, check)
@@ -450,6 +450,7 @@ class CleanInstallTests(unittest.TestCase):
             counts[check["status"]] += 1
         summary = payload["summary"]
         self.assertEqual(summary["pass"], counts["PASS"])
+        self.assertEqual(summary["pending"], counts["PENDING"])
         self.assertEqual(summary["warn"], counts["WARN"])
         self.assertEqual(summary["fail"], counts["FAIL"])
 

@@ -95,6 +95,7 @@ from .connect_verification import (
     TOOLS_VISIBLE,
     assess_verification,
 )
+from .runtime_evidence import runtime_stage_claims, summarize_runtime_evidence
 from .connectors import (
     CONNECTORS,
     ConnectorSpec,
@@ -732,6 +733,8 @@ def build_trust_ladder(
     real_host_launch_proven: bool,
     workspace_root=None,
     verification_fingerprint: str = "",
+    current_revision: str = "",
+    runtime_evidence: Optional[dict] = None,
 ) -> TrustLadder:
     """Assemble the twelve-rung ladder from what is actually known.
 
@@ -751,8 +754,49 @@ def build_trust_ladder(
     evidence leaves the rung UNVERIFIED with the reason named per host.
     One host's missing evidence never degrades another's valid record.
     Config-side rungs keep their structural behaviour either way.
+
+    Self-observed runtime evidence (R6D) overlays the same host-side
+    rungs when no operator proof proves them: what the MCP server itself
+    watched happen — a start, a handshake, a served tools/list, a
+    successful tool call — is direct observation of the weakest kind,
+    and only for stages it could literally see. Current-revision evidence
+    advances the rung; historical evidence advances only the launch rung,
+    with the revision relation named. A rung an operator proof reports as
+    NOT achieved stays not-achieved: conflicting evidence resolves
+    conservatively, never in favour of the newer signal.
     """
     configured = any(host.config_readable for host in hosts)
+
+    if runtime_evidence is None and workspace_root is not None:
+        try:
+            runtime_evidence = summarize_runtime_evidence(
+                str(workspace_root), current_revision
+            )
+        except Exception:
+            # Evidence that cannot be summarized proves nothing; the
+            # ladder renders without it rather than failing.
+            runtime_evidence = {}
+    try:
+        runtime_claims = runtime_stage_claims(
+            runtime_evidence or {}, current_revision
+        )
+    except Exception:
+        runtime_claims = {}
+
+    def _with_runtime(value, evidence: str, claim_key: str):
+        """Overlay a self-observed claim on one rung.
+
+        An operator proof that PROVED the rung keeps its (stronger)
+        evidence. A proof reporting the stage NOT achieved keeps the
+        conservative verdict. Only an unproven rung can be advanced, and
+        only by what the server itself directly observed.
+        """
+        claim = runtime_claims.get(claim_key)
+        if not claim or claim[0] is not True:
+            return value, evidence
+        if value is True or value is False:
+            return value, evidence
+        return True, claim[1]
 
     # Local operational evidence is assessed PER HOST, for every
     # connector the registry says can be written — never for one
@@ -820,41 +864,59 @@ def build_trust_ladder(
             )
         return None, f"{default_evidence}; {note}"
 
-    handshake_value, handshake_evidence = _host_stage(
-        HANDSHAKE_SUCCEEDED,
-        None,
-        "no host has completed an initialize handshake with this server",
+    handshake_value, handshake_evidence = _with_runtime(
+        *_host_stage(
+            HANDSHAKE_SUCCEEDED,
+            None,
+            "no host has completed an initialize handshake with this server",
+        ),
+        "handshake",
     )
-    tools_value, tools_evidence = _host_stage(
-        TOOLS_VISIBLE,
-        bool(tools_declared),
-        f"{tools_declared} tool(s) declared and importable in this process; "
-        "visibility to an agent is a separate, unverified question",
+    tools_value, tools_evidence = _with_runtime(
+        *_host_stage(
+            TOOLS_VISIBLE,
+            bool(tools_declared),
+            f"{tools_declared} tool(s) declared and importable in this process; "
+            "visibility to an agent is a separate, unverified question",
+        ),
+        "tools_visible",
     )
-    callable_value, callable_evidence = _host_stage(
-        TOOLS_CALLABLE,
-        None,
-        "no tool call has arrived from a host",
+    callable_value, callable_evidence = _with_runtime(
+        *_host_stage(
+            TOOLS_CALLABLE,
+            None,
+            "no tool call has arrived from a host",
+        ),
+        "tool_invoked",
     )
-    handoff_value, handoff_evidence = _host_stage(
-        HANDOFF_ROUNDTRIP,
-        False if handoffs_available is False else None,
-        "the memory backend is unavailable, so no handoff can round-trip"
-        if handoffs_available is False
-        else "no handoff has been written and read back through a host",
+    handoff_value, handoff_evidence = _with_runtime(
+        *_host_stage(
+            HANDOFF_ROUNDTRIP,
+            False if handoffs_available is False else None,
+            "the memory backend is unavailable, so no handoff can round-trip"
+            if handoffs_available is False
+            else "no handoff has been written and read back through a host",
+        ),
+        "handoff_round_trip",
     )
-    launch_value, launch_evidence = _host_stage(
-        HOST_LAUNCHED,
-        real_host_launch_proven,
-        "a real host has launched this server"
-        if real_host_launch_proven
-        else "no real host has been observed launching this server",
+    launch_value, launch_evidence = _with_runtime(
+        *_host_stage(
+            HOST_LAUNCHED,
+            real_host_launch_proven,
+            "a real host has launched this server"
+            if real_host_launch_proven
+            else "no real host has been observed launching this server",
+        ),
+        "server_started",
     )
-    protocol_value, protocol_evidence = _host_stage(
-        PROTOCOL_COMPATIBLE,
-        None,
-        "the host's protocol version is only observable during a "
-        "handshake, which this phase does not perform",
+    protocol_value, protocol_evidence = _with_runtime(
+        *_host_stage(
+            PROTOCOL_COMPATIBLE,
+            None,
+            "the host's protocol version is only observable during a "
+            "handshake, which this phase does not perform",
+        ),
+        "protocol_agreed",
     )
 
     stages = (
@@ -1023,6 +1085,7 @@ def assess_routing(
     tools_declared: Optional[int] = None,
     workspace_root=None,
     verification_fingerprint: str = "",
+    current_revision: str = "",
 ) -> RoutingAssessment:
     """Turn a host survey plus backend health into one verdict.
 
@@ -1123,6 +1186,18 @@ def assess_routing(
         advanced_cbm_allowed and bool(cbm_hosts)
     )
 
+    # Self-observed runtime evidence is summarized once here and shared
+    # by the ladder and every renderer below, so one workspace cannot be
+    # described two ways by the same assessment.
+    runtime_summary: Optional[dict] = None
+    if workspace_root is not None:
+        try:
+            runtime_summary = summarize_runtime_evidence(
+                str(workspace_root), current_revision
+            )
+        except Exception:
+            runtime_summary = {"present": False, "invalid": False, "hosts": {}}
+
     return RoutingAssessment(
         context_route=route,
         cbm_ownership=cbm_ownership,
@@ -1144,6 +1219,8 @@ def assess_routing(
             real_host_launch_proven=real_host_launch_proven,
             workspace_root=workspace_root,
             verification_fingerprint=verification_fingerprint,
+            current_revision=current_revision,
+            runtime_evidence=runtime_summary,
         ),
         hosts=tuple(host.to_dict() for host in hosts),
         host_verification=host_verification_view(
@@ -1151,6 +1228,7 @@ def assess_routing(
             workspace_root=workspace_root,
             verification_fingerprint=verification_fingerprint,
         ),
+        runtime_evidence=runtime_summary or {},
         remediation=tuple(remediation),
         route_remediation=route_remediation,
         notes=tuple(notes),
@@ -1165,9 +1243,14 @@ def assess_workspace(
     advanced_cbm_allowed: bool = False,
     specs: Sequence[ConnectorSpec] = CONNECTORS,
     verification_fingerprint: str = "",
+    current_revision: str = "",
 ) -> RoutingAssessment:
     """Survey the machine and assess it, reading only. The one entry point
     both ``doctor`` and ``connect routing`` call, so they cannot disagree.
+
+    ``current_revision`` binds self-observed runtime evidence to the
+    revision the caller is looking at; empty means the revision could
+    not be read and no current-revision claim will be made.
     """
     hosts = survey_hosts(env, specs)
     components = (health or {}).get("components") or {}
@@ -1191,6 +1274,7 @@ def assess_workspace(
             Path(str(env.workspace_root)) if env.workspace_root is not None else None
         ),
         verification_fingerprint=verification_fingerprint,
+        current_revision=current_revision,
     )
 
 

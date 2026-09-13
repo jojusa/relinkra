@@ -68,6 +68,7 @@ from relinkra.product_cli import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
     EXIT_OK,
+    PENDING,
     WARN,
     WorkspaceConfig,
     main,
@@ -1046,7 +1047,7 @@ class OpenCodeDoctorPerHostTests(ConnectApplyOpenCodeCase):
         self.assertTrue(claude["handoff_proven"])
 
         checks = {check["name"]: check for check in payload["checks"]}
-        self.assertEqual(checks["Host verification"]["status"], WARN)
+        self.assertEqual(checks["Host verification"]["status"], PENDING)
         ladder_stages = {
             stage["stage"]: stage
             for stage in payload["routing"]["trust_ladder"]["stages"]
