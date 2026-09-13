@@ -134,6 +134,58 @@ whole-in or whole-out; `memory_id`, `memory_type`, provenance and
 and the budget layer never adds warnings (omissions live in the report
 and in `diagnostics["budget"]`, keeping warning bytes identical).
 
+## Salience tiers and metadata compaction (R6C)
+
+R6C makes salience explicit so that maximum useful information survives
+per token. Every item carries an agent-visible tier (per-item
+`explain["salience"]` when the R4D sidecar is present, plus per-tier
+counts in the packet status block):
+
+| tier | contents | ladder treatment |
+|---|---|---|
+| `must_keep` | essential frame (identity, revision, warnings), the current (most recent active) handoff, all `pending` items | never omitted |
+| `high_salience` | decision/constraint/architecture/bug memories, other handoffs, code references, the direct code fact, important git facts | shed only after every optional item and after metadata compaction |
+| `optional` | discovery/verification/task_result memories, structural CBM facts, extra code facts, optional git facts, verbose metadata | shed first |
+
+**Metadata compaction** is a ladder step between the optional and
+important classes. While over budget it deterministically shrinks, in
+fixed order: per-item explain sidecars (relevance signals → total,
+trust dropped, freshness reduced to state/reason), packet freshness
+notices (grouped by state/reason/action), `selected_source_ids` /
+`included_source_ids` (derivable from the sections), duplicated
+provenance fields, memory-envelope bookkeeping (`v`, `dedup_key`,
+`source_tool`, `agent_id`, packet-equal `project_id` /
+`repository_identity`), notice lists reduced to a count, and duplicated
+reference-payload identity fields. Compaction is recorded as
+`diagnostics.budget.metadata_compacted`. A roomy budget never compacts.
+
+**Explicit truncation.** A ladder-truncated snippet declares
+`snippet_truncated`, `snippet_original_length`, `snippet_returned_length`
+and `snippet_continuation_ref` (the `code_reference_id` of the fact).
+Nothing truncates silently.
+
+**Packet status block** (additive top-level `packet_status` on budgeted
+packets, and on unbudgeted agent-facing packets): `packet_complete`,
+`budget_exhausted`, `omitted_sections`, `omitted_high_salience_count`,
+`recommended_next` (deterministic recovery hints naming real MCP tools),
+`context_sufficiency` (conservative: `implementation` and
+`security_verdict` stay `source_verification_required` whenever code
+evidence is present), per-tier `salience` counts and cpt1
+`token_accounting` (`useful_payload_tokens`, `metadata_tokens`,
+`compression_ratio`, `duplicate_items_suppressed`,
+`duplicate_tokens_estimated` with its method label). Under extreme
+pressure the block shrinks along a fixed key order instead of ever
+breaking the budget guarantee. Per-type omission counts
+(`omitted_item_types`) live in the budget REPORT, not in the block, so
+the block's byte footprint stays bounded.
+
+**Budget guidance.** The report (and the `budget_unsatisfiable` error on
+the CLI/service surfaces) carries deterministic
+`minimum_useful_tokens` (the cpt1 cost of the must-keep skeleton after
+full metadata compaction) and `recommended_max_tokens` (the cost of the
+packet with nothing high-salience omitted). A budget below the minimum
+is unsatisfiable WITH guidance, never a bare retry.
+
 ## Hard budget guarantee
 
 When `status=OK`, the estimated tokens of the budgeted packet's compact

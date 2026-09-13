@@ -315,6 +315,10 @@ def main(
                 "error": "budget_unsatisfiable",
                 "packet_id": result.original_packet_id,
                 "max_estimated_tokens": budget.max_estimated_tokens,
+                # R6C: deterministic guidance so a failed retry is never
+                # the only option.
+                "minimum_useful_tokens": result.minimum_useful_tokens,
+                "recommended_max_tokens": result.recommended_max_tokens,
             }
             if args.budget_report:
                 error_doc["budget_report"] = result.to_portable_dict()
@@ -337,6 +341,16 @@ def main(
         packet = result.packet
     elif args.relevance_report and ranked is not None:
         _emit(ranked.to_dict(), fh=sys.stderr)
+
+    if budget_requested:
+        pass
+    elif args.explain and packet.explainability:
+        # R6C: unbudgeted agent-facing packets carry the additive status
+        # block (guardrail omissions, salience, sufficiency, accounting).
+        # Legacy no-explain output stays byte-identical.
+        from .salience import build_status
+
+        packet.packet_status = build_status(packet)
 
     if args.explain and args.format == "markdown":
         print(human_summary(packet), end="")

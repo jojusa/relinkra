@@ -109,6 +109,46 @@ Hard rules:
   headroom; a final assertion-style check re-verifies it before OK is
   returned. ``reserve_tokens`` is genuinely reserved: content that only
   fits inside the reserve is unsatisfiable.
+
+R6C salience and metadata explainability (additive on top of R1F):
+
+- Salience tiers are explicit and agent-visible (relinkra.salience):
+  MUST_KEEP items are NEVER omitted by the ladder — the current (most
+  recent active) handoff, all pending items, plus the essential frame.
+  HIGH_SALIENCE covers important memories, handoffs, code references,
+  the direct code fact and important git facts; OPTIONAL covers
+  snippets, optional memories/facts and verbose metadata. The ladder
+  order already sheds OPTIONAL before HIGH_SALIENCE; R6C adds one
+  invariant on top: OPTIONAL consumption can never cause a MUST_KEEP
+  item to be dropped.
+- METADATA COMPACTION is a ladder step (after optional shedding, BEFORE
+  any important item is omitted). While over budget it deterministically
+  shrinks, in fixed order: per-item explain sidecars (full relevance
+  signals -> total, trust dropped, freshness reduced to state/reason),
+  packet-level freshness notices (grouped by state/reason/action with
+  shared evidence refs), ``selected_source_ids`` and
+  ``included_source_ids`` (derivable from the packet sections), then
+  duplicated provenance fields and redundant memory-envelope bookkeeping
+  (``v``, ``dedup_key``, ``source_tool``, ``agent_id``, packet-equal
+  ``project_id``/``repository_identity``). Compaction is recorded as
+  ``diagnostics.budget.metadata_compacted``. Roomy budgets never
+  compact: with no pressure the packet keeps the full R4D sidecars.
+- Snippet truncation is explicit: the truncated fact declares
+  ``snippet_original_length``, ``snippet_returned_length`` and
+  ``snippet_continuation_ref`` (the code_reference_id) alongside the
+  existing ``snippet_truncated`` flag. Nothing truncates silently.
+- The budgeted packet carries an additive ``packet_status`` block:
+  packet_complete, budget_exhausted, omitted_sections,
+  omitted_high_salience_count, omitted_item_types, recommended_next
+  (deterministic recovery hints naming real tools), context_sufficiency
+  (conservative; implementation/security stay
+  ``source_verification_required`` with code evidence), salience counts
+  and cpt1 token accounting. Under extreme pressure the block shrinks
+  along the same fixed order instead of breaking the budget guarantee.
+- ``BudgetedContext`` grows additive ``minimum_useful_tokens`` /
+  ``recommended_max_tokens`` guidance: the cpt1 cost of the must-keep
+  skeleton and of the no-high-salience-omission packet. A budget below
+  the minimum is unsatisfiable WITH guidance, not a bare retry.
 """
 
 from __future__ import annotations
@@ -121,6 +161,22 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .context_packet import PACKET_VERSION, ContextPacket, PacketItem
+from .salience import (  # noqa: F401  (re-exported: the shared classification
+    # source moved to salience in R6C; import paths stay stable)
+    IMPORTANT_GIT_FACT_KINDS,
+    IMPORTANT_MEMORY_TYPES,
+    MUST_KEEP,
+    STRUCTURAL_EVIDENCE_KINDS,
+    build_status,
+    build_status_skeleton,
+    classify_git_fact,
+    classify_item,
+    classify_memory_type,
+    current_handoff_memory_id,
+    is_structural_code_fact,
+    shrink_status,
+    status_omitted_item_types,
+)
 
 ESTIMATION_METHOD = "chars-per-token"
 ESTIMATION_VERSION = "cpt1"
@@ -132,10 +188,6 @@ TRUNCATION_MARKER = "\n...[truncated by budget]"
 # Fixed profiles: small = compact agent handoff, medium = normal coding
 # task, large = architecture/debug session.
 BUDGET_PROFILES = {"small": 2000, "medium": 8000, "large": 24000}
-
-IMPORTANT_MEMORY_TYPES = frozenset(
-    {"constraint", "decision", "architecture", "bug"}
-)
 
 STATUS_OK = "OK"
 STATUS_UNSATISFIABLE = "BUDGET_UNSATISFIABLE"
@@ -158,30 +210,6 @@ _ITEM_SECTIONS = ("memories", "code_references", "code_facts", "pending",
 _SECTION_KINDS = {"memories": "memory", "code_references": "code_reference",
                   "code_facts": "code_fact", "pending": "pending",
                   "handoffs": "handoff", "git_facts": "git_fact"}
-
-STRUCTURAL_EVIDENCE_KINDS = frozenset(
-    {
-        "architecture_fact",
-        "caller_relationship",
-        "dependency_relationship",
-        "bounded_path",
-    }
-)
-
-# Git fact policy classes (design §3): repository state, HEAD facts, the
-# focused file's change state, working-tree changes, commit lists and file
-# history are IMPORTANT; co-change and diff facts are OPTIONAL. Unknown
-# future kinds default to optional (shed first, safest).
-IMPORTANT_GIT_FACT_KINDS = frozenset(
-    {
-        "repository_state",
-        "head_facts",
-        "current_change_state",
-        "working_tree_change",
-        "recent_commit",
-        "file_history",
-    }
-)
 
 # Within-class deterministic shedding order for git facts when relevance
 # has no position for them (git_facts is currently unscored). Lower rank
@@ -231,21 +259,6 @@ def estimate_tokens(
 
 def _tokens_for_chars(chars: int, chars_per_token: float) -> int:
     return math.ceil(chars / chars_per_token) if chars > 0 else 0
-
-
-def classify_memory_type(memory_type: Optional[str]) -> str:
-    """Fixed section class: important baseline types, everything else
-    (discovery, verification, task_result, unknown) is optional."""
-    if memory_type in IMPORTANT_MEMORY_TYPES:
-        return "important"
-    return "optional"
-
-
-def classify_git_fact(kind: Optional[str]) -> str:
-    """Fixed git-fact class (see IMPORTANT_GIT_FACT_KINDS)."""
-    if kind in IMPORTANT_GIT_FACT_KINDS:
-        return "important"
-    return "optional"
 
 
 def _carries_git_section(packet: ContextPacket) -> bool:
@@ -461,6 +474,19 @@ class BudgetedContext:
     satisfied: bool
     report_id: str = ""
     relevance_version: Optional[str] = None
+    # R6C additive budget guidance (deterministic cpt1 estimates):
+    # ``minimum_useful_tokens`` is the cost of the must-keep skeleton
+    # (essential frame + protected items + focused code evidence);
+    # ``recommended_max_tokens`` is the cost of the packet with nothing
+    # high-salience omitted. A budget below the minimum is unsatisfiable
+    # WITH guidance rather than a bare retry.
+    minimum_useful_tokens: Optional[int] = None
+    recommended_max_tokens: Optional[int] = None
+    # R6C: per-type omission counts for the REPORT (bounded, sorted).
+    # Lives here rather than in the budgeted packet's status block so the
+    # block's byte footprint stays bounded while the report stays
+    # informative; counts only, never omitted payloads.
+    omitted_item_types: Optional[Dict[str, int]] = None
 
     def reconcile_final_packet(self, packet: ContextPacket) -> None:
         """Rebind the report to a packet mutated after the budget ladder.
@@ -500,6 +526,9 @@ class BudgetedContext:
             "status": self.status,
             "satisfied": self.satisfied,
             "relevance_version": self.relevance_version,
+            "minimum_useful_tokens": self.minimum_useful_tokens,
+            "recommended_max_tokens": self.recommended_max_tokens,
+            "omitted_item_types": self.omitted_item_types,
             "budget": self.budget.to_dict(),
             "original_usage": self.original_usage.to_dict(),
             "final_usage": self.final_usage.to_dict(),
@@ -538,6 +567,21 @@ class BudgetedContext:
             satisfied=bool(data.get("satisfied")),
             report_id=str(data.get("report_id") or ""),
             relevance_version=data.get("relevance_version"),
+            minimum_useful_tokens=(
+                int(data["minimum_useful_tokens"])
+                if data.get("minimum_useful_tokens") is not None
+                else None
+            ),
+            recommended_max_tokens=(
+                int(data["recommended_max_tokens"])
+                if data.get("recommended_max_tokens") is not None
+                else None
+            ),
+            omitted_item_types=(
+                dict(data.get("omitted_item_types"))
+                if isinstance(data.get("omitted_item_types"), Mapping)
+                else None
+            ),
         )
 
     def to_json(self, *, pretty: bool = False) -> str:
@@ -658,11 +702,20 @@ def _budget_stats(
     }
     if _carries_git_section(working):
         diag["final_counts"]["git_facts"] = len(working.git_facts)
-    diag["included_source_ids"] = [
-        _source_id(section, item)
-        for section in _ITEM_SECTIONS
-        for item in getattr(working, section)
-    ]
+    diag["included_source_ids"] = (
+        [
+            _source_id(section, item)
+            for section in _ITEM_SECTIONS
+            for item in getattr(working, section)
+        ]
+        # R6C metadata compaction drops this list from the SHIPPED packet
+        # (it is fully derivable from the packet sections); the flag keeps
+        # the refresh from silently re-adding it after compaction fired.
+        if not diag.get("metadata_compacted")
+        else None
+    )
+    if diag["included_source_ids"] is None:
+        del diag["included_source_ids"]
     omitted: List[str] = []
     truncated: List[str] = []
     counters: Dict[Tuple[str, str], int] = {}
@@ -811,7 +864,7 @@ def _source_id(section: str, item: PacketItem) -> str:
 
 def _is_structural_code_fact(item: PacketItem) -> bool:
     """CBM structural facts are optional, never the protected code focus."""
-    return item.data.get("evidence_kind") in STRUCTURAL_EVIDENCE_KINDS
+    return is_structural_code_fact(item)
 
 
 # -- the accountant ------------------------------------------------------------
@@ -856,6 +909,14 @@ def apply_budget(
     cpt = budget.chars_per_token
     original_usage = _usage(packet, cpt)
     working = prepare_budgeted_packet(packet, budget)
+    current_handoff_id = current_handoff_memory_id(packet)
+    # R6C: the mandated metadata (salience labels + packet_status block)
+    # is attached BEFORE the ladder so the ladder measures its footprint
+    # and sheds items only after the metadata had its chance to compact.
+    # The skeleton carries the worst-case block footprint; the true block
+    # replaces it after the ladder.
+    _attach_salience_labels(working, current_handoff_id)
+    working.packet_status = build_status_skeleton(working, cpt)
 
     # Original-packet occurrence per working item, computed BEFORE any
     # removal: identical to the from-end prefix counting when relevance
@@ -876,6 +937,8 @@ def apply_budget(
     # either shrinks a section, adds an action entry, or changes the
     # snippet payload total (truncation shortens it, reference-only drops
     # the key entirely — and both also cover action-entry overwrites).
+    # Metadata compaction mutates NONE of the tracked sizes, so it
+    # invalidates the probe explicitly via probe["key"] = None.
     probe = {"key": None, "fits": False}
 
     def fits() -> bool:
@@ -904,13 +967,42 @@ def apply_budget(
 
     while not fits():
         snapshot = working.to_json()
-        _ladder(working, actions, fits, occ_map, relevance)
+        _ladder(working, actions, fits, occ_map, relevance,
+                current_handoff_id, probe)
         if working.to_json() == snapshot:
-            break  # ladder exhausted: budget is unsatisfiable
+            # Ladder exhausted against the worst-case skeleton block.
+            # The true (post-ladder) block is never larger, so rebuild it
+            # once and re-check before declaring the budget
+            # unsatisfiable.
+            _settle_packet_status(
+                packet, working, budget, actions, cpt, current_handoff_id
+            )
+            if not (_hard_guarantee(working, budget) and _fits(working, budget)):
+                working.packet_status = _shrink_to_fit(
+                    packet, working, budget, actions
+                )
+            break
 
-    satisfied = fits() and _hard_guarantee(working, budget)
+    # R6C: salience labels on survivors (only where an R4D sidecar
+    # exists) and the additive packet_status block, both measured by the
+    # hard guarantee. Token accounting is self-referential (the block is
+    # part of the measured payload), so the block is rebuilt to a fixed
+    # point exactly like the diagnostics totals. The block shrinks along
+    # a fixed order instead of ever breaking the budget.
+    _attach_salience_labels(working, current_handoff_id)
+    _settle_packet_status(
+        packet, working, budget, actions, cpt, current_handoff_id
+    )
+    if not (_hard_guarantee(working, budget) and _fits(working, budget)):
+        working.packet_status = _shrink_to_fit(
+            packet, working, budget, actions
+        )
+
+    satisfied = _fits(working, budget) and _hard_guarantee(working, budget)
     _budget_stats(packet, working, budget, actions, satisfied)
-    if satisfied and not _hard_guarantee(working, budget):
+    if satisfied and not (
+        _fits(working, budget) and _hard_guarantee(working, budget)
+    ):
         # The definitive stats write shifted the payload across the line.
         satisfied = False
         _budget_stats(packet, working, budget, actions, False)
@@ -933,6 +1025,15 @@ def apply_budget(
             if relevance is not None
             else None
         ),
+        minimum_useful_tokens=_minimum_useful_tokens(
+            packet, budget, current_handoff_id
+        ),
+        recommended_max_tokens=_recommended_max_tokens(
+            packet, budget, current_handoff_id
+        ),
+        omitted_item_types=status_omitted_item_types(
+            packet, _omitted_items(packet, actions)
+        ),
     )
     result.report_id = _report_id(
         packet.packet_id,
@@ -941,6 +1042,199 @@ def apply_budget(
         working,
     )
     return result
+
+
+def _omitted_items(
+    packet: ContextPacket,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+) -> List[Tuple[str, PacketItem]]:
+    """(section, original_item) pairs the ladder omitted, packet order."""
+    omitted: List[Tuple[str, PacketItem]] = []
+    for section in _ITEM_SECTIONS:
+        kind = _SECTION_KINDS[section]
+        counters: Dict[str, int] = {}
+        for item in getattr(packet, section):
+            sid = _source_id(section, item)
+            key = (kind, sid)
+            occurrence = counters.get(key, 0)
+            counters[key] = occurrence + 1
+            action = actions.get((kind, sid, occurrence))
+            if action is not None and action[0] == ACTION_OMITTED:
+                omitted.append((section, item))
+    return omitted
+
+
+def _settle_packet_status(
+    packet: ContextPacket,
+    working: ContextPacket,
+    budget: ContextBudget,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+    cpt: float,
+    current_handoff_id: Optional[str],
+) -> None:
+    """Rebuild the TRUE packet_status block to a fixed point: the block
+    carries token accounting measured over the payload it ships in, so
+    each round re-settles the self-referential diagnostics totals and
+    rebuilds until the block stops changing (bounded rounds; digit-width
+    convergence exactly like the diagnostics totals)."""
+    omitted_pairs = _omitted_items(packet, actions)
+    working.packet_status = build_status(
+        working,
+        original_packet=packet,
+        budget_omitted_items=omitted_pairs,
+        chars_per_token=cpt,
+    )
+    for _ in range(3):
+        _budget_stats(packet, working, budget, actions, True)
+        rebuilt = build_status(
+            working,
+            original_packet=packet,
+            budget_omitted_items=omitted_pairs,
+            chars_per_token=cpt,
+        )
+        if rebuilt == working.packet_status:
+            break
+        working.packet_status = rebuilt
+    _budget_stats(packet, working, budget, actions, True)
+
+
+def _shrink_to_fit(
+    packet: ContextPacket,
+    working: ContextPacket,
+    budget: ContextBudget,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+) -> dict:
+    """Deterministic shrink cascade for the status block: drop keys in
+    fixed value order (token accounting, recovery hints, counts,
+    sufficiency) until the payload fits again. Last resort is an empty
+    block — the completeness booleans then live only in the budget
+    report and the omissions stay visible through the audit decisions."""
+    status = working.packet_status or {}
+    while True:
+        working.packet_status = status
+        _budget_stats(packet, working, budget, actions, True)
+        if _hard_guarantee(working, budget) and _fits(working, budget):
+            return status
+        shrunk = shrink_status(status)
+        if shrunk is None:
+            working.packet_status = {}
+            _budget_stats(packet, working, budget, actions, True)
+            return {}
+        status = shrunk
+
+
+def _attach_salience_labels(
+    working: ContextPacket, current_handoff_id: Optional[str]
+) -> None:
+    """Per-item ``explain["salience"]`` tier labels on survivors.
+
+    Labels attach only where an R4D sidecar already exists; packets
+    without explainability keep their exact wire form (tier counts are
+    still visible in ``packet_status``).
+    """
+    seen_direct = False
+    for section in _ITEM_SECTIONS:
+        for item in getattr(working, section):
+            if item.explain is None:
+                continue
+            is_direct = False
+            if section == "code_facts" and not _is_structural_code_fact(item):
+                is_direct = not seen_direct
+                seen_direct = True
+            item.explain["salience"] = classify_item(
+                section,
+                item,
+                current_handoff_memory_id=current_handoff_id,
+                is_direct_code_fact=is_direct,
+            )
+
+
+def _skeleton_packet(
+    packet: ContextPacket, current_handoff_id: Optional[str]
+) -> ContextPacket:
+    """Deepcopy pruned to the must-keep skeleton: the essential frame,
+    protected items (pending + current handoff), the first code
+    reference and the direct (first non-structural) code fact."""
+    skeleton = copy.deepcopy(packet)
+    skeleton.memories = []
+    skeleton.pending = list(packet.pending)
+    skeleton.handoffs = [
+        item
+        for item in packet.handoffs
+        if item.provenance.memory_id == current_handoff_id
+    ]
+    skeleton.code_references = list(packet.code_references[:1])
+    direct_fact = None
+    for item in packet.code_facts:
+        if not _is_structural_code_fact(item):
+            direct_fact = item
+            break
+    skeleton.code_facts = [copy.deepcopy(direct_fact)] if direct_fact else []
+    skeleton.git_facts = []
+    return skeleton
+
+
+def _high_salience_packet(
+    packet: ContextPacket, current_handoff_id: Optional[str]
+) -> ContextPacket:
+    """Deepcopy with every OPTIONAL-tier item removed: the packet shape
+    that omits nothing high-salience (snippets kept intact)."""
+    pruned = copy.deepcopy(packet)
+    pruned.memories = [
+        item
+        for item in packet.memories
+        if classify_memory_type(item.data.get("memory_type")) == "important"
+    ]
+    pruned.handoffs = list(packet.handoffs)
+    pruned.pending = list(packet.pending)
+    pruned.code_references = list(packet.code_references)
+    pruned.git_facts = [
+        item for item in packet.git_facts if classify_git_fact(
+            item.data.get("kind")
+        ) == "important"
+    ]
+    kept_fact = False
+    facts: List[PacketItem] = []
+    for item in packet.code_facts:
+        if _is_structural_code_fact(item):
+            continue
+        if kept_fact:
+            continue
+        kept_fact = True
+        facts.append(copy.deepcopy(item))
+    pruned.code_facts = facts
+    return pruned
+
+
+def _minimum_useful_tokens(
+    packet: ContextPacket, budget: ContextBudget, current_handoff_id: Optional[str]
+) -> int:
+    skeleton = prepare_budgeted_packet(
+        _skeleton_packet(packet, current_handoff_id), budget
+    )
+    _attach_salience_labels(skeleton, current_handoff_id)
+    skeleton.packet_status = build_status_skeleton(
+        skeleton, budget.chars_per_token
+    )
+    # Full metadata compaction with no budget gate: the honest floor the
+    # ladder can actually produce while keeping every must-keep item.
+    _compact_metadata(skeleton, None, None)
+    _budget_stats(skeleton, skeleton, budget, {}, True)
+    return estimate_tokens(skeleton.to_json(), budget.chars_per_token)
+
+
+def _recommended_max_tokens(
+    packet: ContextPacket, budget: ContextBudget, current_handoff_id: Optional[str]
+) -> int:
+    prepared = prepare_budgeted_packet(
+        _high_salience_packet(packet, current_handoff_id), budget
+    )
+    _attach_salience_labels(prepared, current_handoff_id)
+    prepared.packet_status = build_status_skeleton(
+        prepared, budget.chars_per_token
+    )
+    size = estimate_tokens(prepared.to_json(), budget.chars_per_token)
+    return size + budget.reserve_tokens
 
 
 def _hard_guarantee(working: ContextPacket, budget: ContextBudget) -> bool:
@@ -966,6 +1260,8 @@ def _ladder(
     fits,
     occ_map: Dict[int, int],
     relevance,
+    current_handoff_id: Optional[str] = None,
+    probe: Optional[dict] = None,
 ) -> None:
     # Step 1: truncate oversized snippets to the fixed ladder cap.
     counters: Dict[str, int] = {}
@@ -977,8 +1273,14 @@ def _ladder(
         counters[sid] = occurrence + 1
         snippet = fact.data.get("snippet")
         if isinstance(snippet, str) and len(snippet) > SNIPPET_LADDER_CAP:
+            original_length = len(snippet)
             fact.data["snippet"] = snippet[:SNIPPET_LADDER_CAP] + TRUNCATION_MARKER
             fact.data["snippet_truncated"] = True
+            # R6C: truncation is never silent — the fact declares what
+            # was cut and where the full evidence remains available.
+            fact.data["snippet_original_length"] = original_length
+            fact.data["snippet_returned_length"] = len(fact.data["snippet"])
+            fact.data["snippet_continuation_ref"] = sid or None
             actions[("snippet", sid, occurrence)] = (
                 ACTION_TRUNCATED,
                 REASON_SNIPPET_LADDER,
@@ -994,14 +1296,404 @@ def _ladder(
         if isinstance(fact.data.get("snippet"), str):
             fact.data.pop("snippet", None)
             fact.data.pop("snippet_truncated", None)
+            fact.data.pop("snippet_original_length", None)
+            fact.data.pop("snippet_returned_length", None)
+            fact.data.pop("snippet_continuation_ref", None)
             actions[("snippet", sid, occurrence)] = (
                 ACTION_REFERENCE_ONLY,
                 REASON_SNIPPET_LADDER,
             )
     if relevance is None:
-        _ladder_fixed_order(working, actions, fits, occ_map)
+        _ladder_fixed_order(working, actions, fits, occ_map,
+                            current_handoff_id)
     else:
-        _ladder_ranked_order(working, actions, fits, occ_map, relevance)
+        _ladder_ranked_order(working, actions, fits, occ_map, relevance,
+                             current_handoff_id)
+    # R6C metadata compaction: verbose metadata is sacrificed BEFORE any
+    # high-salience or must-keep item. Each sub-step checks fits() and
+    # mutates only while over budget; the probe is invalidated because
+    # compaction changes bytes without changing any tracked size.
+    if not fits():
+        _compact_metadata(working, fits, probe)
+    if not fits():
+        if relevance is None:
+            _omit_important_fixed_order(working, actions, fits, occ_map,
+                                        current_handoff_id)
+        else:
+            _omit_important_ranked_order(working, actions, fits, occ_map,
+                                         relevance, current_handoff_id)
+
+
+# -- R6C metadata compaction ---------------------------------------------------
+
+
+_COMPACT_FRESHNESS_KEYS = ("state", "reason_code")
+
+
+def _compact_item_explain(explain: dict) -> bool:
+    """Reduce one item's R4D sidecar to its compact form. Returns True
+    when anything changed. Kept: salience, budget treatment, evidence
+    ref, contradiction ids, freshness state/reason_code and the relevance
+    TOTAL. Dropped: per-signal relevance dumps, trust detail, verbose
+    freshness fields."""
+    changed = False
+    selection = explain.get("selection")
+    if isinstance(selection, dict):
+        relevance = selection.get("relevance")
+        if isinstance(relevance, Mapping) and "total" in relevance:
+            if set(relevance) != {"total"}:
+                selection["relevance"] = {"total": relevance["total"]}
+                changed = True
+        if selection.pop("reasons", None) is not None:
+            changed = True
+    if explain.pop("trust", None) is not None:
+        changed = True
+    freshness = explain.get("freshness")
+    if isinstance(freshness, dict) and set(freshness) != set(
+        _COMPACT_FRESHNESS_KEYS
+    ):
+        compact = {
+            key: freshness[key]
+            for key in _COMPACT_FRESHNESS_KEYS
+            if key in freshness
+        }
+        explain["freshness"] = compact
+        changed = True
+    return changed
+
+
+def _group_notices(packet: ContextPacket) -> bool:
+    """Group packet-level freshness notices by (state, reason_code,
+    recommended_action) with a shared evidence_ref list. Same typing,
+    one action string instead of one per item."""
+    explainability = packet.explainability
+    notices = explainability.get("notices") if isinstance(
+        explainability, dict
+    ) else None
+    if not notices or not isinstance(notices, list):
+        return False
+    if notices and isinstance(notices[0], dict) and "evidence_refs" in notices[0]:
+        return False  # already grouped
+    groups: Dict[Tuple[str, str, str], List[str]] = {}
+    order: List[Tuple[str, str, str]] = []
+    for notice in notices:
+        if not isinstance(notice, dict):
+            continue
+        key = (
+            str(notice.get("state") or ""),
+            str(notice.get("reason_code") or ""),
+            str(notice.get("recommended_action") or ""),
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        ref = notice.get("evidence_ref")
+        if ref:
+            groups[key].append(str(ref))
+    if len(order) == len(notices) and all(
+        len(groups[key]) == 1 for key in order
+    ):
+        return False  # grouping would not save anything
+    grouped = []
+    for key in order:
+        state, reason_code, action = key
+        entry = {"state": state}
+        if reason_code:
+            entry["reason_code"] = reason_code
+        entry["evidence_refs"] = groups[key]
+        if action:
+            entry["recommended_action"] = action
+        grouped.append(entry)
+    explainability["notices"] = grouped
+    return True
+
+
+# Envelope fields that are storage/bookkeeping duplication inside a
+# single-project packet: envelope version, dedupe key, and fields whose
+# packet-level value already states the same fact.
+_SIGNED_FIELDS_ALWAYS_DROPPED = ("v", "dedup_key")
+
+
+def _slim_memory_envelope(data: dict, working: ContextPacket) -> bool:
+    changed = False
+    for key in _SIGNED_FIELDS_ALWAYS_DROPPED:
+        if key in data:
+            del data[key]
+            changed = True
+    if data.get("source_tool") == "relinkra" and "source_tool" in data:
+        del data["source_tool"]
+        changed = True
+    if "agent_id" in data and data.get("agent_id") in (
+        None, "", data.get("agent_type"),
+    ):
+        del data["agent_id"]
+        changed = True
+    if (
+        "project_id" in data
+        and data.get("project_id") == working.project_id
+    ):
+        del data["project_id"]
+        changed = True
+    if (
+        "repository_identity" in data
+        and working.repository_identity is not None
+        and data.get("repository_identity") == working.repository_identity
+    ):
+        del data["repository_identity"]
+        changed = True
+    return changed
+
+
+# Provenance fields duplicated verbatim in the item data; the provenance
+# copy is the redundant one (source, why_included, memory_id and
+# code_reference_id always stay).
+_DUPLICATED_PROVENANCE_FIELDS = (
+    ("agent_type", "agent_type"),
+    ("topic_key", "topic_key"),
+    ("workspace_id", "workspace_id"),
+    ("cbm_project_name", "cbm_project_name"),
+    ("resolution_state", "resolution_state"),
+)
+
+
+def _slim_provenance(item: PacketItem) -> bool:
+    changed = False
+    data = item.data if isinstance(item.data, dict) else {}
+    for field_name, data_key in _DUPLICATED_PROVENANCE_FIELDS:
+        value = getattr(item.provenance, field_name)
+        if value is not None and data.get(data_key) == value:
+            setattr(item.provenance, field_name, None)
+            changed = True
+    return changed
+
+
+def _compact_metadata(
+    working: ContextPacket, fits, probe: Optional[dict]
+) -> None:
+    """R6C ladder step: deterministic metadata compaction, most valuable
+    first. Runs only while over budget; every mutation invalidates the
+    fits() probe because compaction changes bytes without changing any
+    tracked size. ``fits=None`` runs every sub-step unconditionally
+    (used to measure the true must-keep floor for budget guidance)."""
+    def invalidated():
+        if probe is not None:
+            probe["key"] = None
+
+    def over() -> bool:
+        return fits is None or not fits()
+
+    # a) per-item explain sidecars (all sections, fixed order)
+    for section in _ITEM_SECTIONS:
+        for item in getattr(working, section):
+            if not over():
+                return
+            if item.explain and _compact_item_explain(item.explain):
+                invalidated()
+    # b) packet-level freshness notices -> grouped form
+    if over() and _group_notices(working):
+        invalidated()
+    # c) composition selected_source_ids: duplicated by the sections plus
+    #    the audit trail
+    composition = working.diagnostics.get("composition")
+    if (
+        over()
+        and isinstance(composition, dict)
+        and composition.pop("selected_source_ids", None) is not None
+    ):
+        invalidated()
+    # d) budget included_source_ids: fully derivable from the sections
+    budget_diag = working.diagnostics.get("budget")
+    if over() and isinstance(budget_diag, dict):
+        if budget_diag.pop("included_source_ids", None) is not None:
+            budget_diag["metadata_compacted"] = True
+            invalidated()
+    # e) provenance fields duplicated in the item data
+    for section in _ITEM_SECTIONS:
+        for item in getattr(working, section):
+            if not over():
+                return
+            if _slim_provenance(item):
+                invalidated()
+    # f) memory-envelope bookkeeping (memories/pending/handoffs)
+    for section in ("memories", "pending", "handoffs"):
+        for item in getattr(working, section):
+            if not over():
+                return
+            if isinstance(item.data, dict) and _slim_memory_envelope(
+                item.data, working
+            ):
+                invalidated()
+    # g) notices reduce to a count; advisory detail is reconstructible by
+    #    re-running the read with a larger budget
+    explainability = working.explainability
+    if (
+        over()
+        and isinstance(explainability, dict)
+        and explainability.pop("notices", None) is not None
+    ):
+        explainability["freshness_notice_count"] = _count_notices(working)
+        invalidated()
+    # h) code-reference payloads drop identity fields duplicated at
+    #    packet/item level (the code_reference_id stays: it IS the
+    #    continuation reference)
+    for item in working.code_references:
+        if not over():
+            return
+        reference = item.data.get("reference") if isinstance(
+            item.data, dict
+        ) else None
+        if isinstance(reference, dict) and _slim_reference_payload(reference):
+            invalidated()
+
+
+_NOTICE_STATE_KEYS = ("aging", "stale", "unknown")
+
+
+def _count_notices(working: ContextPacket) -> int:
+    """Deterministic count of freshness notices that would have been
+    grouped (states that require independent verification)."""
+    count = 0
+    for section in _ITEM_SECTIONS:
+        for item in getattr(working, section):
+            freshness = (item.explain or {}).get("freshness") or {}
+            if str(freshness.get("state") or "") in _NOTICE_STATE_KEYS:
+                count += 1
+    return count
+
+
+# Reference payload fields duplicated at packet/item level inside a
+# code_reference item's embedded CodeReference dict.
+_REFERENCE_DUPLICATED_KEYS = (
+    "project_id",
+    "workspace_id",
+    "repository_identity",
+    "cbm_project_name",
+)
+
+
+def _slim_reference_payload(reference: dict) -> bool:
+    changed = False
+    for key in _REFERENCE_DUPLICATED_KEYS:
+        if key in reference:
+            del reference[key]
+            changed = True
+    for key in ("commit_sha", "symbol_kind"):
+        if key in reference and reference.get(key) is None:
+            del reference[key]
+            changed = True
+    return changed
+
+
+def _omit_important_fixed_order(
+    working: ContextPacket,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+    fits,
+    occ_map: Dict[int, int],
+    current_handoff_id: Optional[str],
+) -> None:
+    """Step 6 exactly as plain R1F, minus MUST_KEEP items: important
+    memories from the end, then non-current handoffs, then git facts,
+    then code_references beyond the first. Pending items and the current
+    handoff are protected (R6C salience)."""
+    index = len(working.memories) - 1
+    while index >= 0:
+        if fits():
+            return
+        item = working.memories[index]
+        working.memories.pop(index)
+        sid = _source_id("memories", item)
+        actions[("memory", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+        index -= 1
+    index = len(working.handoffs) - 1
+    while index >= 0:
+        if fits():
+            return
+        item = working.handoffs[index]
+        if item.provenance.memory_id != current_handoff_id:
+            working.handoffs.pop(index)
+            sid = _source_id("handoffs", item)
+            actions[("handoff", sid, occ_map[id(item)])] = (
+                ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+            )
+        index -= 1
+    while working.git_facts:
+        if fits():
+            return
+        item = working.git_facts.pop()
+        sid = _source_id("git_facts", item)
+        actions[("git_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+    while len(working.code_references) > 1:
+        if fits():
+            return
+        item = working.code_references.pop()
+        sid = _source_id("code_references", item)
+        actions[("code_reference", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+
+
+def _omit_important_ranked_order(
+    working: ContextPacket,
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+    fits,
+    occ_map: Dict[int, int],
+    relevance,
+    current_handoff_id: Optional[str],
+) -> None:
+    """Step 6 with R1G guidance, minus MUST_KEEP items (R6C)."""
+    positions = _rank_positions(relevance, "memories")
+    for item in _worst_first(
+        list(working.memories), "memories", positions, occ_map
+    ):
+        if fits():
+            return
+        sid = _source_id("memories", item)
+        _remove_item(working.memories, item)
+        actions[("memory", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+    positions = _rank_positions(relevance, "handoffs")
+    sheddable = [
+        item
+        for item in working.handoffs
+        if item.provenance.memory_id != current_handoff_id
+    ]
+    for item in _worst_first(sheddable, "handoffs", positions, occ_map):
+        if fits():
+            return
+        sid = _source_id("handoffs", item)
+        _remove_item(working.handoffs, item)
+        actions[("handoff", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+    positions = _rank_positions(relevance, "git_facts")
+    for item in _worst_first(
+        list(working.git_facts), "git_facts", positions, occ_map,
+        _git_fact_shed_rank,
+    ):
+        if fits():
+            return
+        sid = _source_id("git_facts", item)
+        _remove_item(working.git_facts, item)
+        actions[("git_fact", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
+    positions = _rank_positions(relevance, "code_references")
+    ref_extras = list(working.code_references[1:])
+    for item in _worst_first(ref_extras, "code_references", positions, occ_map):
+        if fits():
+            return
+        if len(working.code_references) <= 1:
+            return
+        sid = _source_id("code_references", item)
+        _remove_item(working.code_references, item)
+        actions[("code_reference", sid, occ_map[id(item)])] = (
+            ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED,
+        )
 
 
 def _ladder_fixed_order(
@@ -1009,9 +1701,11 @@ def _ladder_fixed_order(
     actions: Dict[Tuple[str, str, int], Tuple[str, str]],
     fits,
     occ_map: Dict[int, int],
+    current_handoff_id: Optional[str] = None,
 ) -> None:
     """Steps 3-5 exactly as plain R1F: removal from the END of each list.
-    Byte-identical to the pre-relevance accountant."""
+    Byte-identical to the pre-relevance accountant. (Step 6 lives in
+    ``_omit_important_fixed_order`` and runs after metadata compaction.)"""
     # Step 3: omit optional memories, from the END of the list first.
     index = len(working.memories) - 1
     while index >= 0:
@@ -1066,34 +1760,6 @@ def _ladder_fixed_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
-    # Step 6: omit important items, from the end of each list first.
-    for section in ("memories", "pending", "handoffs"):
-        items = getattr(working, section)
-        while items:
-            if fits():
-                return
-            item = items.pop()
-            sid = _source_id(section, item)
-            actions[
-                (_SECTION_KINDS[section], sid, occ_map[id(item)])
-            ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
-    while working.git_facts:
-        if fits():
-            return
-        item = working.git_facts.pop()
-        sid = _source_id("git_facts", item)
-        actions[("git_fact", sid, occ_map[id(item)])] = (
-            ACTION_OMITTED,
-            REASON_IMPORTANT_EXHAUSTED,
-        )
-    while len(working.code_references) > 1:
-        if fits():
-            return
-        item = working.code_references.pop()
-        sid = _source_id("code_references", item)
-        actions[
-            ("code_reference", sid, occ_map[id(item)])
-        ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
 
 
 def _rank_positions(relevance, section: str) -> Dict[Tuple[str, int], int]:
@@ -1146,9 +1812,12 @@ def _ladder_ranked_order(
     fits,
     occ_map: Dict[int, int],
     relevance,
+    current_handoff_id: Optional[str] = None,
 ) -> None:
     """Steps 3-5 with R1G guidance: same ladder STRUCTURE, but removal
-    inside each step is ascending relevance instead of from-end."""
+    inside each step is ascending relevance instead of from-end. (Step 6
+    lives in ``_omit_important_ranked_order`` and runs after metadata
+    compaction.)"""
     # Step 3: omit optional memories, lowest relevance first.
     positions = _rank_positions(relevance, "memories")
     optional = [
@@ -1217,48 +1886,6 @@ def _ladder_ranked_order(
             ACTION_OMITTED,
             REASON_OPTIONAL_EXHAUSTED,
         )
-    # Step 6: omit important items, lowest relevance first per list.
-    for section in ("memories", "pending", "handoffs"):
-        items = getattr(working, section)
-        positions = _rank_positions(relevance, section)
-        for item in _worst_first(list(items), section, positions, occ_map):
-            if fits():
-                return
-            sid = _source_id(section, item)
-            _remove_item(items, item)
-            actions[
-                (_SECTION_KINDS[section], sid, occ_map[id(item)])
-            ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
-    positions = _rank_positions(relevance, "git_facts")
-    for item in _worst_first(
-        list(working.git_facts),
-        "git_facts",
-        positions,
-        occ_map,
-        _git_fact_shed_rank,
-    ):
-        if fits():
-            return
-        sid = _source_id("git_facts", item)
-        _remove_item(working.git_facts, item)
-        actions[("git_fact", sid, occ_map[id(item)])] = (
-            ACTION_OMITTED,
-            REASON_IMPORTANT_EXHAUSTED,
-        )
-    positions = _rank_positions(relevance, "code_references")
-    ref_extras = list(working.code_references[1:])
-    for item in _worst_first(
-        ref_extras, "code_references", positions, occ_map
-    ):
-        if fits():
-            return
-        if len(working.code_references) <= 1:
-            return
-        sid = _source_id("code_references", item)
-        _remove_item(working.code_references, item)
-        actions[
-            ("code_reference", sid, occ_map[id(item)])
-        ] = (ACTION_OMITTED, REASON_IMPORTANT_EXHAUSTED)
 
 
 def _build_decisions(

@@ -266,6 +266,11 @@ class ContextPacket:
     # are omitted from serialization for backward compatibility.
     contradictions: List[dict] = field(default_factory=list)
     explainability: dict = field(default_factory=dict)
+    # R6C additive agent-visible status block (salience tiers, packet
+    # completeness, omissions, recovery hints, sufficiency, cpt1 token
+    # accounting). Empty default keeps every pre-R6C serialization
+    # byte-identical; the field never participates in packet identity.
+    packet_status: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         data = {
@@ -297,6 +302,8 @@ class ContextPacket:
             data["contradictions"] = self.contradictions
         if self.explainability:
             data["explainability"] = self.explainability
+        if self.packet_status:
+            data["packet_status"] = self.packet_status
         return data
 
     @staticmethod
@@ -343,6 +350,7 @@ class ContextPacket:
             diagnostics=dict(data.get("diagnostics") or {}),
             contradictions=[dict(item) for item in data.get("contradictions") or []],
             explainability=dict(data.get("explainability") or {}),
+            packet_status=dict(data.get("packet_status") or {}),
         )
 
     def to_json(self, *, pretty: bool = False) -> str:
@@ -529,6 +537,41 @@ class ContextPacket:
         else:
             lines.append("- (none)")
         lines.append("")
+
+        if self.packet_status:
+            status = self.packet_status
+            lines.append("## Packet status")
+            lines.append("")
+            lines.append(
+                f"- packet_complete: {status.get('packet_complete')}"
+            )
+            lines.append(
+                f"- budget_exhausted: {status.get('budget_exhausted')}"
+            )
+            omitted_sections = status.get("omitted_sections") or []
+            if omitted_sections:
+                lines.append(
+                    "- omitted_sections: " + ", ".join(omitted_sections)
+                )
+            high = status.get("omitted_high_salience_count")
+            if high:
+                lines.append(f"- omitted_high_salience_count: {high}")
+            for hint in status.get("recommended_next") or []:
+                lines.append(f"- recommended_next: {hint}")
+            sufficiency = status.get("context_sufficiency") or {}
+            if sufficiency:
+                rendered = ", ".join(
+                    f"{key}={sufficiency[key]}"
+                    for key in sorted(sufficiency)
+                )
+                lines.append(f"- context_sufficiency: {rendered}")
+            salience = status.get("salience") or {}
+            if salience:
+                rendered = ", ".join(
+                    f"{key}={salience[key]}" for key in sorted(salience)
+                )
+                lines.append(f"- salience: {rendered}")
+            lines.append("")
 
         if self.explainability:
             lines.append("## Freshness and contradictions")

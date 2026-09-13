@@ -849,10 +849,24 @@ class BudgetIntegrationTests(unittest.TestCase):
                          [d.to_dict() for d in explicit_none.decisions])
         self.assertEqual(plain.report_id, explicit_none.report_id)
         self.assertIsNone(plain.to_dict()["relevance_version"])
-        # fixed from-end R1F semantics still hold: last optional memory
+        # fixed from-end R1F semantics still hold: omitted OPTIONAL
+        # memories form a suffix of the packet order (R6C compaction
+        # frees room, so the shedding depth may shrink — the ORDER is
+        # the contract). Important memories shed only after every
+        # optional memory is gone.
         by_id = decisions_by_id(plain)
-        self.assertEqual(by_id["mem_res"].action, "omitted")
-        self.assertEqual(by_id["mem_dec"].action, "included")
+        optional_ids = ("mem_dis1", "mem_dis2", "mem_ver", "mem_res")
+        seen_omitted = False
+        for source_id in optional_ids:
+            if by_id[source_id].action == "omitted":
+                seen_omitted = True
+            else:
+                self.assertFalse(
+                    seen_omitted,
+                    "optional memories must shed from the END only",
+                )
+        if any(by_id[m].action != "omitted" for m in optional_ids):
+            self.assertEqual(by_id["mem_dec"].action, "included")
 
     def test_mismatched_ranking_rejected(self):
         packet = rich_packet()

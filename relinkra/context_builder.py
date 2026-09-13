@@ -848,11 +848,20 @@ class ContextBuilder:
 
         seen = set()
         unique = []
+        duplicate_ids = 0
+        duplicate_chars = 0
         for memory in candidates:
             if memory.memory_id in seen:
+                # R6B/R6C deterministic dedupe accounting. The suppressed
+                # copy is in hand here, so its own envelope length is the
+                # estimate basis for the tokens the packet did not spend.
+                duplicate_ids += 1
+                duplicate_chars += len(memory.envelope_json())
                 continue
             seen.add(memory.memory_id)
             unique.append(memory)
+        diagnostics["duplicate_memory_ids_skipped"] = duplicate_ids
+        diagnostics["duplicate_memory_chars_skipped"] = duplicate_chars
         return unique, set(), True
 
     def _task_token_map(self, mode, task, candidates):
@@ -1433,12 +1442,17 @@ class ContextBuilder:
         }
         data.update(cbm_authority or {})
         if snippet_ref is not None:
-            snippet, truncated = self._read_snippet(snippet_ref)
+            snippet, truncated, original_length = self._read_snippet(snippet_ref)
             if snippet is not None:
                 data["snippet"] = snippet
                 data["snippet_truncated"] = truncated
                 snip_stats["snippets"] += 1
                 if truncated:
+                    # R6C: declared truncation with sizes; the
+                    # code_reference_id in this fact is the continuation
+                    # reference for the full source.
+                    data["snippet_original_length"] = original_length
+                    data["snippet_returned_length"] = len(snippet)
                     snip_stats["truncated"] += 1
         return PacketItem(
             data=data,
@@ -1453,9 +1467,10 @@ class ContextBuilder:
         )
 
     def _read_snippet(self, ref) -> tuple:
-        """Bounded line-range snippet from the workspace; never full files."""
+        """Bounded line-range snippet from the workspace; never full files.
+        Returns (text, truncated, original_length_or_None)."""
         if not self.workspace_root or not ref.start_line:
-            return None, False
+            return None, False, None
         path = os.path.join(
             self.workspace_root, *ref.file_path.split("/")
         )
@@ -1463,15 +1478,18 @@ class ContextBuilder:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
         except OSError:
-            return None, False
+            return None, False, None
         end = ref.end_line or ref.start_line
         text = "\n".join(lines[ref.start_line - 1 : end])
         truncated = False
+        original_length = None
         limit = self.guardrails.max_snippet_chars
         if len(text) > limit:
+            # R6C: guardrail truncation is declared, never silent.
+            original_length = len(text)
             text = text[:limit]
             truncated = True
-        return text, truncated
+        return text, truncated, original_length
 
     def _linked_memory_ids(
         self, project_id, scope, workspace_id, engram_ok, warnings,

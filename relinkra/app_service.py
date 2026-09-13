@@ -87,6 +87,7 @@ from .memory import (
 from .linkage import LinkageService
 from .registry import Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
+from .salience import build_status
 
 CONTRACT_VERSION = "relinkra.mcp/v1"
 
@@ -113,15 +114,24 @@ def sanitize_wire_text(text: str) -> str:
 
 
 class ServiceError(Exception):
-    """A typed, already-sanitized application error."""
+    """A typed, already-sanitized application error.
 
-    def __init__(self, code: str, message: str):
+    ``details`` carries optional additive machine-readable fields inside
+    the error object (e.g. budget guidance on ``budget_unsatisfiable``);
+    ``code``/``message`` consumers are unaffected.
+    """
+
+    def __init__(self, code: str, message: str, details: Optional[dict] = None):
         super().__init__(message)
         self.code = code
         self.message = sanitize_wire_text(message)
+        self.details = details or None
 
     def to_dict(self) -> dict:
-        return {"error": {"code": self.code, "message": self.message}}
+        error: Dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.details:
+            error.update(self.details)
+        return {"error": error}
 
 
 @dataclass
@@ -703,11 +713,18 @@ class RelinkraServices:
             except BudgetValidationError as exc:
                 raise ServiceError(ERR_INVALID_INPUT, str(exc)) from exc
             if not result.satisfied:
+                # R6C: an unsatisfiable budget returns honest guidance,
+                # never a bare retry loop.
                 raise ServiceError(
                     ERR_INVALID_INPUT,
                     "budget_unsatisfiable: the essential packet exceeds "
                     f"max_estimated_tokens={resolved.max_estimated_tokens}",
-                )
+                    details={
+                        "minimum_useful_tokens": result.minimum_useful_tokens,
+                        "recommended_max_tokens": result.recommended_max_tokens,
+                        "max_estimated_tokens": resolved.max_estimated_tokens,
+                    },
+                ) from None
             packet = result.packet
             if ranked is not None:
                 packet.diagnostics["relevance"] = {
@@ -722,7 +739,12 @@ class RelinkraServices:
                     ERR_INVALID_INPUT,
                     "budget_unsatisfiable: the final packet metadata exceeds "
                     f"max_estimated_tokens={resolved.max_estimated_tokens}",
-                )
+                    details={
+                        "minimum_useful_tokens": result.minimum_useful_tokens,
+                        "recommended_max_tokens": result.recommended_max_tokens,
+                        "max_estimated_tokens": resolved.max_estimated_tokens,
+                    },
+                ) from None
             budget_report = result.to_portable_dict()
             # The report embeds the bounded packet, which this response
             # already returns under "packet". Shipping both would double
@@ -736,6 +758,15 @@ class RelinkraServices:
                 "relevance_version": RELEVANCE_VERSION,
                 "as_of": ranked.as_of,
             }
+
+        if budget_report is None:
+            # R6C: unbudgeted agent-facing packets still carry the
+            # additive status block (guardrail omissions, salience
+            # counts, sufficiency, token accounting). The R4D sidecar
+            # channel marks the agent-facing path; legacy direct-builder
+            # consumers keep their exact wire form.
+            if packet.explainability:
+                packet.packet_status = build_status(packet)
 
         payload: Dict[str, Any] = {
             "packet_version": packet.packet_version,

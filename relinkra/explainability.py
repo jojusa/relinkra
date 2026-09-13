@@ -14,6 +14,7 @@ from .freshness import (
     evaluate_freshness,
     normalize_git_revision,
 )
+from .salience import attach_salience
 
 
 EXPLAINABILITY_VERSION = "explain-v1"
@@ -497,6 +498,9 @@ def annotate_packet(
         for item in getattr(packet, section):
             ref = refs[id(item)]
             item.explain["contradictions"] = sorted(by_ref.get(ref, []))
+    # R6C: deterministic agent-visible salience tier per item (the
+    # ladder re-derives the same tiers for survivors after reduction).
+    attach_salience(packet)
     packet.explainability = {
         "version": EXPLAINABILITY_VERSION,
         "freshness_version": FRESHNESS_VERSION,
@@ -759,6 +763,9 @@ def _minimize_explainability(packet: Any) -> None:
                 },
                 "contradictions": list(explain.get("contradictions") or []),
             }
+            if explain.get("salience") is not None:
+                # R6C: the salience tier survives every compaction level.
+                minimal["salience"] = explain["salience"]
             item.explain = minimal
 
     for key in (
@@ -898,4 +905,9 @@ def explanation_document(packet: Any) -> dict:
         "summary": dict(packet.explainability),
         "items": items,
         "contradictions": list(packet.contradictions),
+        **(
+            {"packet_status": dict(packet.packet_status)}
+            if packet.packet_status
+            else {}
+        ),
     }

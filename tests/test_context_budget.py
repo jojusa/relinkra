@@ -410,9 +410,12 @@ class LadderOrderTests(unittest.TestCase):
                 fact_item("ref_b", snippet="t" * 2000),
             ],
         )
-        # over by slightly more than BOTH truncations save (~1050 tokens):
-        # step 1 must exhaust every snippet before step 2 removes one
-        max_tokens = budget_with_over(packet, over=1100)
+        # over by slightly more than BOTH truncations save (~1050 tokens)
+        # plus the R6C mandated metadata footprint (status skeleton +
+        # truncation declarations, ~430 tokens): step 1 must still
+        # exhaust every snippet before step 2 removes one, and step 2
+        # must suffice with the FIRST payload drop (nothing omitted)
+        max_tokens = budget_with_over(packet, over=700)
         result = apply_budget(
             packet, ContextBudget(max_estimated_tokens=max_tokens)
         )
@@ -561,6 +564,10 @@ class MemoryIntegrityTests(unittest.TestCase):
             result = apply_budget(
                 packet, ContextBudget(max_estimated_tokens=max_tokens)
             )
+            if result.packet is None:
+                # R6C: must-keep protection (pending + current handoff)
+                # can make an extreme budget honestly unsatisfiable.
+                continue
             survivors = (
                 result.packet.memories + result.packet.pending
                 + result.packet.handoffs
@@ -665,9 +672,23 @@ class HardGuaranteeTests(unittest.TestCase):
         budget = ContextBudget(max_estimated_tokens=exact)
         result = self.assert_guarantee(packet, budget)
         self.assertEqual(result.status, "OK")
+        # R6C: the exact content fit leaves no room for the mandated
+        # metadata (status block + salience labels), so OPTIONAL-tier
+        # items may be shed and snippets may be truncated — but nothing
+        # important or must-keep.
         self.assertTrue(
-            all(d.action == "included" for d in result.decisions)
+            all(
+                d.action == "included"
+                or d.reason
+                in (
+                    "optional_section_budget_exhausted",
+                    "snippet_budget_ladder",
+                )
+                for d in result.decisions
+            )
         )
+        self.assertTrue(result.packet.pending)
+        self.assertTrue(result.packet.handoffs)
         one_below = ContextBudget(max_estimated_tokens=exact - 1)
         result2 = self.assert_guarantee(packet, one_below)
         self.assertTrue(
@@ -907,12 +928,22 @@ class BuilderFixtureTests(unittest.TestCase):
         original = copy.deepcopy(packet.diagnostics)
         self.assertIn("counts", original)  # real R1E composition data
         result = apply_budget(packet, resolve_budget(profile="small"))
-        self.assertEqual(result.packet.diagnostics["composition"], original)
-        self.assertEqual(packet.diagnostics, original)
         diag = result.packet.diagnostics["budget"]
-        self.assertEqual(
-            diag["included_source_ids"], packet_source_ids(result.packet)
-        )
+        if diag.get("metadata_compacted"):
+            # R6C: redundant id lists are shed under pressure.
+            self.assertNotIn(
+                "selected_source_ids",
+                result.packet.diagnostics["composition"],
+            )
+            self.assertNotIn("included_source_ids", diag)
+        else:
+            self.assertEqual(
+                result.packet.diagnostics["composition"], original
+            )
+            self.assertEqual(
+                diag["included_source_ids"], packet_source_ids(result.packet)
+            )
+        self.assertEqual(packet.diagnostics, original)
 
 
 class RenderingTests(unittest.TestCase):
@@ -1185,7 +1216,15 @@ class FinalDiagnosticsTests(unittest.TestCase):
             },
         )
         # id lists match the ACTUAL final packet / audit trail exactly
-        self.assertEqual(diag["included_source_ids"], packet_source_ids(final))
+        # (R6C: under metadata compaction the redundant included-source
+        # list is dropped from the shipped diagnostics, so it is only
+        # asserted when compaction did not fire)
+        if not diag.get("metadata_compacted"):
+            self.assertEqual(
+                diag["included_source_ids"], packet_source_ids(final)
+            )
+        else:
+            self.assertNotIn("included_source_ids", diag)
         self.assertEqual(
             diag["omitted_source_ids"],
             [
@@ -1216,11 +1255,32 @@ class FinalDiagnosticsTests(unittest.TestCase):
     def test_composition_diagnostics_preserved_verbatim(self):
         packet = rich_packet()
         original = copy.deepcopy(packet.diagnostics)
-        result = apply_budget(packet, resolve_budget(profile="small"))
+        # Roomy budget: no metadata compaction, R1E composition
+        # diagnostics survive verbatim.
+        result = apply_budget(
+            packet, ContextBudget(max_estimated_tokens=10 ** 9)
+        )
         self.assertEqual(result.packet.diagnostics["composition"], original)
         self.assertEqual(
             set(result.packet.diagnostics), {"composition", "budget"}
         )
+        self.assertEqual(packet.diagnostics, original)  # input untouched
+
+    def test_composition_diagnostics_compacted_under_pressure(self):
+        packet = rich_packet()
+        original = copy.deepcopy(packet.diagnostics)
+        result = apply_budget(packet, resolve_budget(profile="small"))
+        diag = result.packet.diagnostics
+        if diag["budget"].get("metadata_compacted"):
+            # R6C: redundant id lists are shed under pressure; everything
+            # else in the composition channel stays verbatim.
+            self.assertNotIn("selected_source_ids", diag["composition"])
+            self.assertNotIn("included_source_ids", diag["budget"])
+            expected = copy.deepcopy(original)
+            expected.pop("selected_source_ids", None)
+            self.assertEqual(diag["composition"], expected)
+        else:
+            self.assertEqual(diag["composition"], original)
         self.assertEqual(packet.diagnostics, original)  # input untouched
 
     def test_untrimmed_packet_stats(self):
@@ -1370,7 +1430,10 @@ class AuditCollisionTests(unittest.TestCase):
                 memory_item("", "discovery", "z" * 900),
             ]
         )
-        max_tokens = budget_with_over(packet, over=500)
+        # R6C: the mandated metadata footprint participates in the
+        # budget, so the offset accounts for it; two of the three items
+        # are shed, each with its own decision.
+        max_tokens = budget_with_over(packet, over=300)
         result = apply_budget(
             packet, ContextBudget(max_estimated_tokens=max_tokens)
         )
