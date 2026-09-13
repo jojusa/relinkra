@@ -400,6 +400,27 @@ def _recommended_next(
     return hints
 
 
+def _truncation_recovery_hint(packet: ContextPacket) -> Optional[str]:
+    """Continuation hint for a truncation-only budget reduction.
+
+    A budget-driven snippet truncation or reference-only reduction means
+    the shipped code fact lost its payload; the exact recovery path is
+    resolving the fact's own file. Emits nothing when no qualifying code
+    fact ships (no invented ids, no memory/handoff guesses).
+    """
+    for item in packet.code_facts:
+        data = item.data if isinstance(item.data, dict) else {}
+        if is_structural_code_fact(item):
+            continue
+        file_path = data.get("file_path")
+        if isinstance(file_path, str) and file_path:
+            return "code_resolve(project_id='%s', file='%s')" % (
+                packet.project_id,
+                file_path,
+            )
+    return None
+
+
 def _omission_sections(
     *, budget_omitted: List[str], guardrail: Dict[str, int]
 ) -> List[str]:
@@ -480,6 +501,15 @@ def build_status(
 
     if omitted_sections:
         status["recommended_next"] = _recommended_next(packet, omitted_sections)
+    elif budget_truncated:
+        # R6C-FIX: a truncation-only budget run omits nothing but still
+        # loses (or compresses) a code-fact snippet. The honest recovery
+        # path is the code fact's own continuation: code_resolve on the
+        # fact's file (a real MCP tool; the fact keeps its file_path and
+        # code_reference_id). Never filler, never invented ids.
+        hint = _truncation_recovery_hint(packet)
+        if hint:
+            status["recommended_next"] = [hint]
 
     status["context_sufficiency"] = _sufficiency(
         packet, has_omissions=has_omissions

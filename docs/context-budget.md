@@ -111,9 +111,12 @@ mutation, stopping as soon as it fits:
    `reason=optional_section_budget_exhausted`.
 4. **Omit optional code facts** — code_facts beyond the FIRST one (the
    direct focus), from the end. `reason=optional_section_budget_exhausted`.
-5. **Omit important items** — important memories, then pending, then
-   handoffs, then code_references beyond the first; from the end of each
-   list. `reason=important_section_budget_exhausted`.
+5. **Omit important items** — important memories, then non-current
+   handoffs, then git facts, then code_references beyond the first; from
+   the end of each list. R6C protects `pending` items and the current
+   (most recent active) handoff from omission, and the metadata
+   compaction step (see "Salience tiers and metadata compaction" below)
+   runs before this step. `reason=important_section_budget_exhausted`.
 6. Still over ⇒ `status=BUDGET_UNSATISFIABLE`, `packet=None`,
    `satisfied=false`, decisions retained. Never silently exceeded.
 

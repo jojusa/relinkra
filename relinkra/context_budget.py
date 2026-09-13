@@ -1064,6 +1064,20 @@ def _omitted_items(
     return omitted
 
 
+def _budget_truncated(
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]],
+) -> bool:
+    """True when any ladder action reduced content without omitting it:
+    snippet truncation or reference-only reduction. R6C-FIX: a
+    truncation-only reduction is budget-driven loss and must be reported
+    by the packet status block (uses the existing action constants, no
+    duplicated semantics)."""
+    return any(
+        action[0] in (ACTION_TRUNCATED, ACTION_REFERENCE_ONLY)
+        for action in actions.values()
+    )
+
+
 def _settle_packet_status(
     packet: ContextPacket,
     working: ContextPacket,
@@ -1078,10 +1092,12 @@ def _settle_packet_status(
     rebuilds until the block stops changing (bounded rounds; digit-width
     convergence exactly like the diagnostics totals)."""
     omitted_pairs = _omitted_items(packet, actions)
+    budget_truncated = _budget_truncated(actions)
     working.packet_status = build_status(
         working,
         original_packet=packet,
         budget_omitted_items=omitted_pairs,
+        budget_truncated=budget_truncated,
         chars_per_token=cpt,
     )
     for _ in range(3):
@@ -1090,6 +1106,7 @@ def _settle_packet_status(
             working,
             original_packet=packet,
             budget_omitted_items=omitted_pairs,
+            budget_truncated=budget_truncated,
             chars_per_token=cpt,
         )
         if rebuilt == working.packet_status:

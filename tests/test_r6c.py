@@ -23,6 +23,7 @@ from relinkra.context_budget import (
 )
 from relinkra.context_builder import ContextBuilder, ContextRequest
 from relinkra.explainability import attach_relevance
+from relinkra.mcp_server import TOOLS_BY_NAME
 from relinkra.relevance import score_packet
 from relinkra.salience import (
     HIGH_SALIENCE,
@@ -479,6 +480,54 @@ class PacketCompletenessTests(unittest.TestCase):
         rendered = json.dumps(status)
         self.assertNotIn(VERBOSE.strip()[:40], rendered)
 
+    def test_truncation_only_ladder_run_reports_incomplete(self):
+        """R6C-FIX (ladder level): a budget run whose ONLY reduction is
+        snippet truncation/reference-only must report an incomplete,
+        budget-exhausted packet even with zero omissions."""
+        from test_context_budget import fact_item, make_packet
+
+        packet = make_packet(
+            facts=[fact_item("ref_focus", snippet="s" * 4000)],
+        )
+        working_size = estimate_tokens(packet.to_json(), 3.0)
+        result = apply_budget(
+            packet, ContextBudget(max_estimated_tokens=working_size - 300)
+        )
+        self.assertEqual(result.status, "OK")
+        budget_diag = result.packet.diagnostics["budget"]
+        self.assertTrue(budget_diag["truncated_source_ids"])
+        self.assertEqual(budget_diag["omitted_source_ids"], [])
+        status = result.packet.packet_status
+        self.assertFalse(status["packet_complete"])
+        self.assertTrue(status["budget_exhausted"])
+        self.assertEqual(status["omitted_sections"], [])
+        self.assertNotEqual(
+            status["context_sufficiency"]["orientation"], "sufficient"
+        )
+        # the continuation hint names the fact's file via a real tool
+        hints = status["recommended_next"]
+        self.assertEqual(len(hints), 1)
+        self.assertTrue(hints[0].startswith("code_resolve("))
+        self.assertIn("file='src/mod.py'", hints[0])
+
+    def test_no_truncation_no_omission_reports_complete(self):
+        from test_context_budget import fact_item, make_packet
+
+        packet = make_packet(
+            facts=[fact_item("ref_focus", snippet="s" * 300)],
+        )
+        result = apply_budget(
+            packet, ContextBudget(max_estimated_tokens=10 ** 9)
+        )
+        status = result.packet.packet_status
+        self.assertTrue(status["packet_complete"])
+        self.assertFalse(status["budget_exhausted"])
+        self.assertEqual(status["omitted_sections"], [])
+        self.assertEqual(
+            status["context_sufficiency"]["orientation"], "sufficient"
+        )
+        self.assertNotIn("recommended_next", status)
+
     def test_markdown_renders_the_status_block(self):
         packet, ranked = build_ranked_packet(self.env)
         result = apply_budget(packet, resolve_budget(max_tokens=3000),
@@ -707,6 +756,60 @@ class ServiceSurfaceTests(unittest.TestCase):
         self.assertIn("minimum_useful_tokens", details)
         self.assertIn("recommended_max_tokens", details)
         self.assertGreater(details["minimum_useful_tokens"], 2500)
+
+    def test_truncation_only_budget_run_reports_incomplete(self):
+        """R6C-FIX regression (service surface): when the ladder ONLY
+        truncates/removes a snippet and omits no item, the packet status
+        must still report the loss — never packet_complete=true with a
+        truncated fact inside."""
+        env = DogfoodEnv()
+        self.addCleanup(env.cleanup)
+        env.save(memory_type="handoff", title="Lean handoff",
+                 body="Handoff: continue salience work.")
+        env.save(memory_type="decision", title="Deterministic ladder",
+                 body="decision: fixed ladder only")
+        import os
+
+        src = os.path.join(env.ws_dir, "src")
+        os.makedirs(src, exist_ok=True)
+        with open(os.path.join(src, "budget.py"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(
+                f"line_{i:02d} " + "x" * 60 for i in range(40)
+            ))
+        config = ServiceConfig(
+            default_project_id=env.project_id,
+            default_workspace_id=env.workspace_id,
+            workspace_root=env.ws_dir,
+            registry_path=env.registry_path,
+        )
+        services = RelinkraServices(
+            config=config, store=env.store, cbm_adapter=env.cbm,
+            registry=env.registry, clock=fixed_clock,
+        )
+        # deterministic cap inside the measured truncation-only window
+        # (satisfiable, snippet reduced, ZERO complete-item omissions)
+        payload = services.context_get(
+            task=TASK, symbol="src.budget.applyBudget",
+            include_git=False, max_tokens=3200,
+        )
+        packet = payload["packet"]
+        budget_diag = packet["diagnostics"]["budget"]
+        self.assertTrue(budget_diag["truncated_source_ids"])
+        self.assertEqual(budget_diag["omitted_source_ids"], [])
+        status = packet["packet_status"]
+        self.assertFalse(status["packet_complete"])
+        self.assertTrue(status["budget_exhausted"])
+        sufficiency = status["context_sufficiency"]
+        self.assertNotEqual(sufficiency["orientation"], "sufficient")
+        # the recovery hint is the code fact's own truthful continuation
+        # path, naming a tool that actually exists on the MCP surface
+        hints = status["recommended_next"]
+        self.assertEqual(len(hints), 1)
+        self.assertTrue(hints[0].startswith("code_resolve("))
+        self.assertIn("file='src/budget.py'", hints[0])
+        self.assertIn("code_resolve", TOOLS_BY_NAME)
+        file_path = packet["code_facts"][0]["data"]["file_path"]
+        self.assertIn(f"file='{file_path}'", hints[0])
 
 
 class R6BRegressionTests(unittest.TestCase):
