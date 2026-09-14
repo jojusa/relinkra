@@ -6,7 +6,7 @@ evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.3 release-preparation candidate; not yet published.** Windows
+> **Status: 0.1.4 release-preparation candidate; not yet published.** Windows
 > is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
@@ -47,7 +47,7 @@ source commit:
 `8afd3245347dea9cda93176384421d33fdfd69b3`
 
 The 0.1.2 artifact record is historical and is not the package-build source
-for this 0.1.3 candidate. Do not rebuild or republish 0.1.2. For the 0.1.3
+for the current candidate. Do not rebuild or republish 0.1.2. For the
 release-preparation candidate, after release authorization, maintainers build
 and inspect artifacts, then retain the exact release-HEAD report and its
 digests as external evidence:
@@ -409,15 +409,18 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- Version 0.1.3, single-sourced in `relinkra/__init__.py`
+- The source version is still `0.1.3` until the release bump; the candidate
+  under preparation is **0.1.4**. The version is single-sourced in
+  `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by
-  `tests/test_packaging.py`.
+  `tests/test_packaging.py`. Versioned artifact-path examples below use the
+  current source version and follow the bump at release time.
 - Pre-1.0 semver: **minor** bumps may add features or break compat;
   **patch** bumps are fixes only.
 - The bump happens **only** in a dedicated release commit by the
   maintainer — never mixed into feature work.
-- RC naming is `0.1.3rcN`, only if and when tagging is approved. R5B
+- RC naming is `<version>rcN`, only if and when tagging is approved. R5B
   does not tag.
 
 ## Legal and NOTICE readiness

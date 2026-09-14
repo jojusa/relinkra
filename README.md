@@ -3,72 +3,112 @@
 **Potente por dentro. Simple por fuera.**
 
 Relinkra is an orchestration and context layer for AI coding agents. It
-optimizes the path to project information while leaving the agent in control
-of search, reasoning, editing, and validation.
+gives every connected agent one shared project route — stable project
+identity, persistent memory, cross-agent handoffs, read-only Git facts, an
+optional code graph, and bounded context packets — through a single MCP
+server, while the agent stays in control of search, reasoning, editing,
+and validation.
 
-> Relinkra optimiza el camino hacia la información; no restringe la capacidad del agente de buscar, razonar, editar o validar por sí mismo.
+> Relinkra optimiza el camino hacia la información; no restringe la
+> capacidad del agente de buscar, razonar, editar o validar por sí mismo.
 
-## Start here
+## Why Relinkra
 
-This checkout is the 0.1.3 release-preparation candidate. It is not yet
-published; the last public PyPI package is 0.1.2. Use the normal install path
-for the published package, or the maintainer source checkout when exercising
-this candidate.
+Every agent session starts by rediscovering the same project facts. With
+several agents — or several sessions of one agent — that rediscovery
+repeats and the agents drift apart.
 
-### 1. Install
+- **Reduces rediscovery.** Project identity, prior decisions, active
+  handoffs, and code-graph facts are resolved once and served to every
+  connected agent.
+- **Improves continuity.** Deterministic memory and cross-agent handoffs
+  let a fresh session — or a different agent — pick up where the last one
+  stopped.
+- **Improves useful information per token.** Context packets are
+  salience-ranked and budgeted; token optimization removes redundancy,
+  never evidence.
 
-Requirements: Python 3.9 or newer and Git.
+Three principles run through everything:
+
+- **Relinkra-first.** The shared route is the normal path to project
+  context.
+- **Source-authoritative.** Current source always wins; Relinkra evidence
+  is advisory.
+- **Expand-on-demand.** Start with the short answer; every read exposes
+  where to dig deeper.
+
+Relinkra never disables native file access, search, or source inspection,
+and never requires Relinkra-only reasoning. There is no universal or
+quantitative token-saving guarantee; local or simple tasks can carry
+overhead (see [Performance and scope](#performance-and-scope)).
+
+## Release status
+
+Relinkra **0.1.4** is the release-preparation candidate documented here.
+It is not yet published; **0.1.2** remains the last public PyPI package.
+Maintainers and testers can exercise this candidate from a source checkout
+(see [Contributing](CONTRIBUTING.md)).
+
+Requirements: Python 3.9 or newer and Git. Zero runtime dependencies.
+Released under the [MIT License](LICENSE). The project is hosted at
+[github.com/jojusa/relinkra](https://github.com/jojusa/relinkra).
+
+## Level A — Quick start
+
+Six commands take a project from zero to connected and verified:
 
 ```bash
 pip install relinkra
+
+cd my-project
+relinkra init          # register this workspace (idempotent)
+relinkra cbm setup     # optional: install the code-graph backend
+relinkra cbm index     # build the code graph
+relinkra connect all   # connect every supported agent host
+relinkra doctor        # confirm everything is healthy
 ```
 
-Relinkra has zero runtime dependencies and is released under the [MIT
-License](LICENSE). The project is hosted at
-[github.com/jojusa/relinkra](https://github.com/jojusa/relinkra).
+What each step gives you:
 
-### 2. Add Relinkra to a project
+1. **`relinkra init`** detects the repository, resolves a stable logical
+   project identity (`rlk_...` / `ws_...`), and writes local state under
+   `.relinkra/`. It is per workspace and safe to run again.
+2. **`relinkra cbm setup` and `relinkra cbm index`** install the optional
+   Codebase Memory (CBM) backend and build the structural code graph your
+   agents query for architecture orientation and caller/dependency
+   relationships. Skip them if you do not want the code graph — memory,
+   handoffs, and context packets still work.
+3. **`relinkra connect all`** walks every supported host (`codex`,
+   `opencode`, `claude`, `devin-desktop`, `zcode`) through its own
+   inspect → plan → confirm → apply pipeline, with per-host backup and
+   rollback. Already-valid hosts are safe no-ops; every write asks first.
+4. **Restart each configured host**, then **`relinkra doctor`** answers:
+   is Relinkra healthy, which agents are configured, which were actually
+   observed running, what is still pending, and what to do next.
 
-Run this inside an existing Git repository with at least one commit:
-
-```bash
-relinkra version
-relinkra init
-relinkra status
-```
-
-`init` is per repository/workspace and idempotent. It writes
-`.relinkra/config.json` and `.relinkra/registry.json`, then reuses that local
-identity on later commands.
-
-### Level A — Quick Start: connect one agent (0.1.3 release-preparation candidate)
-
-Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
-`devin-desktop`:
+Connecting one agent instead of all of them:
 
 ```bash
-relinkra doctor
 relinkra connect codex
 ```
 
-The normal front door performs inspection and planning, asks for confirmation
-before a write, and then uses the existing backup, validation, rollback, and
-restart guidance. If the registration is already valid for the workspace it
-is a verified no-op. Configuration presence is never proof that the host
-launched Relinkra.
+The normal front door inspects and plans first, asks for confirmation
+before a write, and then uses the existing backup, validation, rollback,
+and restart guidance. If the registration is already valid for the
+workspace it is a verified no-op. Configuration presence is never proof
+that the host launched Relinkra.
 
-Supported front-door targets are `codex`, `opencode`, `claude`,
-`devin-desktop`, and `zcode`. To connect every supported host in one
-command, use `relinkra connect all` (see [Multiagent onboarding and
-routing](#multiagent-onboarding-and-routing-r6e) below). This front door
-is part of the 0.1.3 release-preparation candidate and is not yet
-published. The last public 0.1.2 package does not expose it; use a source
-checkout to exercise this candidate.
+After connecting, just use your agent. It can call the Relinkra MCP tools
+(`project_resolve`, `context_get`, `memory_save`, `memory_search`,
+`memory_get`, `handoff_create`, `handoff_get`, `code_resolve`,
+`code_architecture`, `code_relationships`, `git_context`, `health`) to
+share memory, hand work across agents, and fetch bounded, budgeted project
+context. See [Memory, handoffs, and context surfaces](#memory-handoffs-and-context-surfaces).
 
-### Level B — Safe Advanced Connector Workflow (last-published 0.1.2)
+## Level B — Advanced and safe control
 
-Use these last-published 0.1.2 advanced commands when you need to inspect or
-control one stage:
+When you need to inspect or control one stage, the same pipeline is
+available step by step:
 
 ```bash
 relinkra connect list
@@ -80,25 +120,11 @@ relinkra connect rollback <agent>
 relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`inspect`, `check`, and `plan` are read-only. `apply` writes only after the
-existing safety gates; restart the host, then run `check` and `verify`.
-
-### 4. Build the optional code graph
-
-Codebase Memory (CBM) is optional. Relinkra owns the normal route; agents do
-not add CBM directly to their configuration.
-
-```bash
-relinkra cbm setup
-relinkra cbm status
-relinkra cbm index
-```
-
-Use `relinkra cbm refresh` after the index becomes stale. `setup` also accepts
-`--from-file PATH` and `--json`; `index` and `refresh` accept `--path`,
-`--json`, and `--mode fast`.
-
-### 5. Verify
+`inspect`, `check`, and `plan` are read-only. `apply` writes only after
+the existing safety gates; restart the host, then run `check` and
+`verify`. `relinkra connect rollback <agent>` restores a supported backup.
+The `relinkra connect generic` route is available for generic
+configuration work; `devin-cloud` is unsupported.
 
 Configuration verification and host-side proof are separate:
 
@@ -107,8 +133,8 @@ relinkra connect check <agent>
 relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`check` verifies the configuration. After the host is restarted or reloaded,
-`verify` records proof that the real host launched Relinkra.
+`check` verifies the configuration. After the host is restarted or
+reloaded, `verify` records proof that the real host launched Relinkra.
 
 ## What Relinkra provides
 
@@ -127,10 +153,9 @@ CBM or Engram for every task, or register CBM directly with an agent.
 
 ## Agent hosts
 
-The following connector IDs have configuration support in the 0.1.3
-release-preparation candidate. Every one is **experimental**: configuration
-and format support are distinct from proof that the real host launches Relinkra
-end to end.
+The following connector IDs have configuration support. Every one is
+**experimental**: configuration and format support are distinct from proof
+that the real host launches Relinkra end to end.
 
 | Connector | Configuration target | Reload after `connect apply` |
 |---|---|---|
@@ -148,11 +173,7 @@ relinkra connect check <agent>
 relinkra connect verify <agent> --proof <proof-file>
 ```
 
-`relinkra connect rollback <agent>` restores a supported backup. The
-`relinkra connect generic` route is available for generic configuration work.
-`devin-cloud` is unsupported.
-
-## Multiagent onboarding and routing (R6E)
+## Multiagent onboarding and routing
 
 ### Connect all
 
@@ -212,7 +233,10 @@ read, the relation is `unknown`, never `stale`.
 Evidence storage is one bounded file per host
 (`.relinkra/runtime-evidence/<host>.json`), so concurrent hosts cannot
 lose each other's evidence, and the pre-R6E single-file store remains
-readable. No migration is required.
+readable. No migration is required. Concurrent processes of the same
+host serialize their writes with a bounded per-host lock; a writer that
+cannot take the lock in time skips its record (conservative
+under-reporting) rather than blocking MCP serving.
 
 ### ZCode generated state
 
@@ -237,6 +261,84 @@ status — warns. Relinkra never deletes the lock file and never edits
   remains fully available for Gentleman/SDD state, explicitly
   Engram-only workflows, and information Relinkra does not expose.
 
+## Memory, handoffs, and context surfaces
+
+These are the agent-facing surfaces served by the Relinkra MCP server.
+Full contracts live in [the MCP surface](docs/mcp-surface.md), [memory
+policy](docs/memory-policy.md), [handoff lifecycle](docs/handoff-lifecycle.md),
+and [context budget](docs/context-budget.md).
+
+**Deterministic memory.** `memory_search` returns results in a stable,
+deterministic order (oldest first, `memory_id` tiebreak) — the same
+query always returns the same results. `memory_get(memory_id)` fetches
+exactly one record by id: a deterministic exact lookup with no fuzzy
+fallback (`found=false` when absent). Same id, same record, every time.
+
+**Handoffs and memory mirrors.** A handoff is mirrored into memory, and
+duplicate handoffs on the same topic are deduplicated (superseding the
+older record). Because the mirrors would bury real memories,
+`memory_search` excludes handoff mirror records by default. To retrieve
+handoffs:
+
+- `handoff_get` — authoritative for handoff workflow state;
+- `memory_get(memory_id)` — expand any handoff mirror id you already have;
+- `memory_search(..., include_handoffs=true)` — opt back into mirrors;
+- `memory_search(..., memory_type="handoff")` — mirrors auto-included.
+
+**Code relationships include tests on demand.** `code_relationships`
+excludes test code by default; pass `include_tests=true` when callers
+living in test files matter.
+
+**Bounded, honest context packets.** `context_get` composes the packet,
+then ranks every item into salience tiers and applies a deterministic
+reduction ladder under a token budget:
+
+- `must_keep` items (identity, warnings, the current handoff, pending
+  work) are never omitted; `optional` items (payload-heavy, redundant, or
+  reconstructable metadata) are sacrificed first.
+- Nothing disappears silently. The packet's `packet_status` block tells
+  the agent the truth: `packet_complete` (or not), `budget_exhausted`,
+  `omitted_sections`, `recommended_next` (deterministic recovery hints
+  naming real MCP tools), and a conservative `context_sufficiency` that
+  flags when code claims still require source verification.
+- Snippet truncation is explicit (`snippet_truncated`, original and
+  returned lengths, a continuation reference) and recorded in
+  `truncated_source_ids`.
+- Token accounting uses the `cpt1` estimation method and is reported
+  with the packet, so an agent can see how its budget was spent.
+- When a budget cannot hold the must-keep skeleton, the error carries
+  budget guidance (`minimum_useful_tokens`, `recommended_max_tokens`) —
+  never a bare retry.
+
+## Doctor: what healthy means
+
+`relinkra doctor` is compact by default and reads like a status board:
+core groups (Git, project identity, registered revision, CBM, Engram),
+an agent table (config state vs runtime observation — never merged into
+one column), and one suggested next action. It answers, without flags:
+
+- Is Relinkra healthy? (`PASS` / `WARN` / `FAIL` / `PENDING` counts)
+- Which agents are configured? (per-host config column)
+- Which agents were actually observed? (per-host runtime column, from
+  persisted evidence the MCP server records while serving)
+- What is pending? (`PENDING` — not yet proven, not wrong)
+- What is actually wrong? (`WARN` / `FAIL` with reasons)
+- What should I do next? (one concrete next action)
+
+`PENDING` and `WARN` are different judgments: `PENDING` means "no proof
+yet", `WARN` means "a real condition worth attention". A missing optional
+backend is `WARN`, never `FAIL`; `FAIL` is reserved for "this cannot
+work" (no git, no repository, a corrupt registry). Use
+`relinkra doctor --verbose` for the full per-check diagnostics; the
+compact view is a projection of the same payload, never a second
+opinion.
+
+Doctor's runtime-evidence column is fed automatically: the MCP server
+records self-observed evidence (server start, client handshake, tool
+activity) to `.relinkra/runtime-evidence/<host>.json` while serving —
+no manual proof file required. Self-observed evidence remains distinct
+from the stronger external `connect verify` proof.
+
 ## Revision and generated-state hygiene
 
 Relinkra keeps the registered workspace snapshot separate from live Git. In
@@ -250,7 +352,7 @@ state is explicitly unknown/degraded.
 `.zcode/config.json.lock` is ZCode-owned generated state: Relinkra detects and
 reports it but never deletes it. Relinkra does not silently edit `.gitignore`;
 review Git ownership/ignore policy explicitly before committing workspace
-state (see [ZCode generated state](#zcode-generated-state) for the R6E
+state (see [ZCode generated state](#zcode-generated-state) for the
 healthy/unhygienic classification). `.relinkra/`, `.codebase-memory/`, and
 `*.relinkra-backup*` remain local state; runtime evidence lives under
 `.relinkra/runtime-evidence/` and never dirties a linked worktree's Git
@@ -288,8 +390,12 @@ relinkra cbm refresh
 ```
 
 `status` distinguishes missing, ready, stale, unavailable, unsupported, and
-unknown states. CBM remains behind Relinkra; agents should not install or
-register it directly.
+unknown states, reporting index freshness as drift against the registered
+revision (`STALE_COMMITTED`, `STALE_WORKTREE`, `STALE_BOTH`) with a next
+action. A successful `cbm index` or `refresh` reports only reliable fields:
+`nodes`, `edges`, the workspace `revision`, freshness drift flags, and
+measured `elapsed_seconds`. CBM remains behind Relinkra; agents should not
+install or register it directly. There is no CBM web UI.
 
 See [CBM backend](docs/cbm-backend.md) for certified acquisition, cache
 behavior, and limitations.
@@ -310,17 +416,11 @@ universal token-saving guarantee. Local or simple tasks can incur overhead
 from initialization, health checks, or optional backend inspection. The next
 validation step is Kisouma dogfood.
 
-## Relinkra 0.1.3 release-preparation candidate
-
-The 0.1.3 changes described here are in the release-preparation candidate and
-are not a claim that 0.1.3 has been published. The CBM lifecycle is `relinkra cbm setup`,
-`relinkra cbm index`, `relinkra cbm status`, and `relinkra cbm refresh`; stale
-registration guidance uses the real route `relinkra cbm index`.
-
 ## Platform and release truth
 
-- Version **0.1.3** is the release-preparation candidate; 0.1.2 remains the
-  last public PyPI release until publication.
+- Version **0.1.4** is the release-preparation candidate; it is not yet
+  published and **0.1.2** remains the last public PyPI release until
+  publication.
 - Windows is certified for the product. Linux and macOS have CI coverage, but
   exact-SHA/product certification language remains limited to the evidence
   available for each platform.
@@ -334,6 +434,11 @@ registration guidance uses the real route `relinkra cbm index`.
 - [Product CLI](docs/cli.md) — command behavior and exit codes.
 - [Connectors](docs/connectors.md) — host configuration details.
 - [CBM backend](docs/cbm-backend.md) — optional code-graph lifecycle.
+- [MCP surface](docs/mcp-surface.md) — the agent-facing tool contract.
+- [Context budget](docs/context-budget.md) — salience, truncation truth,
+  and budget guidance.
+- [Memory policy](docs/memory-policy.md) — what is remembered and how.
+- [Handoff lifecycle](docs/handoff-lifecycle.md) — cross-agent handoffs.
 - [Freshness and explainability](docs/freshness-explainability.md) — how
   Relinkra qualifies context and conflicts.
 - [Release verification](docs/release.md) — maintainer evidence and

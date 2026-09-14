@@ -1,8 +1,9 @@
 # Install Relinkra
 
-Relinkra's 0.1.3 release-preparation candidate gives coding agents an
-orchestration and context layer without replacing their native tools. It is not
-yet published; 0.1.2 remains the last public package until publication.
+Relinkra gives coding agents an orchestration and context layer without
+replacing their native tools. The current release-preparation candidate is
+**0.1.4**; it is not yet published, and **0.1.2** remains the last public
+package until publication.
 
 ## Quick path
 
@@ -12,20 +13,22 @@ Requirements: Python 3.9 or newer and Git.
 pip install relinkra
 ```
 
-From inside an existing Git repository with at least one commit:
+From inside an existing Git repository with at least one commit, the normal
+journey is:
 
 ```bash
 relinkra version
 relinkra init
+relinkra cbm setup
+relinkra cbm index
+relinkra connect all
 relinkra doctor
-relinkra connect list
-relinkra connect check <agent>
-relinkra connect plan <agent>
-relinkra connect apply <agent>
 ```
 
-Replace `<agent>` with `codex`, `opencode`, `zcode`, `claude`, or
-`devin-desktop`. Restart or reload the host after `apply`, then use
+`cbm setup` and `cbm index` are optional (they build the code graph);
+everything else works without them. To connect one agent instead of all of
+them, replace `relinkra connect all` with a single front door such as
+`relinkra connect codex`. Restart or reload each configured host, then use
 configuration verification and host-side proof as separate steps:
 
 ```bash

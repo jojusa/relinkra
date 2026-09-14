@@ -4,10 +4,11 @@ Relinkra runs as an MCP server. A *connector* is what gets a host — Claude
 Code, OpenCode, Codex, Devin Desktop (formerly Windsurf), or anything else that speaks MCP — to launch
 that server for this workspace.
 
-### Level A — 0.1.3 release-preparation front door (not yet published)
+### Level A — Normal-user front door
 
-The host-name forms below are candidate behavior for 0.1.3. They are not part
-of the last-published 0.1.2 CLI and do not claim that 0.1.3 has been published.
+The host-name forms below connect one agent through the safe front door.
+To connect every supported host in one command, use `relinkra connect all`
+(see [Connect all](#connect-all)).
 
 ```
 relinkra connect codex
@@ -17,9 +18,9 @@ relinkra connect devin-desktop
 relinkra connect zcode
 ```
 
-### Level B — Last-published 0.1.2 advanced commands
+### Level B — Advanced commands
 
-The last-published public release uses these exact advanced commands:
+Use these advanced commands when you need to inspect or control one stage:
 
 ```
 relinkra connect list
@@ -35,10 +36,9 @@ relinkra connect generic
 
 Powerful inside, simple outside. Everything below is the "inside".
 
-The release-preparation front door inspects and plans first, no-ops when the
+The front door inspects and plans first, no-ops when the
 registration already matches, asks before writing, and then reuses the
-existing backup, validation, rollback, restart, and verification flow. There
-is no `connect all`; use one host at a time.
+existing backup, validation, rollback, restart, and verification flow.
 
 > **Status.** Claude Code (R4C.1B), OpenCode (R4C.1C), Codex (R4C.1D), Devin
 > Desktop (R4C.1E), and ZCode (R5K.1) have gated write paths (`connect apply`
@@ -46,6 +46,43 @@ is no `connect all`; use one host at a time.
 > the last-published 0.1.2 CLI currently reports `real_host_launch_proven=false` for
 > Devin Desktop and overall. Actual host proof is separate and must be recorded
 > through the published verify flow. See [Capability honesty](#capability-honesty).
+
+---
+
+## Connect all
+
+`relinkra connect all` is a driver over the per-agent safety, never a weaker
+batch path: every default target (`codex`, `opencode`, `claude`,
+`devin-desktop`, `zcode`) runs through its OWN inspect/check/plan/preflight/
+confirmation/apply pipeline.
+
+- already-valid hosts are safe no-ops;
+- every write asks per host (`apply?`); declining one host writes nothing
+  for it and does not affect the others;
+- a refused or malformed host fails closed and is reported, without marking
+  the others successful;
+- each apply owns its own backup and rollback; there is no cross-host rollback;
+- non-interactive runs (nobody to answer the confirmation) decline every
+  write; there is deliberately no consent flag that bypasses the per-host
+  confirmation.
+
+The summary table reports each host's config state, workspace match, runtime
+evidence, and outcome. Repeating `connect all` is idempotent.
+
+### Compact check
+
+`relinkra connect check <agent>` is concise and host-local by default
+(config, workspace match, generated state, runtime evidence, one next
+action). `--verbose` shows the full report (findings, persisted verification
+evidence, per-host sections); the JSON payload always carries the full
+detail. Both views render from one payload — compact is a projection, never
+a second opinion.
+
+### Inspect workspace match
+
+`relinkra connect inspect <agent>` exposes `workspace_matches` directly
+(`true`, `false`, or unknown), so inspect alone answers whether a
+registration points at the current workspace.
 
 ---
 

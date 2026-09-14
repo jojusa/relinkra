@@ -108,12 +108,12 @@ wire name repeats the server namespace.
 |-----------|--------------|---------|
 | `project_resolve` | `relinkra.project.resolve` | Resolve logical project identity + active workspace |
 | `context_get` | `relinkra.context.get` | One deterministic Project Context Packet |
-| `memory_search` | `relinkra.memory.search` | Search shared project memory (deterministic order; handoff mirrors excluded by default) |
-| `memory_get` | `relinkra.memory.get` | Fetch exactly one memory by id (deterministic exact lookup) |
+| `memory_search` | `relinkra.memory.search` | Search shared project memory (deterministic order; handoff mirrors excluded by default — pass `include_handoffs` or `memory_type="handoff"` to include them) |
+| `memory_get` | `relinkra.memory.get` | Fetch exactly one memory by id (deterministic exact lookup, no fuzzy fallback; handoff mirror records are retrievable here) |
 | `memory_save` | `relinkra.memory.save` | Save a memory under R1C policy |
 | `code_resolve` | `relinkra.code.resolve` | Resolve file/symbol → portable code reference |
 | `code_architecture` | `relinkra.code.architecture` | Return compact advisory architecture orientation |
-| `code_relationships` | `relinkra.code.relationships` | Return bounded advisory caller/dependency relationships |
+| `code_relationships` | `relinkra.code.relationships` | Return bounded advisory caller/dependency relationships (test code excluded unless `include_tests`) |
 | `git_context` | `relinkra.git.context` | Read-only git facts |
 | `handoff_create` | `relinkra.handoff.create` | Record a cross-agent handoff |
 | `handoff_get` | `relinkra.handoff.get` | Fetch one handoff, or list recent ones |

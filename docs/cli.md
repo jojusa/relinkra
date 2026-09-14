@@ -30,7 +30,7 @@ Entry point: the installed `relinkra` console script — see
 [Installation](installation.md). From a source checkout,
 `python -m relinkra.product_cli` is equivalent.
 
-The public product CLI does not expose a `relinkra register` command. For CBM workspace registration, use `relinkra cbm index`; this is the supported route in the 0.1.3 release-preparation candidate.
+The public product CLI does not expose a `relinkra register` command. For CBM workspace registration, use `relinkra cbm index`; this is the supported route in the current release-preparation candidate.
 
 For evidence-level questions such as “why was this selected?” or “is it
 current?”, use `python -m relinkra.context_cli --explain`. It has compact
@@ -124,8 +124,26 @@ show `WARN`, capabilities show `UNAVAILABLE`, and the command succeeds.
 
 ## `relinkra doctor`
 
-Deep diagnostics as `PASS` / `WARN` / `FAIL`, each with a suggested
-action when it is not passing:
+Deep diagnostics as `PASS` / `WARN` / `FAIL` / `PENDING`, each with a
+suggested action when it is not passing. Doctor is compact by default and
+answers a fresh user's questions without flags: is Relinkra healthy, which
+agents are configured, which were actually observed, what is pending, what
+is wrong, and what to do next. It prints core groups (Git, project
+identity, registered revision, CBM, Engram), one agent row per
+apply-capable host, and a single suggested next action. Related checks are
+folded into one row showing the worst status in the group, so a compact row
+can always be expanded by re-running with `--verbose`.
+
+`PENDING` and `WARN` are different judgments, and both are distinct from
+`FAIL`:
+
+- `PENDING` — not yet proven. Nothing is wrong; the evidence has not been
+  recorded yet. Typical for a configured host that has not been restarted.
+- `WARN` — a real condition worth attention, with a reason and a suggested
+  action. A missing optional engine is `WARN`, not `FAIL` — Relinkra is
+  built to degrade.
+- `FAIL` is reserved for "this cannot work": no git, no repository, a
+  corrupt registry. Only `FAIL` moves the exit code.
 
 ```
 WARN CBM
@@ -134,9 +152,20 @@ WARN CBM
       certified code-index binary; everything else works without it.
 ```
 
+The agent table never merges two different facts into one column: an
+agent's configuration state (`valid` / `unregistered` / `absent`) and its
+runtime observation (attested / observed / stale / unknown / pending) are
+separate columns. Runtime evidence recorded without a host identity gets
+its own `host_unknown` row and is never attributed to a named host.
+
+Use `--verbose` for the full per-check diagnostics. The compact and
+verbose views come from the SAME payload — the compact view is a
+projection of the full check list, never a second opinion — and `--json`
+always carries the full detail.
+
 Checks: Python runtime, git executable, git repository, Relinkra config,
 registry integrity, Engram, CBM, git intelligence, MCP constructability,
-project identity, and a **portable-output self-audit**.
+project identity, registered revision, and a **portable-output self-audit**.
 
 That last one is unusual and deliberate: `doctor` runs
 `contains_absolute_path` over the payload it is about to print and

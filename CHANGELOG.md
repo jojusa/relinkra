@@ -3,6 +3,75 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased — 0.1.4 fresh-user recertification
+
+Not yet published; no version bump. This section records the 0.1.4 core
+surfaces (R6B–R6D) and the documentation finalization (R6G). The R6E and
+R6F sections below are part of the same unreleased 0.1.4 pool.
+
+### Added
+
+- `memory_get(memory_id)`: a deterministic exact-record lookup on the MCP
+  surface. Same id returns the same logical record; no fuzzy fallback
+  (`found=false` when the id does not exist or is outside the caller's
+  channels). Handoff mirror records are retrievable here; `handoff_get`
+  remains authoritative for handoff workflow state.
+- Deterministic memory retrieval: `memory_search` returns a stable total
+  order (oldest first, `memory_id` tiebreak) — identical inputs return
+  identical results.
+- Handoff/memory dedupe: duplicate handoffs on the same topic supersede
+  the older mirror record instead of accumulating.
+- `include_tests` on `code_relationships`: test-code relationships are
+  excluded by default and can be included explicitly when callers living
+  in test files matter.
+- ContextPacket salience: every packet item carries an agent-visible tier
+  (`must_keep` / `high_salience` / `optional`), `must_keep` items (the
+  essential frame, the current handoff, pending work) are protected from
+  budget omission, and `optional` items are sacrificed first.
+- Truncation truth on the packet `packet_status` block:
+  `packet_complete`, `budget_exhausted`, `omitted_sections`,
+  `omitted_high_salience_count`, `recommended_next` (deterministic
+  recovery hints naming real MCP tools), and a conservative
+  `context_sufficiency`. Snippet truncation is explicit
+  (`snippet_truncated`, original/returned lengths, continuation
+  reference) with `truncated_source_ids` in the budget report. Nothing
+  disappears silently.
+- Budget guidance: `budget_unsatisfiable` errors and budget reports carry
+  deterministic `minimum_useful_tokens` (the cpt1 cost of the must-keep
+  skeleton) and `recommended_max_tokens` (nothing high-salience omitted) —
+  guidance, never a bare retry.
+- Token-efficiency observability: `cpt1` char-per-token accounting and
+  the `budget_report` (with `useful_payload_tokens`, `metadata_tokens`,
+  `compression_ratio`, duplicate suppression counts) are returned with
+  `context_get`; unbudgeted agent-facing packets carry the additive
+  status block too.
+- Automatic runtime evidence: the MCP server self-observes while serving
+  (server start, client handshake, `tools/list`, tool invocations, memory
+  and CBM activity) and persists the evidence automatically — doctor can
+  see a host was real without any manual proof file. Self-observed
+  evidence remains distinct from the stronger external `connect verify`
+  proof.
+- Doctor `PENDING` state: "not yet proven" is reported distinctly from
+  `WARN` ("a real condition worth attention"); neither changes the exit
+  code — only `FAIL` does.
+
+### Changed
+
+- `memory_search` no longer includes handoff mirror records by default.
+  To retrieve handoffs: use `handoff_get` (authoritative), expand a known
+  mirror id with `memory_get(id)`, pass `include_handoffs=true`, or
+  filter `memory_type="handoff"` (mirrors are auto-included there).
+- `relinkra doctor` is compact by default — core groups, one agent row
+  per apply-capable host, one suggested next action — with `--verbose`
+  for the full per-check diagnostics. Both views render from the same
+  payload; the compact view is a projection, never a second opinion.
+- README restructured as a public product document: a six-command quick
+  start (`init` → `cbm setup` → `cbm index` → `connect all` → `doctor`),
+  an explicit two-level split (Level A quick start, Level B advanced
+  safe-control commands), and the memory/context surface guide. Relinkra
+  remains Relinkra-first, source-authoritative, and expand-on-demand;
+  token optimization removes redundancy, never evidence.
+
 ## Unreleased — R6E multiagent UX and routing
 
 Not yet published; no version bump.
