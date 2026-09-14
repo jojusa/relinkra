@@ -999,6 +999,17 @@ class InMemoryStore:
         )
         self._next_id += 1
         self._records.append(record)
+        # Keep the historical test/debug view logical even though the
+        # service now passes an immutable physical topic to real adapters.
+        # The in-memory store is append-only and has no backend upsert, so
+        # exposing both values preserves callers that asserted the old
+        # logical ``saved_args[...]["topic_key"]`` contract.
+        logical_topic_key = topic_key
+        try:
+            envelope = json.loads(content)
+            logical_topic_key = str(envelope.get("topic_key") or topic_key)
+        except (TypeError, ValueError):
+            pass
         self.saved_args.append(
             {
                 "title": title,
@@ -1006,7 +1017,8 @@ class InMemoryStore:
                 "storage_type": storage_type,
                 "project": project,
                 "scope": scope,
-                "topic_key": topic_key,
+                "topic_key": logical_topic_key,
+                "physical_topic_key": topic_key,
             }
         )
         return record.record_id

@@ -173,7 +173,9 @@ class _IsolatedStoreCase(unittest.TestCase):
         return EngramCLIAdapter(**overrides)
 
     @classmethod
-    def make_services(cls, store, project_ids=(("a", IDENTITY_A),)):
+    def make_services(
+        cls, store, project_ids=(("a", IDENTITY_A),), clock=None
+    ):
         """Services bound to a registry holding the given explicit projects."""
         registry = Registry(cls.registry_path)
         ids = {}
@@ -186,7 +188,7 @@ class _IsolatedStoreCase(unittest.TestCase):
             config=ServiceConfig(registry_path=cls.registry_path),
             store=store,
             registry=registry,
-            clock=lambda: FIXED_NOW,
+            clock=clock or (lambda: FIXED_NOW),
         )
         return services, ids
 
@@ -280,6 +282,77 @@ class TestR5J1ExactRegression(_IsolatedStoreCase):
         )
         self.assertEqual(packet["diagnostics"]["skipped_malformed"], 0)
         self.assertEqual(packet["diagnostics"]["skipped_truncated"], 0)
+
+
+@unittest.skipUnless(_ENGRAM_BIN, "engram is required for immutable history proof")
+class TestImmutableMemoryHistoryReal(_IsolatedStoreCase):
+    """Real Engram must retain every logical supersede revision."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.store = cls.make_store()
+        ticks = iter(range(1, 1000))
+        cls.services, cls.ids = cls.make_services(
+            cls.store,
+            clock=lambda: (
+                f"2026-08-26T00:00:{next(ticks):02d}+00:00"
+            ),
+        )
+        cls.project_id = cls.ids["a"]
+
+    def test_supersede_chain_roundtrips_with_unique_physical_topics(self):
+        saved = []
+        for body in ("revision A", "revision B", "revision C"):
+            saved.append(
+                self.services.memory_save(
+                    project_id=self.project_id,
+                    memory_type="decision",
+                    title="Immutable history probe",
+                    body=body,
+                )
+            )
+
+        current = self.services.memory_search(
+            project_id=self.project_id,
+            query=None,
+        )
+        self.assertEqual(current["count"], 1)
+        self.assertEqual(current["memories"][0]["body"], "revision C")
+
+        history = self.services.memory_search(
+            project_id=self.project_id,
+            query=None,
+            include_history=True,
+        )
+        self.assertEqual(
+            [memory["body"] for memory in history["memories"]],
+            ["revision A", "revision B", "revision C"],
+        )
+        for expected in saved:
+            fetched = self.services.memory_get(
+                project_id=self.project_id, memory_id=expected["memory_id"]
+            )
+            self.assertTrue(fetched["found"])
+            self.assertEqual(fetched["memory"]["memory_id"], expected["memory_id"])
+
+        loopback = _shared_loopback(_ENGRAM_BIN, self.data_dir)
+        self.assertIsNotNone(loopback)
+        self.assertTrue(loopback.base_url)
+        with urllib.request.urlopen(
+            f"{loopback.base_url}/search?q=rlkmem1&limit=20",
+            timeout=5,
+        ) as response:
+            rows = json.loads(response.read().decode("utf-8"))
+        rows = [
+            row
+            for row in rows
+            if row.get("project") == self.project_id
+            and row.get("title") == "Immutable history probe"
+        ]
+        self.assertEqual(len(rows), 3)
+        physical_topics = [row.get("topic_key") for row in rows]
+        self.assertEqual(len(physical_topics), len(set(physical_topics)))
 
 
 @unittest.skipUnless(_ENGRAM_BIN, "engram is required for roundtrip proof")

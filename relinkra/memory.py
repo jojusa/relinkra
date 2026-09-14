@@ -358,6 +358,20 @@ def topic_key_for(
     )
 
 
+def physical_topic_key_for(logical_topic_key: str, memory_id: str) -> str:
+    """Derive an immutable Engram storage key for one logical memory.
+
+    Engram treats ``topic_key`` as an upsert key.  Relinkra keeps the
+    logical topic in the envelope for lifecycle policy, but appends the
+    generated memory id to the backend key so every new write gets its own
+    physical observation.  The id is generated before persistence and is
+    therefore stable for retries of the same in-memory save transaction.
+    """
+    if not logical_topic_key or not memory_id:
+        raise MemoryValidationError("logical_topic_key and memory_id are required")
+    return f"{logical_topic_key}/memory/{memory_id}"
+
+
 @dataclass
 class Memory:
     memory_id: str
@@ -593,6 +607,22 @@ class MemoryService:
                 return existing, True, []
 
         topic_key = topic_key_for(project_id, channel, memory_type, title)
+        if supersedes:
+            # Explicit supersession normally bypasses content dedup so a
+            # replacement can intentionally reuse an existing body.  A
+            # retried identical supersede is the one exception: return the
+            # already-written replacement instead of creating a second link.
+            retry = self._find_supersede_retry(
+                project_id,
+                channel,
+                memory_type,
+                topic_key,
+                dedup_key,
+                supersedes,
+                status,
+            )
+            if retry is not None:
+                return retry, True, []
         superseded_ids: list[str] = []
         if status == "active" and supersedes is None:
             prior = self._find_active_by_topic(project_id, topic_key)
@@ -630,7 +660,7 @@ class MemoryService:
             storage_type=STORAGE_TYPE_MAP[memory_type],
             project=project_id,
             scope=ENGRAM_SCOPE,
-            topic_key=topic_key,
+            topic_key=physical_topic_key_for(topic_key, memory.memory_id),
         )
         return memory, False, superseded_ids
 
@@ -985,6 +1015,38 @@ class MemoryService:
         if not active:
             return None
         return max(active, key=lambda m: (m.timestamp, m.memory_id))
+
+    def _find_supersede_retry(
+        self,
+        project_id: str,
+        channel: str,
+        memory_type: str,
+        topic_key: str,
+        dedup_key: str,
+        supersedes: str,
+        status: str,
+    ) -> Optional[Memory]:
+        """Find an exact replacement already persisted for a retry.
+
+        This deliberately matches the explicit target plus the complete
+        logical identity, rather than applying ordinary content dedup.  Thus
+        explicit supersession still writes when the target or replacement
+        differs, while an identical retry is idempotent.
+        """
+        candidates = self._search_project(project_id, ENVELOPE_VERSION)
+        matches = [
+            m
+            for m in candidates
+            if m.scope_channel == channel
+            and m.memory_type == memory_type
+            and m.topic_key == topic_key
+            and m.dedup_key == dedup_key
+            and m.supersedes == supersedes
+            and m.status == status
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda m: (m.timestamp, m.memory_id))
 
     def _find_by_id(self, project_id: str, memory_id: str) -> Optional[Memory]:
         # Same exact lookup as get(): the targeted id query keeps

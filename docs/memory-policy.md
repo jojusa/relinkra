@@ -72,7 +72,7 @@ store cannot carry.
 | `project`    | the R1B `project_id` (`rlk_…`) — never a path/CBM name |
 | `scope`      | always `project` |
 | `type`       | mapped storage type (table above) |
-| `topic_key`  | `relinkra/v1/{project_id}/{scope_channel}/{memory_type}/{slug}` |
+| `topic_key`  | immutable physical key derived from the logical key plus `memory_id`; the logical `relinkra/v1/{project_id}/{scope_channel}/{memory_type}/{slug}` remains in the envelope |
 | `title`      | human title (may carry a nonce for proofs) |
 | `content`    | compact single-line JSON envelope (`"v":"rlkmem1"`, all fields) |
 
@@ -99,7 +99,9 @@ from the R1B Registry via `--path`; otherwise pass `--project-id` and
 
 ## Lifecycle and supersession
 
-History is never deleted. Saving an `active` memory whose `topic_key`
+For new Relinkra writes, history is never deleted. Every new Relinkra write uses a unique physical
+Engram topic key, so Engram's topic upsert cannot overwrite an earlier
+observation. Saving an `active` memory whose **logical** `topic_key`
 already has an active record automatically supersedes the prior one (the
 new envelope carries `supersedes: <old memory_id>`). Default retrieval
 returns only `active` records and excludes superseded ones; pass
@@ -107,10 +109,13 @@ returns only `active` records and excludes superseded ones; pass
 `supersede` replaces a memory's content, or `--obsolete` writes a
 tombstone that hides the whole topic by default.
 
-Caveat: Engram treats `topic_key` as an upsert key for its own latest-
-observation reuse. Relinkra does not rely on Engram's upsert semantics —
-supersession is computed from envelopes at query time — but operators
-should know the two mechanisms coexist.
+Legacy records written before this guarantee may already have been
+overwritten by Engram when they reused the same physical topic key; that
+lost history cannot be reconstructed by Relinkra. Legacy observations that
+still exist remain readable and participate in the same envelope/lifecycle
+policy. An exact retry of an explicit supersede is idempotent, while a
+different explicit target or replacement still bypasses ordinary content
+deduplication and writes a new memory.
 
 ## Deduplication
 

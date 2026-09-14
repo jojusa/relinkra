@@ -318,6 +318,40 @@ class TestLifecycle(unittest.TestCase):
         save_shared(service, title="Plan", body="v2")
         self.assertEqual(len(store.saved_args), 2)
 
+    def test_three_versions_keep_history_current_and_exact_get(self):
+        service, store = make_service()
+        first, _, _ = save_shared(service, title="Plan", body="v1")
+        second, _, _ = save_shared(service, title="Plan", body="v2")
+        third, _, _ = save_shared(service, title="Plan", body="v3")
+
+        current = service.query(project_id=PID_A, scope="project_shared")
+        self.assertEqual([m.body for m in current.memories], ["v3"])
+        history = service.query(
+            project_id=PID_A, scope="project_shared", include_history=True
+        )
+        self.assertEqual(
+            [m.body for m in history.memories], ["v1", "v2", "v3"]
+        )
+        self.assertEqual(
+            service.get(project_id=PID_A, memory_id=first.memory_id).body, "v1"
+        )
+        self.assertEqual(
+            service.get(project_id=PID_A, memory_id=second.memory_id).body, "v2"
+        )
+        self.assertEqual(
+            service.get(project_id=PID_A, memory_id=third.memory_id).body, "v3"
+        )
+        self.assertEqual(second.supersedes, first.memory_id)
+        self.assertEqual(third.supersedes, second.memory_id)
+        physical = [row["physical_topic_key"] for row in store.saved_args]
+        self.assertEqual(len(physical), len(set(physical)))
+        self.assertTrue(
+            all(
+                key.endswith(memory.memory_id)
+                for key, memory in zip(physical, (first, second, third))
+            )
+        )
+
     def test_supersede_command_replaces(self):
         service, _ = make_service()
         first, _, _ = save_shared(service, title="Doc", body="old")
@@ -331,6 +365,40 @@ class TestLifecycle(unittest.TestCase):
         result = service.query(project_id=PID_A, scope="project_shared")
         self.assertEqual([m.body for m in result.memories], ["new"])
         self.assertEqual(replacement.supersedes, first.memory_id)
+
+    def test_failed_supersede_leaves_prior_history_and_current_state(self):
+        class FailNextStore(InMemoryStore):
+            def __init__(self):
+                super().__init__()
+                self.fail_next = False
+
+            def save_record(self, **kwargs):
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("simulated backend failure")
+                return super().save_record(**kwargs)
+
+        store = FailNextStore()
+        service, _ = make_service(store)
+        first, _, _ = save_shared(service, title="Atomic", body="v1")
+        store.fail_next = True
+        with self.assertRaises(RuntimeError):
+            service.supersede(
+                memory_id=first.memory_id,
+                project_id=PID_A,
+                title="Atomic",
+                body="v2",
+            )
+
+        self.assertEqual(
+            service.get(project_id=PID_A, memory_id=first.memory_id).body, "v1"
+        )
+        current = service.query(project_id=PID_A, scope="project_shared")
+        self.assertEqual([memory.body for memory in current.memories], ["v1"])
+        history = service.query(
+            project_id=PID_A, scope="project_shared", include_history=True
+        )
+        self.assertEqual([memory.body for memory in history.memories], ["v1"])
 
     def test_supersede_obsolete_tombstone(self):
         service, _ = make_service()
@@ -385,6 +453,26 @@ class TestDedup(unittest.TestCase):
         )
         old = next(m for m in history.memories if m.memory_id == a.memory_id)
         self.assertEqual(old.superseded_by, replacement.memory_id)
+
+    def test_identical_explicit_supersede_retry_is_idempotent(self):
+        service, store = make_service()
+        target, _, _ = save_shared(service, title="Plan", body="v1")
+        first, superseded = service.supersede(
+            memory_id=target.memory_id,
+            project_id=PID_A,
+            title="Plan",
+            body="v2",
+        )
+        retry, retry_superseded = service.supersede(
+            memory_id=target.memory_id,
+            project_id=PID_A,
+            title="Plan",
+            body="v2",
+        )
+        self.assertEqual(superseded, [target.memory_id])
+        self.assertEqual(retry_superseded, [])
+        self.assertEqual(retry.memory_id, first.memory_id)
+        self.assertEqual(len(store.saved_args), 2)
 
     def test_identical_save_returns_existing(self):
         service, store = make_service()
