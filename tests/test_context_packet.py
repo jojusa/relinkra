@@ -770,6 +770,23 @@ class FatalTests(unittest.TestCase):
 
 
 class GuardrailTests(unittest.TestCase):
+    def test_incomplete_memory_window_is_explicit_in_packet_diagnostics(self):
+        env = Env(seed=False)
+        self.addCleanup(env.cleanup)
+        env.store.last_search_metadata = {
+            "backend_window_complete": False,
+            "backend_limit": 20,
+            "retrieval_scope": "partial",
+            "retrieval_complete": False,
+        }
+        env.save(memory_type="discovery", title="Partial retrieval", body="x")
+        packet = env.builder().build(env.request())
+        self.assertFalse(packet.diagnostics["retrieval_complete"])
+        self.assertEqual(packet.diagnostics["retrieval_scopes"], ["partial"])
+        self.assertIn(
+            "engram_retrieval_incomplete", warning_codes(packet)
+        )
+
     def test_max_memories_and_omission(self):
         env = Env(seed=False)
         self.addCleanup(env.cleanup)

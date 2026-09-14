@@ -28,6 +28,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -43,6 +44,13 @@ ENGRAM_BIN = "engram"
 DEFAULT_ENGRAM_URL = "http://127.0.0.1:7437"
 ENGRAM_URL_ENV = "ENGRAM_URL"
 ENGRAM_DATA_DIR_ENV = "ENGRAM_DATA_DIR"
+# Engram 1.20.0 currently caps every search response at 20 rows.  The
+# HTTP/loopback API does not expose a cursor or total, and the CLI exposes no
+# offset/page flag, so this is a detection threshold rather than a requested
+# Relinkra result limit.  When the threshold is reached we use the existing
+# complete `engram export` primitive instead of pretending the capped page is
+# complete.
+ENGRAM_SEARCH_CAP = 20
 
 
 @dataclass
@@ -385,6 +393,26 @@ def _deterministic_newest_first(
     )
 
 
+def _export_query_matches(query: str, title: str, content: str) -> bool:
+    """Apply the complete-export search predicate conservatively.
+
+    Engram's public search surface exposes token-AND matching but no way to
+    page a result set.  Export has no query argument, so the fallback mirrors
+    the stable part of that predicate (case-insensitive token containment over
+    title + content).  The envelope parser and project/scope policy still run
+    after this filter, exactly as they do for backend search results.
+    """
+    tokens = [
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9_]+", query or "")
+        if token
+    ]
+    if not tokens:
+        return True
+    haystack = f"{title}\n{content}".casefold()
+    return all(token in haystack for token in tokens)
+
+
 # ---------------------------------------------------------------------------
 # Engram CLI adapter
 # ---------------------------------------------------------------------------
@@ -444,6 +472,16 @@ class EngramCLIAdapter:
         #: How the last search actually read data:
         #: "http" | "loopback" | "cli" | "unknown" (never searched).
         self.read_mode: str = "unknown"
+        #: Additive retrieval accounting for callers that need to distinguish
+        #: a complete backend page from a complete-store export or an honest
+        #: partial fallback.  The list-returning MemoryStore protocol stays
+        #: backwards compatible; MemoryService reads this side channel.
+        self.last_search_metadata: dict = {
+            "backend_window_complete": True,
+            "backend_limit": None,
+            "retrieval_scope": "backend_window",
+            "retrieval_complete": True,
+        }
         if http_url is None:
             if ENGRAM_URL_ENV in os.environ:
                 http_url = os.environ[ENGRAM_URL_ENV]
@@ -511,6 +549,12 @@ class EngramCLIAdapter:
         limit: int = 50,
     ) -> List[StoredRecord]:
         limit = max(1, int(limit))
+        self.last_search_metadata = {
+            "backend_window_complete": True,
+            "backend_limit": None,
+            "retrieval_scope": "backend_window",
+            "retrieval_complete": True,
+        }
         # project_alias rewrites the PHYSICAL store filter only; the R1C
         # policy layer still filters parsed envelopes by the logical
         # project_id, so cross-project isolation is preserved.
@@ -518,7 +562,10 @@ class EngramCLIAdapter:
         http_records = self._http_search(query, physical_project, limit)
         if http_records is not None:
             self.read_mode = "http"
-            return self._filtered(http_records, storage_type, limit)
+            records = self._recover_capped_window(
+                http_records, query, physical_project, storage_type
+            )
+            return self._filtered(records, storage_type, limit)
         if self.allow_loopback:
             data_dir = os.environ.get(ENGRAM_DATA_DIR_ENV) or str(
                 Path.home() / ".engram"
@@ -530,7 +577,13 @@ class EngramCLIAdapter:
                 )
                 if loopback_records is not None:
                     self.read_mode = "loopback"
-                    return self._filtered(loopback_records, storage_type, limit)
+                    records = self._recover_capped_window(
+                        loopback_records,
+                        query,
+                        physical_project,
+                        storage_type,
+                    )
+                    return self._filtered(records, storage_type, limit)
         self.read_mode = "cli"
         args = ["search", query, "--limit", str(limit)]
         if physical_project:
@@ -540,10 +593,124 @@ class EngramCLIAdapter:
         output = self._run(args)
         if "No memories found" in output:
             return []
+        records = parse_search_output(output)
+        records = self._recover_capped_window(
+            records, query, physical_project, storage_type
+        )
         # The CLI backend already applied its own limit to its own
         # (incidental) ordering; re-ordering the parsed page is the only
-        # deterministic part left in Relinkra's hands.
-        return _deterministic_newest_first(parse_search_output(output))
+        # deterministic part left in Relinkra's hands when export recovery is
+        # unavailable.  Type filtering remains client-side for the recovered
+        # complete path so all tiers have the same pipeline.
+        return self._filtered(records, storage_type, limit)
+
+    def _recover_capped_window(
+        self,
+        records: List[StoredRecord],
+        query: str,
+        project: Optional[str],
+        storage_type: Optional[str],
+    ) -> List[StoredRecord]:
+        """Recover a capped backend page through Engram's complete export.
+
+        Engram 1.20.0 returns exactly 20 rows for a matching search even when
+        Relinkra asks for 200, and it ignores offset/page/cursor parameters.
+        Once that cap is reached, the page cannot prove that its newest rows
+        are the newest rows in the store.  ``engram export`` is an existing
+        supported read primitive that returns all observations, so use it only
+        at the cap and filter the exported records locally before they enter
+        the ordering/policy pipeline.  If export is unavailable, preserve the
+        backend page but expose an explicit incomplete retrieval scope.
+        """
+        if len(records) < ENGRAM_SEARCH_CAP:
+            return records
+        exported = self._export_search(query, project, storage_type)
+        if exported is not None:
+            self.last_search_metadata = {
+                "backend_window_complete": False,
+                "backend_limit": ENGRAM_SEARCH_CAP,
+                "retrieval_scope": "complete_export",
+                "retrieval_complete": True,
+            }
+            return exported
+        self.last_search_metadata = {
+            "backend_window_complete": False,
+            "backend_limit": ENGRAM_SEARCH_CAP,
+            "retrieval_scope": "partial",
+            "retrieval_complete": False,
+        }
+        return records
+
+    def _export_search(
+        self,
+        query: str,
+        project: Optional[str],
+        storage_type: Optional[str],
+    ) -> Optional[List[StoredRecord]]:
+        """Read and filter the complete Engram JSON export, if available.
+
+        Export is deliberately invoked only after the 20-row cap is observed;
+        ordinary small searches stay on the fast HTTP/loopback/CLI path.  The
+        temporary file is outside the repository and is removed immediately.
+        Project/type/query filtering happens before deterministic ordering so
+        foreign or private observations never influence result ranking.
+        """
+        fd, path = tempfile.mkstemp(
+            prefix="relinkra-engram-export-", suffix=".json"
+        )
+        os.close(fd)
+        try:
+            self._run(["export", path])
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (MemoryStoreError, OSError, TypeError, ValueError):
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        observations = payload.get("observations") if isinstance(payload, dict) else None
+        if not isinstance(observations, list):
+            return None
+
+        records: List[StoredRecord] = []
+        for item in observations:
+            if not isinstance(item, dict):
+                continue
+            # Deleted observations are not search results.  Engram's export
+            # schema has used both a timestamp and a boolean marker across
+            # versions; accept either without assuming a migration shape.
+            if item.get("deleted_at") or item.get("deleted"):
+                continue
+            item_project = str(item.get("project") or "")
+            if project and item_project != project:
+                continue
+            item_type = str(item.get("type") or item.get("storage_type") or "")
+            if storage_type and item_type != storage_type:
+                continue
+            title = str(item.get("title") or "")
+            content = str(item.get("content") or "")
+            if not _export_query_matches(query, title, content):
+                continue
+            records.append(
+                StoredRecord(
+                    record_id=str(item.get("id") or item.get("sync_id") or ""),
+                    storage_type=item_type,
+                    title=title,
+                    content=content,
+                    project=item_project,
+                    scope=str(item.get("scope") or ""),
+                    timestamp=str(
+                        item.get("timestamp")
+                        or item.get("created_at")
+                        or item.get("updated_at")
+                        or ""
+                    ),
+                )
+            )
+        return records
 
     @staticmethod
     def _filtered(
@@ -629,6 +796,12 @@ class InMemoryStore:
         self._records: List[StoredRecord] = []
         self._next_id = 1
         self.saved_args: List[dict] = []
+        self.last_search_metadata = {
+            "backend_window_complete": True,
+            "backend_limit": None,
+            "retrieval_scope": "in_memory_complete",
+            "retrieval_complete": True,
+        }
 
     def save_record(
         self,

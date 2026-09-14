@@ -24,7 +24,7 @@ from relinkra.engram_adapter import (
     parse_search_output,
 )
 from relinkra.identity import explicit_identity
-from relinkra.memory import MemoryStoreError
+from relinkra.memory import MemoryService, MemoryStoreError
 from relinkra.registry import Registry
 
 PID = "rlk_" + "a1b2c3d4" * 4
@@ -61,6 +61,35 @@ SAMPLE_SEARCH = """Found 2 memories:
     {{"v":"rlkmem1","memory_id":"mem_bbb","body":"xxxxxxxxxxxxxxxxxxxxxxxx...
     2026-07-24 10:01:00 | project: {pid} | scope: project
 """.format(pid=PID)
+
+
+def capped_search_output(count=20):
+    lines = [f"Found {count} memories:", ""]
+    for index in range(1, count + 1):
+        lines.extend(
+            [
+                f"[{index}] #{index} (decision) — r6hcap fixture {index:03d}",
+                f"    r6hcap fixture {index:03d}",
+                f"    2026-09-14 10:00:{index:02d} | project: {PID} | scope: project",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def export_observations(count=50):
+    return [
+        {
+            "id": index,
+            "type": "decision",
+            "title": f"r6hcap fixture {index:03d}",
+            "content": f"r6hcap fixture {index:03d}",
+            "project": PID,
+            "scope": "project",
+            "created_at": f"2026-09-14 10:00:{index:02d}",
+        }
+        for index in range(1, count + 1)
+    ]
 
 
 def run_cli(argv, store=None):
@@ -179,6 +208,51 @@ class TestEngramCLIAdapter(unittest.TestCase):
             return_value=FakeCompleted(stdout='No memories found for: "zz"'),
         ):
             self.assertEqual(adapter.search_records(query="zz"), [])
+
+    def test_search_recovers_real_backend_cap_from_complete_export(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            self.assertEqual(command[1], "export")
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": export_observations()}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ) as subprocess_run:
+            records = adapter.search_records(
+                query="r6hcap", project=PID, limit=50
+            )
+
+        self.assertEqual(len(records), 50)
+        self.assertEqual(records[0].record_id, "50")
+        self.assertEqual(records[-1].record_id, "1")
+        self.assertEqual(adapter.last_search_metadata["retrieval_scope"], "complete_export")
+        self.assertFalse(adapter.last_search_metadata["backend_window_complete"])
+        self.assertTrue(adapter.last_search_metadata["retrieval_complete"])
+        self.assertEqual(subprocess_run.call_count, 2)
+
+    def test_search_cap_export_failure_is_explicitly_partial(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            return FakeCompleted(stderr="export unavailable", returncode=1)
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            records = adapter.search_records(
+                query="r6hcap", project=PID, limit=50
+            )
+
+        self.assertEqual(len(records), 20)
+        self.assertEqual(adapter.last_search_metadata["retrieval_scope"], "partial")
+        self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
 
     def test_nonzero_exit_raises_sanitized(self):
         adapter = self.make_adapter()
@@ -806,6 +880,133 @@ class TestEngramIntegration(unittest.TestCase):
         # Transport loss counted honestly: truncated, not malformed.
         self.assertGreaterEqual(payload["skipped_truncated"], 1)
         self.assertEqual(payload["skipped_malformed"], 0)
+        self._assert_writes_stayed_local()
+
+    def test_real_backend_cap_recovers_newest_deterministically_and_isolates_scope(self):
+        """R6H acceptance: complete export recovers records beyond 20."""
+        store = EngramCLIAdapter()
+        service = MemoryService(store)
+        saved = []
+        for index in range(50):
+            memory, deduplicated, _ = service.save(
+                project_id=PID,
+                memory_type="decision",
+                title=f"R6H real cap {index:03d}",
+                body="r6h-real-cap semantic candidate",
+                repository_identity={
+                    "kind": "explicit",
+                    "value": REPO_VALUE,
+                    "trust": "strong",
+                },
+            )
+            self.assertFalse(deduplicated)
+            saved.append(memory)
+
+        first = service.query(
+            project_id=PID, text="r6h-real-cap", limit=5
+        )
+        second = service.query(
+            project_id=PID, text="r6h-real-cap", limit=5
+        )
+        self.assertEqual(len(first.memories), 5)
+        self.assertEqual(
+            [m.memory_id for m in first.memories],
+            [m.memory_id for m in second.memories],
+        )
+        self.assertEqual(first.retrieval_scope, "complete_export")
+        self.assertFalse(first.backend_window_complete)
+        self.assertTrue(first.retrieval_complete)
+        self.assertEqual(
+            len(
+                service.query(
+                    project_id=PID, text="r6h-real-cap", limit=100
+                ).memories
+            ),
+            50,
+        )
+        newest = saved[-1]
+        self.assertEqual(
+            service.get(project_id=PID, memory_id=newest.memory_id).memory_id,
+            newest.memory_id,
+        )
+
+        foreign, _, _ = service.save(
+            project_id="rlk_" + "b2" * 16,
+            memory_type="decision",
+            title="foreign R6H candidate",
+            body="r6h-real-cap semantic candidate",
+            repository_identity={
+                "kind": "explicit",
+                "value": "explicit://foreign-r6h",
+                "trust": "strong",
+            },
+        )
+        self.assertNotIn(
+            foreign.memory_id,
+            [
+                m.memory_id
+                for m in service.query(
+                    project_id=PID, text="r6h-real-cap", limit=100
+                ).memories
+            ],
+        )
+
+        private, _, _ = service.save(
+            project_id=PID,
+            memory_type="decision",
+            title="private R6H candidate",
+            body="r6h-real-cap semantic candidate",
+            repository_identity={
+                "kind": "explicit",
+                "value": REPO_VALUE,
+                "trust": "strong",
+            },
+            scope="agent_private",
+            agent_type="private-r6h",
+        )
+        shared_ids = {
+            m.memory_id
+            for m in service.query(
+                project_id=PID, text="r6h-real-cap", limit=100
+            ).memories
+        }
+        self.assertNotIn(private.memory_id, shared_ids)
+        private_result = service.query(
+            project_id=PID,
+            scope="agent_private",
+            agent_type="private-r6h",
+            text="r6h-real-cap",
+            limit=10,
+        )
+        self.assertIn(private.memory_id, {m.memory_id for m in private_result.memories})
+
+        handoff, _, _ = service.save(
+            project_id=PID,
+            memory_type="handoff",
+            title="R6H handoff mirror",
+            body="r6h-real-cap handoff context",
+            repository_identity={
+                "kind": "explicit",
+                "value": REPO_VALUE,
+                "trust": "strong",
+            },
+        )
+        hidden = service.query(
+            project_id=PID,
+            text="r6h-real-cap",
+            include_handoff_mirrors=False,
+            limit=100,
+        )
+        self.assertNotIn(handoff.memory_id, {m.memory_id for m in hidden.memories})
+        visible = service.query(
+            project_id=PID,
+            text="r6h-real-cap",
+            include_handoff_mirrors=True,
+            limit=100,
+        )
+        self.assertEqual(
+            [m.memory_id for m in visible.memories].count(handoff.memory_id), 1
+        )
         self._assert_writes_stayed_local()
 
 

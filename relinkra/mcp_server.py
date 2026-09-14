@@ -180,7 +180,9 @@ TOOLS: List[dict] = [
             "tiebreak). Handoff mirror records are excluded by default — "
             "handoff_get is authoritative for handoffs; pass "
             "include_handoffs or filter memory_type=handoff to see them. "
-            "Agent-private memory is never returned through this surface."
+            "The response also reports retrieval completeness when the "
+            "backend search window is capped. Agent-private memory is never "
+            "returned through this surface."
         ),
         "inputSchema": {
             "type": "object",

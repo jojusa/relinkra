@@ -664,6 +664,29 @@ class TestMalformedStoredEnvelopes(unittest.TestCase):
         self.assertEqual(result.skipped_malformed, 2)
 
 
+class TestRetrievalCompletenessMetadata(unittest.TestCase):
+    def test_partial_backend_window_is_additive_and_honest(self):
+        class PartialStore(InMemoryStore):
+            def search_records(self, **kwargs):
+                self.last_search_metadata = {
+                    "backend_window_complete": False,
+                    "backend_limit": 20,
+                    "retrieval_scope": "partial",
+                    "retrieval_complete": False,
+                }
+                return super().search_records(**kwargs)
+
+        service, _ = make_service(PartialStore())
+        save_shared(service, title="Visible", body="partial probe")
+        result = service.query(project_id=PID_A, text="partial probe")
+        payload = result.to_dict()
+        self.assertEqual(payload["count"], 1)
+        self.assertFalse(payload["backend_window_complete"])
+        self.assertEqual(payload["backend_limit"], 20)
+        self.assertEqual(payload["retrieval_scope"], "partial")
+        self.assertFalse(payload["retrieval_complete"])
+
+
 class TestMemoryGet(unittest.TestCase):
     """R6B: exact-id lookup is deterministic and window-independent."""
 

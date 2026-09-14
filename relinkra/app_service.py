@@ -861,6 +861,10 @@ class RelinkraServices:
             "count": len(result.memories),
             "skipped_malformed": result.skipped_malformed,
             "skipped_truncated": result.skipped_truncated,
+            "backend_window_complete": result.backend_window_complete,
+            "backend_limit": result.backend_limit,
+            "retrieval_scope": result.retrieval_scope,
+            "retrieval_complete": result.retrieval_complete,
             "memories": explained_memories,
             "explainability": {
                 "as_of": freshness_context.as_of,

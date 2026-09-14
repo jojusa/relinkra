@@ -483,6 +483,12 @@ class QueryResult:
     #: truncation). Counted separately so a degraded read channel is
     #: reported honestly instead of inflating the malformed counter.
     skipped_truncated: int = 0
+    #: Additive retrieval accounting.  The adapter sets these when a capped
+    #: backend page was observed; exact memory_get remains independent.
+    backend_window_complete: bool = True
+    backend_limit: Optional[int] = None
+    retrieval_scope: str = "backend_window"
+    retrieval_complete: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -490,6 +496,10 @@ class QueryResult:
             "count": len(self.memories),
             "skipped_malformed": self.skipped_malformed,
             "skipped_truncated": self.skipped_truncated,
+            "backend_window_complete": self.backend_window_complete,
+            "backend_limit": self.backend_limit,
+            "retrieval_scope": self.retrieval_scope,
+            "retrieval_complete": self.retrieval_complete,
         }
 
 
@@ -709,10 +719,13 @@ class MemoryService:
         Results are a deterministic total order for identical inputs:
         ascending ``(timestamp, memory_id)`` — the id breaks timestamp
         ties — sliced to the newest ``limit`` records after lifecycle
-        filtering. The store is asked for ONE fixed page of at most
-        ``STORE_PAGE_LIMIT`` matches; when a project holds more matches
-        than that, page membership is the store's newest-first window
-        and this layer re-sorts whatever the page contains.
+        filtering. The backend candidate window is retrieved first, then
+        visibility/type/lifecycle policy is applied, and only then is the
+        caller limit cut. Engram 1.20.0 has no usable cursor/offset and caps
+        search responses at 20; the adapter uses its complete export path when
+        that cap is reached. If export is unavailable, the additive retrieval
+        metadata marks the result partial instead of implying that omitted
+        matches do not exist.
 
         ``include_handoff_mirrors=False`` hides handoff-type mirror
         records from the result (handoff state is authoritative through
@@ -742,6 +755,7 @@ class MemoryService:
             project=project_id,
             limit=STORE_PAGE_LIMIT,
         )
+        retrieval = getattr(self.store, "last_search_metadata", {}) or {}
         memories, skipped_malformed, skipped_truncated = self._parse_envelopes(
             records, project_id
         )
@@ -759,6 +773,14 @@ class MemoryService:
             memories=visible,
             skipped_malformed=skipped_malformed,
             skipped_truncated=skipped_truncated,
+            backend_window_complete=bool(
+                retrieval.get("backend_window_complete", True)
+            ),
+            backend_limit=retrieval.get("backend_limit"),
+            retrieval_scope=str(
+                retrieval.get("retrieval_scope", "backend_window")
+            ),
+            retrieval_complete=bool(retrieval.get("retrieval_complete", True)),
         )
 
     def get(

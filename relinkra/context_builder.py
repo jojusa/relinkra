@@ -103,6 +103,7 @@ WARN_AMBIGUOUS = "ambiguous_code_reference"
 WARN_CBM_UNAVAILABLE = "cbm_unavailable"
 WARN_CBM_STRUCTURAL = "cbm_structural_unavailable"
 WARN_ENGRAM_UNAVAILABLE = "engram_unavailable"
+WARN_ENGRAM_RETRIEVAL_INCOMPLETE = "engram_retrieval_incomplete"
 WARN_WORKSPACE_MISMATCH = "workspace_mismatch"
 WARN_WORKSPACE_NOT_REGISTERED = "workspace_not_registered"
 WARN_ITEMS_OMITTED = "items_omitted"
@@ -244,6 +245,7 @@ class ContextBuilder:
         diagnostics: dict[str, Any] = {
             "skipped_malformed": 0,
             "skipped_truncated": 0,
+            "retrieval_complete": True,
         }
 
         project_id = self._validate_project(request.project_id)
@@ -816,6 +818,7 @@ class ContextBuilder:
             candidates.extend(result.memories)
             diagnostics["skipped_malformed"] += result.skipped_malformed
             diagnostics["skipped_truncated"] += result.skipped_truncated
+            self._record_retrieval_metadata(result, diagnostics, warnings)
         except MemoryError as exc:
             warnings.append(
                 PacketWarning(
@@ -837,6 +840,7 @@ class ContextBuilder:
                 candidates.extend(private.memories)
                 diagnostics["skipped_malformed"] += private.skipped_malformed
                 diagnostics["skipped_truncated"] += private.skipped_truncated
+                self._record_retrieval_metadata(private, diagnostics, warnings)
             except MemoryError as exc:
                 warnings.append(
                     PacketWarning(
@@ -863,6 +867,25 @@ class ContextBuilder:
         diagnostics["duplicate_memory_ids_skipped"] = duplicate_ids
         diagnostics["duplicate_memory_chars_skipped"] = duplicate_chars
         return unique, set(), True
+
+    @staticmethod
+    def _record_retrieval_metadata(result, diagnostics, warnings) -> None:
+        """Carry backend completeness honestly into ContextPacket diagnostics."""
+        if getattr(result, "retrieval_complete", True):
+            return
+        diagnostics["retrieval_complete"] = False
+        scopes = diagnostics.setdefault("retrieval_scopes", [])
+        scope = getattr(result, "retrieval_scope", "partial")
+        if scope not in scopes:
+            scopes.append(scope)
+            scopes.sort()
+        warning = PacketWarning(
+            WARN_ENGRAM_RETRIEVAL_INCOMPLETE,
+            "memory retrieval examined only a bounded backend window; "
+            "additional matching memories may exist",
+        )
+        if not any(existing.code == warning.code for existing in warnings):
+            warnings.append(warning)
 
     def _task_token_map(self, mode, task, candidates):
         """memory_id -> sorted matched task tokens (empty for non-task)."""

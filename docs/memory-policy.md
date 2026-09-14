@@ -173,13 +173,29 @@ therefore follow a three-tier path over the SAME physical backend:
    records; content that ends with the truncation marker is flagged
    `truncated=True`.
 
-- `GET /search?q=<query>&project=<project>` returns a JSON array with
-  **full untruncated `content`**; tiers 1 and 2 therefore deliver every
-  envelope whole whenever either is available.
+- `GET /search?q=<query>&project=<project>&limit=<N>` returns a JSON array with
+  **full untruncated `content`**, but Engram 1.20.0 caps that array at 20
+  records and exposes no total, cursor, offset, or page metadata. The loopback
+  endpoint has the same boundary. The CLI has the equivalent
+  `engram search <query> --limit <N>` request but no paging flag.
+- When a tier returns the observed 20-row cap, Relinkra reads the existing
+  complete `engram export <temporary-file>` primitive and applies the same
+  project/type/token filter locally before ordering. This is only invoked at
+  the cap, so ordinary small searches stay on the fast three-tier path. If
+  export is unavailable, the result carries additive
+  `backend_window_complete: false`, `backend_limit: 20`,
+  `retrieval_scope: "partial"`, and `retrieval_complete: false`; callers must
+  not interpret that page as proof that no other match exists. Successful
+  export recovery reports `retrieval_scope: "complete_export"` while still
+  keeping `backend_window_complete: false` to expose the backend boundary.
 - Short timeout (2s). Any failure — server down, timeout, malformed
   payload — falls back transparently to the next tier.
 - `--type` filtering and the store page limit are applied client-side
-  on HTTP/loopback results.
+  on HTTP/loopback results. The policy pipeline is backend candidate
+  retrieval → project/visibility/type filtering → lifecycle/supersession
+  filtering → deterministic `(timestamp, memory_id)` ordering → requested
+  result window. `memory_get(id)` remains an exact targeted lookup and does
+  not depend on the search window.
 
 **Honest accounting in degraded modes.** When only the CLI text path is
 available (explicit `ENGRAM_URL=""` hard-off, or both HTTP tiers
@@ -192,10 +208,11 @@ bytes", not "the data was corrupt"; memories affected are simply absent
 from results rather than mis-parsed.
 
 **Writes always go through the `engram save` CLI**; loopback failures
-never affect saves. Query paging is fixed: the store is always asked for
-a page of 200 records and channel/type/lifecycle filtering plus the user
-`--limit` are applied afterwards, so filtering can never starve visible
-results.
+never affect saves. Query paging asks the store for 200 candidates and
+applies channel/type/lifecycle filtering plus the user `--limit` afterwards.
+For real Engram, the adapter detects the 20-row backend cap and uses complete
+export recovery; an export failure is surfaced as incomplete retrieval metadata
+rather than a false "no match" result.
 
 All policy behavior is fully validated offline via mocked subprocess
 and mocked `urllib`; no server is required for the normal test suite.
