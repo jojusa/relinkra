@@ -27,6 +27,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -393,24 +394,95 @@ def _deterministic_newest_first(
     )
 
 
-def _export_query_matches(query: str, title: str, content: str) -> bool:
-    """Apply the complete-export search predicate conservatively.
+def _fts_tokens(query: str) -> List[str]:
+    """Split a query the way Engram's default ``unicode61`` tokenizer does.
 
-    Engram's public search surface exposes token-AND matching but no way to
-    page a result set.  Export has no query argument, so the fallback mirrors
-    the stable part of that predicate (case-insensitive token containment over
-    title + content).  The envelope parser and project/scope policy still run
-    after this filter, exactly as they do for backend search results.
+    ``unicode61`` treats punctuation (including ``_``) as a token boundary,
+    folds case, and removes diacritics.  Quoting each resulting token before
+    passing it to FTS5 makes operators such as ``OR`` ordinary terms and
+    prevents user input from changing the MATCH expression.
     """
-    tokens = [
-        token.casefold()
-        for token in re.findall(r"[A-Za-z0-9_]+", query or "")
-        if token
-    ]
-    if not tokens:
+    tokens: List[str] = []
+    current: List[str] = []
+    for char in query or "":
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _fts_match_query(query: str) -> Optional[str]:
+    """Build Engram's safe, whitespace-term-AND FTS5 MATCH expression.
+
+    Engram wraps each whitespace-delimited term as an FTS phrase.  Therefore
+    punctuation *inside* a term remains significant as an adjacency phrase
+    (``foo-bar``), while punctuation-only terms are discarded.  ``None``
+    means an actually empty query (match all); an empty string means a
+    nonblank query with no searchable terms (match none).
+    """
+    raw_query = query or ""
+    if not raw_query.strip():
+        return None
+    terms = []
+    for term in raw_query.split():
+        if not _fts_tokens(term):
+            continue
+        # Keep punctuation in the phrase so foo-bar requires adjacent foo,
+        # bar tokens, matching the backend's whitespace-term normalization.
+        terms.append('"' + term.replace('"', '""') + '"')
+    return " AND ".join(terms)
+
+
+def _export_query_matches(
+    query: str,
+    title: str,
+    content: str,
+    tool_name: str = "",
+    storage_type: str = "",
+    project: str = "",
+    topic_key: str = "",
+) -> bool:
+    """Apply Engram's complete-export FTS predicate to one record.
+
+    This compatibility helper intentionally uses the same six columns as
+    Engram 1.20's ``observations_fts`` table.  The export path batches rows in
+    one ephemeral database; keeping this helper separate also makes the
+    predicate easy to regression-test directly.
+    """
+    match_query = _fts_match_query(query)
+    if match_query is None:
         return True
-    haystack = f"{title}\n{content}".casefold()
-    return all(token in haystack for token in tokens)
+    if not match_query:
+        return False
+    try:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE VIRTUAL TABLE observations_fts USING fts5("
+                "title, content, tool_name, type, project, topic_key, "
+                "tokenize='unicode61')"
+            )
+            connection.execute(
+                "INSERT INTO observations_fts "
+                "(title, content, tool_name, type, project, topic_key) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (title, content, tool_name, storage_type, project, topic_key),
+            )
+            return connection.execute(
+                "SELECT 1 FROM observations_fts "
+                "WHERE observations_fts MATCH ? LIMIT 1",
+                (match_query,),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+    except Exception:
+        # The batched export path turns this into an honest incomplete read;
+        # this helper has no metadata channel and therefore fails closed.
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +553,8 @@ class EngramCLIAdapter:
             "backend_limit": None,
             "retrieval_scope": "backend_window",
             "retrieval_complete": True,
+            "retrieval_diagnostic": None,
+            "retrieval_diagnostics": [],
         }
         if http_url is None:
             if ENGRAM_URL_ENV in os.environ:
@@ -554,6 +628,8 @@ class EngramCLIAdapter:
             "backend_limit": None,
             "retrieval_scope": "backend_window",
             "retrieval_complete": True,
+            "retrieval_diagnostic": None,
+            "retrieval_diagnostics": [],
         }
         # project_alias rewrites the PHYSICAL store filter only; the R1C
         # policy layer still filters parsed envelopes by the logical
@@ -624,20 +700,36 @@ class EngramCLIAdapter:
         """
         if len(records) < ENGRAM_SEARCH_CAP:
             return records
-        exported = self._export_search(query, project, storage_type)
+        exported = self._export_search(
+            query, project, storage_type, authoritative_records=records
+        )
         if exported is not None:
-            self.last_search_metadata = {
-                "backend_window_complete": False,
-                "backend_limit": ENGRAM_SEARCH_CAP,
-                "retrieval_scope": "complete_export",
-                "retrieval_complete": True,
-            }
+            # _export_search may have had to reconcile records from the
+            # authoritative capped page.  Preserve that diagnostic rather
+            # than claiming a complete export when its matcher disagreed.
+            self.last_search_metadata.update(
+                {
+                    "backend_window_complete": False,
+                    "backend_limit": ENGRAM_SEARCH_CAP,
+                    "retrieval_scope": "complete_export",
+                    "retrieval_complete": self.last_search_metadata.get(
+                        "retrieval_complete", True
+                    ),
+                }
+            )
             return exported
         self.last_search_metadata = {
             "backend_window_complete": False,
             "backend_limit": ENGRAM_SEARCH_CAP,
             "retrieval_scope": "partial",
             "retrieval_complete": False,
+            "retrieval_diagnostic": self.last_search_metadata.get(
+                "retrieval_diagnostic"
+            )
+            or "complete_export_unavailable",
+            "retrieval_diagnostics": self.last_search_metadata.get(
+                "retrieval_diagnostics", []
+            ),
         }
         return records
 
@@ -646,6 +738,7 @@ class EngramCLIAdapter:
         query: str,
         project: Optional[str],
         storage_type: Optional[str],
+        authoritative_records: Optional[List[StoredRecord]] = None,
     ) -> Optional[List[StoredRecord]]:
         """Read and filter the complete Engram JSON export, if available.
 
@@ -664,6 +757,7 @@ class EngramCLIAdapter:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (MemoryStoreError, OSError, TypeError, ValueError):
+            self._set_retrieval_diagnostic("complete_export_unavailable")
             return None
         finally:
             try:
@@ -673,12 +767,14 @@ class EngramCLIAdapter:
 
         observations = payload.get("observations") if isinstance(payload, dict) else None
         if not isinstance(observations, list):
+            self._set_retrieval_diagnostic("complete_export_malformed")
             return None
 
-        records: List[StoredRecord] = []
+        candidates: List[Tuple[StoredRecord, Tuple[str, ...]]] = []
         for item in observations:
             if not isinstance(item, dict):
-                continue
+                self._set_retrieval_diagnostic("complete_export_malformed")
+                return None
             # Deleted observations are not search results.  Engram's export
             # schema has used both a timestamp and a boolean marker across
             # versions; accept either without assuming a migration shape.
@@ -692,25 +788,104 @@ class EngramCLIAdapter:
                 continue
             title = str(item.get("title") or "")
             content = str(item.get("content") or "")
-            if not _export_query_matches(query, title, content):
-                continue
-            records.append(
-                StoredRecord(
-                    record_id=str(item.get("id") or item.get("sync_id") or ""),
-                    storage_type=item_type,
-                    title=title,
-                    content=content,
-                    project=item_project,
-                    scope=str(item.get("scope") or ""),
-                    timestamp=str(
-                        item.get("timestamp")
-                        or item.get("created_at")
-                        or item.get("updated_at")
-                        or ""
+            record = StoredRecord(
+                record_id=str(item.get("id") or item.get("sync_id") or ""),
+                storage_type=item_type,
+                title=title,
+                content=content,
+                project=item_project,
+                scope=str(item.get("scope") or ""),
+                timestamp=str(
+                    item.get("timestamp")
+                    or item.get("created_at")
+                    or item.get("updated_at")
+                    or ""
+                ),
+            )
+            candidates.append(
+                (
+                    record,
+                    (
+                        title,
+                        content,
+                        str(item.get("tool_name") or item.get("source_tool") or ""),
+                        item_type,
+                        item_project,
+                        str(item.get("topic_key") or ""),
                     ),
                 )
             )
+
+        records = self._fts_filter_export(candidates, query)
+        if records is None:
+            self._set_retrieval_diagnostic("fts_unavailable")
+            return None
+
+        # The backend page is authoritative for every ID it returned.  An
+        # export may be stale, use a different id field, or expose a tokenizer
+        # mismatch.  Never silently drop those page records: union them and
+        # downgrade completeness so callers know the export was reconciled.
+        exported_ids = {record.record_id for record in records if record.record_id}
+        missing = [
+            record
+            for record in (authoritative_records or [])
+            if record.record_id and record.record_id not in exported_ids
+        ]
+        if missing:
+            records.extend(missing)
+            self.last_search_metadata["retrieval_complete"] = False
+            self._set_retrieval_diagnostic(
+                {
+                    "code": "backend_page_reconciled",
+                    "missing_backend_ids": [r.record_id for r in missing],
+                }
+            )
         return records
+
+    def _set_retrieval_diagnostic(self, diagnostic) -> None:
+        """Add an explicit, machine-readable retrieval honesty diagnostic."""
+        diagnostics = self.last_search_metadata.setdefault(
+            "retrieval_diagnostics", []
+        )
+        if diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+        if self.last_search_metadata.get("retrieval_diagnostic") is None:
+            self.last_search_metadata["retrieval_diagnostic"] = diagnostic
+
+    @staticmethod
+    def _fts_filter_export(
+        candidates: List[Tuple[StoredRecord, Tuple[str, ...]]], query: str
+    ) -> Optional[List[StoredRecord]]:
+        """Filter export rows with a temporary Engram-compatible FTS5 table."""
+        match_query = _fts_match_query(query)
+        if match_query is None:
+            return [record for record, _fields in candidates]
+        if not match_query:
+            return []
+        try:
+            connection = sqlite3.connect(":memory:")
+            try:
+                connection.execute(
+                    "CREATE VIRTUAL TABLE observations_fts USING fts5("
+                    "title, content, tool_name, type, project, topic_key, "
+                    "tokenize='unicode61')"
+                )
+                connection.executemany(
+                    "INSERT INTO observations_fts "
+                    "(title, content, tool_name, type, project, topic_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (fields for _record, fields in candidates),
+                )
+                rows = connection.execute(
+                    "SELECT rowid FROM observations_fts "
+                    "WHERE observations_fts MATCH ?",
+                    (match_query,),
+                ).fetchall()
+                return [candidates[int(row[0]) - 1][0] for row in rows]
+            finally:
+                connection.close()
+        except Exception:
+            return None
 
     @staticmethod
     def _filtered(

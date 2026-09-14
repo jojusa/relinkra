@@ -489,6 +489,10 @@ class QueryResult:
     backend_limit: Optional[int] = None
     retrieval_scope: str = "backend_window"
     retrieval_complete: bool = True
+    #: Machine-readable details explaining an incomplete or reconciled
+    #: retrieval.  Adapters may leave these empty for ordinary backend pages.
+    retrieval_diagnostic: Any = None
+    retrieval_diagnostics: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -500,6 +504,8 @@ class QueryResult:
             "backend_limit": self.backend_limit,
             "retrieval_scope": self.retrieval_scope,
             "retrieval_complete": self.retrieval_complete,
+            "retrieval_diagnostic": self.retrieval_diagnostic,
+            "retrieval_diagnostics": list(self.retrieval_diagnostics),
         }
 
 
@@ -781,6 +787,12 @@ class MemoryService:
                 retrieval.get("retrieval_scope", "backend_window")
             ),
             retrieval_complete=bool(retrieval.get("retrieval_complete", True)),
+            retrieval_diagnostic=retrieval.get("retrieval_diagnostic"),
+            retrieval_diagnostics=(
+                list(retrieval.get("retrieval_diagnostics", []))
+                if isinstance(retrieval.get("retrieval_diagnostics", []), list)
+                else [retrieval.get("retrieval_diagnostics")]
+            ),
         )
 
     def get(

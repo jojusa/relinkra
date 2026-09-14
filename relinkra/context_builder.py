@@ -871,6 +871,12 @@ class ContextBuilder:
     @staticmethod
     def _record_retrieval_metadata(result, diagnostics, warnings) -> None:
         """Carry backend completeness honestly into ContextPacket diagnostics."""
+        detail = getattr(result, "retrieval_diagnostic", None)
+        details = getattr(result, "retrieval_diagnostics", None) or []
+        if detail is not None:
+            diagnostics["retrieval_diagnostic"] = detail
+        if details:
+            diagnostics["retrieval_diagnostics"] = list(details)
         if getattr(result, "retrieval_complete", True):
             return
         diagnostics["retrieval_complete"] = False

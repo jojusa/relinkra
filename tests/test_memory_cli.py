@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import shutil
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ from relinkra.engram_adapter import (
     EngramCLIAdapter,
     InMemoryStore,
     _close_all_loopbacks,
+    _export_query_matches,
     parse_save_output,
     parse_search_output,
 )
@@ -253,6 +255,150 @@ class TestEngramCLIAdapter(unittest.TestCase):
         self.assertEqual(len(records), 20)
         self.assertEqual(adapter.last_search_metadata["retrieval_scope"], "partial")
         self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
+
+    def test_export_fts_matches_type_and_project_columns(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(
+                    stdout=capped_search_output().replace(
+                        "(decision)", "(bugfix)"
+                    )
+                )
+            observations = export_observations()
+            for item in observations:
+                item["type"] = "bugfix"
+                item["title"] = "unrelated title"
+                item["content"] = "unrelated body"
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": observations}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            records = adapter.search_records(
+                query="bugfix", project=PID, limit=50
+            )
+        self.assertEqual(len(records), 50)
+        self.assertTrue(adapter.last_search_metadata["retrieval_complete"])
+
+        # The project column is searchable too, even when title/body do not
+        # contain the project id.
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            records = adapter.search_records(query=PID, project=PID, limit=50)
+        self.assertEqual(len(records), 50)
+        self.assertTrue(adapter.last_search_metadata["retrieval_complete"])
+
+    def test_export_fts_uses_exact_tokens_and_unicode61_diacritics(self):
+        self.assertFalse(_export_query_matches("fix", "", "bugfix"))
+        self.assertFalse(_export_query_matches("cap", "", "recapture"))
+        self.assertTrue(_export_query_matches("foo", "foo_bar", ""))
+        self.assertTrue(_export_query_matches("foo-bar", "foo-bar", ""))
+        self.assertFalse(_export_query_matches("foo-bar", "foo x bar", ""))
+        self.assertTrue(_export_query_matches("foo . bar", "foo x bar", ""))
+        self.assertTrue(_export_query_matches("cafe", "Café", ""))
+        self.assertTrue(
+            _export_query_matches("topic-token", "", "", topic_key="topic-token")
+        )
+        self.assertTrue(
+            _export_query_matches("tool-token", "", "", tool_name="tool-token")
+        )
+        self.assertFalse(_export_query_matches("alpha OR beta", "alpha beta", ""))
+        self.assertFalse(_export_query_matches("...", "anything", ""))
+
+    def test_export_reconciles_backend_ids_and_downgrades_completeness(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            observations = export_observations(count=19)
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": observations}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            records = adapter.search_records(query="r6hcap", project=PID, limit=50)
+        self.assertEqual({r.record_id for r in records}, {str(i) for i in range(1, 20 + 1)})
+        self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
+        diagnostic = adapter.last_search_metadata["retrieval_diagnostic"]
+        self.assertEqual(diagnostic["code"], "backend_page_reconciled")
+        self.assertEqual(diagnostic["missing_backend_ids"], ["20"])
+
+    def test_export_reconciles_backend_match_rejected_by_local_matcher(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            observations = export_observations()
+            # Keep the backend page's id=20 but make its exported fields fail
+            # the local predicate. The authoritative page record must still
+            # survive, with completeness downgraded rather than hidden.
+            observations[19]["title"] = "unrelated title"
+            observations[19]["content"] = "unrelated body"
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": observations}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            records = adapter.search_records(query="r6hcap", project=PID, limit=50)
+        self.assertIn("20", {record.record_id for record in records})
+        self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
+        self.assertEqual(
+            adapter.last_search_metadata["retrieval_diagnostic"]["code"],
+            "backend_page_reconciled",
+        )
+
+    def test_export_malformed_payload_is_explicitly_partial(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": [{"id": 1}, "not-an-object"]}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ):
+            adapter.search_records(query="r6hcap", project=PID, limit=50)
+        self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
+        self.assertEqual(
+            adapter.last_search_metadata["retrieval_diagnostic"],
+            "complete_export_malformed",
+        )
+
+    def test_export_fts_unavailable_is_explicitly_partial(self):
+        adapter = self.make_adapter()
+
+        def run(command, **_kwargs):
+            if command[1] == "search":
+                return FakeCompleted(stdout=capped_search_output())
+            with open(command[2], "w", encoding="utf-8") as handle:
+                json.dump({"observations": export_observations()}, handle)
+            return FakeCompleted(stdout="Exported")
+
+        with mock.patch(
+            "relinkra.engram_adapter.subprocess.run", side_effect=run
+        ), mock.patch(
+            "relinkra.engram_adapter.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("fts5 unavailable"),
+        ):
+            adapter.search_records(query="r6hcap", project=PID, limit=50)
+        self.assertFalse(adapter.last_search_metadata["retrieval_complete"])
+        self.assertEqual(
+            adapter.last_search_metadata["retrieval_diagnostic"], "fts_unavailable"
+        )
 
     def test_nonzero_exit_raises_sanitized(self):
         adapter = self.make_adapter()

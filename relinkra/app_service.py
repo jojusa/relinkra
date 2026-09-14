@@ -865,6 +865,8 @@ class RelinkraServices:
             "backend_limit": result.backend_limit,
             "retrieval_scope": result.retrieval_scope,
             "retrieval_complete": result.retrieval_complete,
+            "retrieval_diagnostic": result.retrieval_diagnostic,
+            "retrieval_diagnostics": list(result.retrieval_diagnostics),
             "memories": explained_memories,
             "explainability": {
                 "as_of": freshness_context.as_of,
