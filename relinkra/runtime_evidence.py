@@ -57,6 +57,7 @@ again; there is no migration step.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
@@ -136,6 +137,25 @@ REVISION_LENGTH = 12
 #: when a holder dies, so an abandoned writer cannot wedge this.
 EVIDENCE_LOCK_TIMEOUT_SECONDS = 5.0
 
+# Handoff identifiers are correlation material, not evidence payload.  Keep
+# only a bounded one-way digest so runtime state cannot disclose the id (or
+# anything reachable through it) while still allowing a create/get pair to
+# be matched.
+HANDOFF_FINGERPRINT_LENGTH = 16
+HANDOFF_FINGERPRINT_KEY = "handoff_id_fingerprint"
+MAX_HANDOFF_FINGERPRINTS = 32
+
+
+def handoff_id_fingerprint(handoff_id: Optional[str]) -> str:
+    """Return a bounded, one-way correlation token for a handoff id."""
+    if not isinstance(handoff_id, str) or not handoff_id.strip():
+        return ""
+    digest = hashlib.sha256(
+        b"relinkra/runtime-evidence/handoff/v1\x00"
+        + handoff_id.strip().encode("utf-8", "ignore")
+    ).hexdigest()
+    return digest[:HANDOFF_FINGERPRINT_LENGTH]
+
 
 def _utc_now() -> str:
     from datetime import datetime, timezone
@@ -173,6 +193,30 @@ def revision_relation(evidence_revision: str, current_revision: str) -> str:
     if evidence_revision == current_revision:
         return "current"
     return "older"
+
+
+def identity_relation(
+    evidence: Mapping[str, Any],
+    current_project_id: str = "",
+    current_workspace_id: str = "",
+) -> str:
+    """Classify immutable project/workspace binding for one event.
+
+    Missing pins are legacy/unbound, never inferred from the current cwd.
+    Any mismatch is foreign (not merely stale). A current claim requires
+    both ids and both exact matches.
+    """
+    project = str(evidence.get("project_id") or "").strip()
+    workspace = str(evidence.get("workspace_id") or "").strip()
+    current_project_id = str(current_project_id or "").strip()
+    current_workspace_id = str(current_workspace_id or "").strip()
+    if not project or not workspace:
+        return "unbound"
+    if not current_project_id or not current_workspace_id:
+        return "unknown"
+    if project != current_project_id or workspace != current_workspace_id:
+        return "foreign"
+    return "current"
 
 
 def resolve_host_id(raw: Optional[str]) -> str:
@@ -266,6 +310,7 @@ def normalize_store(data: Any) -> dict:
 
 def _normalize_bucket(bucket: Any) -> dict:
     events: Dict[str, Any] = {}
+    normalized: Dict[str, Any] = {"events": events}
     if isinstance(bucket, dict):
         events_raw = bucket.get("events")
         if isinstance(events_raw, dict):
@@ -273,7 +318,11 @@ def _normalize_bucket(bucket: Any) -> dict:
                 if event not in EVENTS:
                     continue
                 events[event] = _normalize_entry(entry)
-    return {"events": events}
+        for key in ("project_id", "workspace_id"):
+            value = bucket.get(key)
+            if isinstance(value, str) and value:
+                normalized[key] = value[:MAX_DETAIL_CHARS]
+    return normalized
 
 
 def _normalize_entry(entry: Any) -> dict:
@@ -295,12 +344,36 @@ def _normalize_entry(entry: Any) -> dict:
         for key, value in detail.items():
             if not isinstance(key, str) or not key:
                 continue
+            if key in ("handoff_id", "id"):
+                # A handoff id in a pre-R6I file is not trusted and must not
+                # be carried forward in clear text.
+                continue
+            if key == HANDOFF_FINGERPRINT_KEY:
+                if isinstance(value, str) and value:
+                    clean[key] = [value[:HANDOFF_FINGERPRINT_LENGTH]]
+                elif isinstance(value, list):
+                    clean[key] = [
+                        item[:HANDOFF_FINGERPRINT_LENGTH]
+                        for item in value
+                        if isinstance(item, str) and item
+                    ][:MAX_HANDOFF_FINGERPRINTS]
+                continue
             if isinstance(value, bool):
                 clean[key[:MAX_DETAIL_CHARS]] = value
             elif isinstance(value, str):
                 clean[key[:MAX_DETAIL_CHARS]] = value[:MAX_DETAIL_CHARS]
         if clean:
             normalized["detail"] = clean
+    # Identity is attached to every new entry.  Missing values are retained
+    # as absent so legacy evidence remains readable but is never eligible for
+    # identity-bound claims.
+    for key in ("project_id", "workspace_id"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            normalized[key] = value[:MAX_DETAIL_CHARS]
+    host_id = entry.get("host_id")
+    if isinstance(host_id, str) and host_id:
+        normalized["host_id"] = host_id[:MAX_DETAIL_CHARS]
     return normalized
 
 
@@ -412,13 +485,40 @@ def _ignores_relinkra(text: str) -> bool:
     return False
 
 
-def _sanitize_detail(detail: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _sanitize_detail(
+    detail: Optional[Mapping[str, Any]], event: Optional[str] = None
+) -> Dict[str, Any]:
     if not detail:
         return {}
     clean: Dict[str, Any] = {}
     for key, value in detail.items():
         if not isinstance(key, str) or not key:
             continue
+        # Never persist the handoff id itself.  It is only accepted on the
+        # two handoff route events and reduced to a non-reversible token.
+        if event in (EVENT_HANDOFF_CREATE_CALLED, EVENT_HANDOFF_GET_CALLED):
+            if key in ("handoff_id", "id", "handoff_ids"):
+                raw_values = value if isinstance(value, (list, tuple)) else [value]
+                fingerprints = [
+                    handoff_id_fingerprint(item)
+                    for item in raw_values
+                ]
+                fingerprints = [item for item in fingerprints if item]
+                if fingerprints:
+                    clean[HANDOFF_FINGERPRINT_KEY] = fingerprints[
+                        :MAX_HANDOFF_FINGERPRINTS
+                    ]
+                continue
+            if key == HANDOFF_FINGERPRINT_KEY and isinstance(value, str):
+                clean[key] = [value[:HANDOFF_FINGERPRINT_LENGTH]]
+                continue
+            if key == HANDOFF_FINGERPRINT_KEY and isinstance(value, (list, tuple)):
+                clean[key] = [
+                    item[:HANDOFF_FINGERPRINT_LENGTH]
+                    for item in value
+                    if isinstance(item, str) and item
+                ][:MAX_HANDOFF_FINGERPRINTS]
+                continue
         if isinstance(value, bool):
             clean[key[:MAX_DETAIL_CHARS]] = value
         elif isinstance(value, str):
@@ -507,12 +607,22 @@ class EvidenceRecorder:
         clock: Optional[Callable[[], str]] = None,
         revision: Optional[str] = None,
         lock_timeout: Optional[float] = EVIDENCE_LOCK_TIMEOUT_SECONDS,
+        project_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ):
         self.workspace_root = str(workspace_root) if workspace_root else None
         self.host_id = resolve_host_id(host_id)
         self._clock = clock or _utc_now
         self._revision = short_revision(revision)
         self._lock_timeout = lock_timeout
+        self._explicit_pin = {
+            key: value[:MAX_DETAIL_CHARS]
+            for key, value in (
+                ("project_id", project_id),
+                ("workspace_id", workspace_id),
+            )
+            if isinstance(value, str) and value.strip()
+        }
         self._pin: Optional[Dict[str, str]] = None
         self._pin_loaded = False
         self._exclude_checked = False
@@ -532,6 +642,9 @@ class EvidenceRecorder:
         if self._pin_loaded:
             return self._pin or {}
         self._pin_loaded = True
+        if self._explicit_pin:
+            self._pin = dict(self._explicit_pin)
+            return self._pin
         if not self.workspace_root:
             return {}
         try:
@@ -595,16 +708,45 @@ class EvidenceRecorder:
         entry = events.get(event) if isinstance(events.get(event), dict) else {}
         entry["observed_at"] = self._clock()
         entry["revision"] = self._revision
+        entry["host_id"] = self.bucket_id
         try:
             entry["count"] = max(1, min(int(entry.get("count", 0)) + 1, MAX_COUNT))
         except (TypeError, ValueError):
             entry["count"] = 1
-        clean_detail = _sanitize_detail(detail)
+        clean_detail = _sanitize_detail(detail, event)
+        if event in (EVENT_HANDOFF_CREATE_CALLED, EVENT_HANDOFF_GET_CALLED):
+            previous = (entry.get("detail") or {}).get(HANDOFF_FINGERPRINT_KEY, [])
+            if isinstance(previous, str):
+                previous = [previous]
+            current = clean_detail.get(HANDOFF_FINGERPRINT_KEY, [])
+            if isinstance(current, str):
+                current = [current]
+            merged = []
+            for fingerprint in list(previous or []) + list(current or []):
+                if (
+                    isinstance(fingerprint, str)
+                    and fingerprint
+                    and fingerprint not in merged
+                ):
+                    merged.append(fingerprint[:HANDOFF_FINGERPRINT_LENGTH])
+            if merged:
+                clean_detail[HANDOFF_FINGERPRINT_KEY] = merged[
+                    -MAX_HANDOFF_FINGERPRINTS:
+                ]
         if clean_detail:
             entry["detail"] = clean_detail
         else:
             entry.pop("detail", None)
         events[event] = entry
+
+        # Bind the observation itself, not merely its containing host file.
+        # A file can outlive a workspace re-registration and different events
+        # can have been written before/after that change.
+        for key, value in self._workspace_pin().items():
+            entry[key] = value
+        for key in ("project_id", "workspace_id"):
+            if key not in self._workspace_pin():
+                entry.pop(key, None)
 
         data["updated_at"] = self._clock()
         for key, value in self._workspace_pin().items():
@@ -776,6 +918,8 @@ def build_evidence_recorder(
     host_id: Optional[str],
     *,
     revision: Optional[str] = None,
+    project_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> Optional[EvidenceRecorder]:
     """Recorder for an MCP server process, or None without a workspace.
 
@@ -797,6 +941,8 @@ def build_evidence_recorder(
         workspace_root,
         host_id or "",
         revision=resolved_revision,
+        project_id=project_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -810,8 +956,9 @@ class HostRuntime:
     """One host bucket's self-observed evidence, classified for doctor."""
 
     host_id: str
-    state: str  # "observed" | "stale" | "unknown" | "pending"
+    state: str  # "observed" | "stale" | "foreign" | "unbound" | "unknown" | "pending"
     revision_relation: str  # "current" | "older" | "unknown" | ""
+    identity_relation: str  # "current" | "foreign" | "unbound" | "unknown" | ""
     last_observed_at: str
     revision: str
     events: Mapping[str, dict] = field(default_factory=dict)
@@ -821,6 +968,7 @@ class HostRuntime:
             "host_id": self.host_id,
             "state": self.state,
             "revision_relation": self.revision_relation,
+            "identity_relation": self.identity_relation,
             "last_observed_at": self.last_observed_at,
             "revision": self.revision,
             "events": dict(self.events),
@@ -828,7 +976,12 @@ class HostRuntime:
         }
 
 
-def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRuntime:
+def _host_state(
+    entries: Mapping[str, dict],
+    current_revision: str,
+    current_project_id: str = "",
+    current_workspace_id: str = "",
+) -> HostRuntime:
     """Classify one bucket.
 
     Current-revision evidence dominates and is ``observed``. When the
@@ -842,24 +995,49 @@ def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRunti
     if not entries:
         return HostRuntime(
             host_id="", state="pending", revision_relation="",
-            last_observed_at="", revision="", events={},
+            identity_relation="", last_observed_at="", revision="", events={},
         )
     latest_at = ""
     latest_revision = ""
     seen_current = False
     seen_unknown = False
+    seen_foreign = False
+    seen_unbound = False
+    seen_identity_unknown = False
+    seen_current_identity = False
+    identity_required = bool(current_project_id or current_workspace_id)
     for entry in entries.values():
         observed_at = str(entry.get("observed_at") or "")
         if observed_at > latest_at:
             latest_at = observed_at
             latest_revision = short_revision(entry.get("revision"))
         relation = revision_relation(entry.get("revision"), current_revision)
-        if relation == "current":
+        binding = identity_relation(entry, current_project_id, current_workspace_id)
+        if binding == "unbound" and not identity_required:
+            # Compatibility for pre-init diagnostics: without any current
+            # project/workspace pin there is no identity to compare. This
+            # mode never applies once a workspace pin is available.
+            binding = "current"
+        if binding == "current":
+            seen_current_identity = True
+        elif binding == "foreign":
+            seen_foreign = True
+        elif binding == "unbound":
+            seen_unbound = True
+        elif binding == "unknown":
+            seen_identity_unknown = True
+        if relation == "current" and binding == "current":
             seen_current = True
-        elif relation == "unknown":
+        elif relation == "unknown" and binding == "current":
             seen_unknown = True
     if seen_current:
         state, relation = "observed", "current"
+    elif seen_foreign:
+        state, relation = "foreign", "foreign"
+    elif seen_unbound:
+        state, relation = "unbound", "unbound"
+    elif seen_identity_unknown:
+        state, relation = "unknown", "unknown"
     elif seen_unknown:
         state, relation = "unknown", "unknown"
     else:
@@ -868,6 +1046,12 @@ def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRunti
         host_id="",
         state=state,
         revision_relation=relation,
+        identity_relation=(
+            "current" if seen_current_identity else
+            "foreign" if seen_foreign else
+            "unbound" if seen_unbound else
+            "unknown" if seen_identity_unknown else ""
+        ),
         last_observed_at=latest_at,
         revision=latest_revision,
         events=dict(entries),
@@ -875,13 +1059,27 @@ def _host_state(entries: Mapping[str, dict], current_revision: str) -> HostRunti
 
 
 def summarize_runtime_evidence(
-    workspace_root: Optional[str], current_revision: str = ""
+    workspace_root: Optional[str],
+    current_revision: str = "",
+    *,
+    current_project_id: str = "",
+    current_workspace_id: str = "",
 ) -> dict:
     """Everything doctor needs about self-observed evidence, read-only.
 
     The result is plain data (dicts of primitives) so it can ride inside
     the routing assessment payload unchanged.
     """
+    if workspace_root and not (current_project_id and current_workspace_id):
+        try:
+            from .product_cli import WorkspaceConfig
+
+            config = WorkspaceConfig.load(workspace_root)
+            if config is not None:
+                current_project_id = str(config.project_id or "")
+                current_workspace_id = str(config.workspace_id or "")
+        except Exception:
+            pass
     invalid = _store_invalid(workspace_root)
     loaded = load_store(workspace_root)
     if loaded is None:
@@ -890,12 +1088,19 @@ def summarize_runtime_evidence(
         return {
             "present": False,
             "invalid": invalid,
+            "current_project_id": current_project_id,
+            "current_workspace_id": current_workspace_id,
             "hosts": {},
         }
     hosts: Dict[str, dict] = {}
     for host_id, bucket in loaded.get("hosts", {}).items():
         entries = bucket.get("events") or {}
-        runtime = _host_state(entries, current_revision)
+        runtime = _host_state(
+            entries,
+            current_revision,
+            current_project_id,
+            current_workspace_id,
+        )
         summary = runtime.to_dict()
         summary["host_id"] = host_id
         for key in ("project_id", "workspace_id"):
@@ -907,6 +1112,8 @@ def summarize_runtime_evidence(
         "present": bool(hosts),
         "invalid": invalid,
         "current_revision": short_revision(current_revision),
+        "current_project_id": current_project_id,
+        "current_workspace_id": current_workspace_id,
         "hosts": hosts,
     }
 
@@ -940,116 +1147,95 @@ def _event_any_revision(entries: Mapping[str, dict]) -> bool:
     return bool(entries)
 
 
-def runtime_stage_claims(summary: dict, current_revision: str = "") -> dict:
-    """Map self-observed evidence onto the trust ladder's host-side rungs.
-
-    ``current_revision`` binds the "current" classification; when empty,
-    the revision recorded in the summary itself is used, so a summary
-    produced by :func:`summarize_runtime_evidence` is self-contained.
-    The result is ``{claim: (achieved, evidence)}`` where ``achieved`` is
-    True only for what was directly observed on the current revision. The
-    one deliberate exception is the server-start claim: a launch is a
-    fact about the host's history, so historical evidence still proves
-    it — with the revision relation named in the evidence string. When
-    the current revision cannot be read, only the launch claim survives:
-    "unknown" evidence never proves current-revision stages.
-
-    Claims from the ``host_unknown`` bucket are included here: the ladder
-    speaks for the workspace, and "some process launched Relinkra and
-    served a route" is true even when the launcher never identified
-    itself. Per-host attribution (the agents table) never reads unknown
-    evidence into a named host.
-    """
+def runtime_stage_claims(
+    summary: dict,
+    current_revision: str = "",
+    *,
+    current_project_id: str = "",
+    current_workspace_id: str = "",
+) -> dict:
+    """Map only correctly-bound current runtime evidence onto trust stages."""
+    summary = summary or {}
     if not current_revision:
-        current_revision = str((summary or {}).get("current_revision") or "")
-    hosts = (summary or {}).get("hosts") or {}
+        current_revision = str(summary.get("current_revision") or "")
+    current_project_id = str(
+        current_project_id or summary.get("current_project_id") or ""
+    )
+    current_workspace_id = str(
+        current_workspace_id or summary.get("current_workspace_id") or ""
+    )
+    identity_required = bool(current_project_id or current_workspace_id)
+    hosts = summary.get("hosts") or {}
     claims: Dict[str, Any] = {}
 
-    def _buckets() -> "list[tuple[str, Mapping[str, dict]]]":
-        return [
-            (host_id, (bucket or {}).get("events") or {})
-            for host_id, bucket in sorted(hosts.items())
-        ]
+    def entries_for(event: str, *, current_only: bool = True):
+        found = []
+        for host_id, bucket in sorted(hosts.items()):
+            entry = ((bucket or {}).get("events") or {}).get(event) or {}
+            if not isinstance(entry, dict):
+                continue
+            binding = identity_relation(
+                entry, current_project_id, current_workspace_id
+            )
+            if binding == "unbound" and not identity_required:
+                binding = "current"
+            relation = revision_relation(entry.get("revision"), current_revision)
+            if current_only and (binding != "current" or relation != "current"):
+                continue
+            found.append((host_id, entry, binding, relation))
+        return sorted(found, key=lambda item: (str(item[1].get("observed_at") or ""), item[0]))
 
-    def _claim(key: str, achieved: bool, evidence: str) -> None:
-        if achieved:
-            claims[key] = (True, evidence)
-
-    def _label(host_id: str) -> str:
+    def label(host_id: str) -> str:
         return host_id if host_id != HOST_UNKNOWN else "host identity unknown"
 
-    started = [
-        (_label(host_id), bucket.get(EVENT_MCP_SERVER_STARTED) or {})
-        for host_id, bucket in _buckets()
-    ]
-    started = [(label, entry) for label, entry in started if entry]
+    started = []
+    for host_id, bucket in sorted(hosts.items()):
+        entry = ((bucket or {}).get("events") or {}).get(EVENT_MCP_SERVER_STARTED) or {}
+        if isinstance(entry, dict) and entry:
+            binding = identity_relation(entry, current_project_id, current_workspace_id)
+            if binding == "unbound" and not identity_required:
+                binding = "current"
+            relation = revision_relation(entry.get("revision"), current_revision)
+            if binding == "current":
+                started.append((host_id, entry, relation))
     if started:
-        label, entry = started[0]
-        relation = revision_relation(entry.get("revision"), current_revision)
-        relation_note = (
-            f"on revision {entry.get('revision') or 'unknown'}"
-            if relation != "current"
-            else "on the current revision"
-        )
-        _claim(
-            "server_started",
+        host_id, entry, relation = sorted(
+            started, key=lambda item: (str(item[1].get("observed_at") or ""), item[0])
+        )[-1]
+        relation_note = "on the current revision" if relation == "current" else f"on revision {entry.get('revision') or 'unknown'}"
+        claims["server_started"] = (
             True,
-            f"self-observed Relinkra server start ({label}, {relation_note}, "
+            f"self-observed Relinkra server start ({label(host_id)}, {relation_note}, "
             f"{entry.get('observed_at') or 'time unknown'})",
         )
 
-    initialize = [
-        (_label(host_id), bucket.get(EVENT_INITIALIZE_OBSERVED) or {})
-        for host_id, bucket in _buckets()
-    ]
-    initialize = [(label, entry) for label, entry in initialize if entry]
-    if initialize:
-        label, entry = initialize[0]
+    handshake = entries_for(EVENT_INITIALIZE_OBSERVED)
+    if handshake:
+        host_id, entry, _, _ = handshake[-1]
+        claims["handshake"] = (
+            True,
+            f"self-observed initialize handshake ({label(host_id)}, revision {entry.get('revision') or 'unknown'})",
+        )
         detail = entry.get("detail") or {}
-        if _event_on_current_revision({EVENT_INITIALIZE_OBSERVED: entry}, current_revision):
-            _claim(
-                "handshake",
+        if detail.get("protocol_agreed") is True:
+            claims["protocol_agreed"] = (
                 True,
-                f"self-observed initialize handshake ({label}, revision "
-                f"{entry.get('revision') or 'unknown'}, {entry.get('observed_at') or 'time unknown'})",
-            )
-            if detail.get("protocol_agreed") is True:
-                _claim(
-                    "protocol_agreed",
-                    True,
-                    "self-observed handshake agreed protocol version "
-                    f"{detail.get('protocol_negotiated') or 'unknown'} ({label})",
-                )
-
-    tools_list = [
-        (_label(host_id), bucket.get(EVENT_TOOLS_LIST_OBSERVED) or {})
-        for host_id, bucket in _buckets()
-    ]
-    tools_list = [(label, entry) for label, entry in tools_list if entry]
-    if tools_list:
-        label, entry = tools_list[0]
-        if _event_on_current_revision({EVENT_TOOLS_LIST_OBSERVED: entry}, current_revision):
-            _claim(
-                "tools_visible",
-                True,
-                f"self-observed tools/list served to a connected host ({label}, "
-                f"revision {entry.get('revision') or 'unknown'})",
+                f"self-observed handshake agreed protocol version {detail.get('protocol_negotiated') or 'unknown'} ({label(host_id)})",
             )
 
-    invoked = [
-        (_label(host_id), bucket.get(EVENT_TOOL_INVOKED) or {})
-        for host_id, bucket in _buckets()
-    ]
-    invoked = [(label, entry) for label, entry in invoked if entry]
-    if invoked:
-        label, entry = invoked[0]
-        if _event_on_current_revision({EVENT_TOOL_INVOKED: entry}, current_revision):
-            tool = (entry.get("detail") or {}).get("tool") or "a tool"
-            _claim(
-                "tool_invoked",
+    for event, key, text in (
+        (EVENT_TOOLS_LIST_OBSERVED, "tools_visible", "tools/list served to a connected host"),
+        (EVENT_TOOL_INVOKED, "tool_invoked", "successful tool call"),
+    ):
+        seen = entries_for(event)
+        if seen:
+            host_id, entry, _, _ = seen[-1]
+            suffix = ""
+            if event == EVENT_TOOL_INVOKED:
+                suffix = f" {(entry.get('detail') or {}).get('tool') or 'a tool'}"
+            claims[key] = (
                 True,
-                f"self-observed successful tool call ({tool}, {label}, "
-                f"revision {entry.get('revision') or 'unknown'})",
+                f"self-observed {text}{suffix} ({label(host_id)}, revision {entry.get('revision') or 'unknown'})",
             )
 
     for event, key in (
@@ -1058,34 +1244,37 @@ def runtime_stage_claims(summary: dict, current_revision: str = "") -> dict:
         (EVENT_HANDOFF_CREATE_CALLED, "handoff_create"),
         (EVENT_HANDOFF_GET_CALLED, "handoff_get"),
     ):
-        seen = [
-            (_label(host_id), bucket.get(event) or {})
-            for host_id, bucket in _buckets()
-        ]
-        seen = [(label, entry) for label, entry in seen if entry]
+        seen = entries_for(event)
         if seen:
-            label, entry = seen[0]
-            if _event_on_current_revision({event: entry}, current_revision):
-                _claim(
-                    key,
-                    True,
-                    f"self-observed {event.replace('_', ' ')} ({label}, "
-                    f"revision {entry.get('revision') or 'unknown'})",
-                )
+            host_id, entry, _, _ = seen[-1]
+            claims[key] = (
+                True,
+                f"self-observed {event.replace('_', ' ')} ({label(host_id)}, revision {entry.get('revision') or 'unknown'})",
+            )
 
-    # Both halves observed on the current revision. No handoff-id
-    # correlation is persisted, so the honest wording is "write and read
-    # served": the server observed a write route and a read route. It
-    # did NOT correlate one write with one read-back of that write
-    # (R6E) — only an operator proof asserts an actual round trip.
-    create = claims.get("handoff_create")
-    fetch = claims.get("handoff_get")
-    if create and create[0] and fetch and fetch[0]:
+    creates = entries_for(EVENT_HANDOFF_CREATE_CALLED)
+    gets = entries_for(EVENT_HANDOFF_GET_CALLED)
+    def fingerprints(entry: Mapping[str, Any]):
+        raw = ((entry.get("detail") or {}).get(HANDOFF_FINGERPRINT_KEY) or [])
+        if isinstance(raw, str):
+            raw = [raw]
+        return raw if isinstance(raw, (list, tuple)) else []
+
+    created_ids = {
+        fingerprint
+        for _, entry, _, _ in creates
+        for fingerprint in fingerprints(entry)
+    }
+    retrieved_ids = {
+        fingerprint
+        for _, entry, _, _ in gets
+        for fingerprint in fingerprints(entry)
+    }
+    if created_ids & retrieved_ids:
         claims["handoff_round_trip"] = (
             True,
-            f"self-observed handoff write and read served; {create[1]}; {fetch[1]}",
+            "self-observed correlated handoff create/read for the same handoff under the current project/workspace and revision",
         )
-
     return claims
 
 

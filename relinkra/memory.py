@@ -784,6 +784,18 @@ class MemoryService:
         channels = self._visible_channels(scope, workspace_id, agent_type)
 
         search_text = (text or "").strip() or ENVELOPE_VERSION
+        needs_head_validation = not include_history and bool((text or "").strip())
+        head_records = None
+        head_retrieval = {}
+        if needs_head_validation:
+            # Fetch lifecycle heads before the caller's text query so the
+            # backend-facing query remains the requested/narrow predicate.
+            head_records = self.store.search_records(
+                query=ENVELOPE_VERSION,
+                project=project_id,
+                limit=STORE_PAGE_LIMIT,
+            )
+            head_retrieval = getattr(self.store, "last_search_metadata", {}) or {}
         # Request a fixed, sufficiently large store page independent of the
         # user limit; filtering below must not starve visible results.
         records = self.store.search_records(
@@ -801,6 +813,53 @@ class MemoryService:
             visible = [m for m in visible if m.memory_type == memory_type]
         if not include_handoff_mirrors:
             visible = [m for m in visible if m.memory_type != "handoff"]
+        if (
+            not include_history
+            and not needs_head_validation
+            and not bool(retrieval.get("retrieval_complete", True))
+        ):
+            # The match-all candidate page is itself the head view in this
+            # mode; a partial page cannot safely establish current state.
+            visible = []
+        # A text-narrow current query cannot decide lifecycle from its
+        # candidate page alone: a successor may not contain the searched
+        # text. Resolve all candidate logical heads in one bounded retrieval
+        # before returning any current result. If that head view is partial,
+        # fail closed rather than presenting a possibly superseded memory as
+        # current. Historical queries intentionally retain their existing
+        # candidate-window semantics and exact gets remain addressable.
+        if needs_head_validation and visible:
+            head_memories, head_malformed, head_truncated = self._parse_envelopes(
+                head_records or [], project_id
+            )
+            retrieval_complete = bool(
+                retrieval.get("retrieval_complete", True)
+            ) and bool(head_retrieval.get("retrieval_complete", True))
+            if not retrieval_complete:
+                visible = []
+            else:
+                head_visible = [
+                    m for m in head_memories if m.scope_channel in channels
+                ]
+                if memory_type:
+                    head_visible = [m for m in head_visible if m.memory_type == memory_type]
+                if not include_handoff_mirrors:
+                    head_visible = [m for m in head_visible if m.memory_type != "handoff"]
+                active_ids = {
+                    m.memory_id
+                    for m in self._apply_lifecycle(head_visible, include_history=False)
+                }
+                visible = [m for m in visible if m.memory_id in active_ids]
+            retrieval = {
+                **retrieval,
+                "retrieval_complete": retrieval_complete,
+                "backend_window_complete": bool(
+                    retrieval.get("backend_window_complete", True)
+                ) and bool(head_retrieval.get("backend_window_complete", True)),
+            }
+            # Head validation is an internal lifecycle check. Its malformed
+            # rows must not be double-counted in the caller-facing search
+            # diagnostics, which describe the requested text retrieval.
         visible.sort(key=lambda m: (m.timestamp, m.memory_id))
         visible = self._apply_lifecycle(visible, include_history)
         if not include_history:

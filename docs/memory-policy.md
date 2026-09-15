@@ -108,6 +108,12 @@ returns only `active` records and excludes superseded ones; pass
 `--include-history` to see everything (with `superseded_by` resolved).
 `supersede` replaces a memory's content, or `--obsolete` writes a
 tombstone that hides the whole topic by default.
+Current-mode text searches validate each candidate against a complete,
+bounded logical-topic head view before returning it. A successor does not
+need to match the search text; if that head view is incomplete, the query
+fails closed and reports incomplete retrieval rather than presenting a
+possibly superseded record as current. `--include-history` and exact gets
+remain historical/addressable.
 
 Legacy records written before this guarantee may already have been
 overwritten by Engram when they reused the same physical topic key; that

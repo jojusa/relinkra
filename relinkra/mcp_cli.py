@@ -182,6 +182,8 @@ def main(argv: Optional[list] = None) -> int:
     recorder = build_evidence_recorder(
         services.config.workspace_root,
         _env("HOST_ID"),
+        project_id=services.config.default_project_id,
+        workspace_id=services.config.default_workspace_id,
     )
     server = MCPServer(services, evidence_recorder=recorder)
     try:

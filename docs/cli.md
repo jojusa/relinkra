@@ -154,9 +154,13 @@ WARN CBM
 
 The agent table never merges two different facts into one column: an
 agent's configuration state (`valid` / `unregistered` / `absent`) and its
-runtime observation (attested / observed / stale / unknown / pending) are
+runtime observation (attested / observed / stale / foreign / unbound /
+unknown / pending) are
 separate columns. Runtime evidence recorded without a host identity gets
 its own `host_unknown` row and is never attributed to a named host.
+Evidence is also bound to the persisted project and workspace ids on every
+event. Foreign project/workspace evidence is retained for diagnostics but is
+ignored for current trust; legacy/unbound evidence is never promoted.
 
 Use `--verbose` for the full per-check diagnostics. The compact and
 verbose views come from the SAME payload — the compact view is a
@@ -185,6 +189,9 @@ a writer that cannot take the lock in time skips its record (conservative
 under-reporting) rather than blocking serving or inflating trust. Locks
 die with their holding process, so an abandoned writer cannot wedge the
 store, and the lock files themselves are never rendered as evidence.
+Handoff trust requires a correlated create/read of the same handoff id under
+the current project, workspace, and revision. Runtime state stores only a
+bounded one-way fingerprint of the id, never the handoff body or raw id.
 
 ## `relinkra project`
 

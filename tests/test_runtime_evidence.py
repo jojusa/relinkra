@@ -46,6 +46,8 @@ from relinkra.product_cli import FAIL, PASS, PENDING, WARN, main
 from relinkra.registry import Registry, interprocess_lock
 from relinkra.runtime_evidence import (
     EVENT_CONTEXT_GET_CALLED,
+    EVENT_HANDOFF_CREATE_CALLED,
+    EVENT_HANDOFF_GET_CALLED,
     EVENT_INITIALIZE_OBSERVED,
     EVENT_MCP_SERVER_STARTED,
     EVENT_PROJECT_RESOLVE_CALLED,
@@ -331,6 +333,26 @@ class EvidenceMcpPathTests(unittest.TestCase):
         self.assertIn(EVENT_PROJECT_RESOLVE_CALLED, events)
         self.assertIn(EVENT_CONTEXT_GET_CALLED, events)
 
+    def test_handoff_route_records_correlatable_ids_without_bodies(self):
+        created = self.call(
+            "handoff_create",
+            source_agent="codex",
+            task="R6I handoff fixture",
+        )
+        handoff_id = created["structuredContent"]["handoff"]["handoff_id"]
+        fetched = self.call("handoff_get", handoff_id=handoff_id)
+        self.assertEqual(
+            fetched["structuredContent"]["handoff"]["handoff_id"], handoff_id
+        )
+        events = self._store()
+        create_detail = events[EVENT_HANDOFF_CREATE_CALLED]["detail"]
+        get_detail = events[EVENT_HANDOFF_GET_CALLED]["detail"]
+        self.assertNotIn(handoff_id, json.dumps(events))
+        self.assertEqual(
+            create_detail["handoff_id_fingerprint"],
+            get_detail["handoff_id_fingerprint"],
+        )
+
     def test_failed_tool_call_records_nothing(self):
         result = self.call(
             "memory_get", memory_id="mem_x", project_id="rlk_unknown_project"
@@ -521,12 +543,21 @@ class DoctorDogfoodTests(DogfoodCase):
         stage = next(
             entry for entry in ladder if entry["stage"] == STAGE_HANDOFF_ROUND_TRIP
         )
+        # Route halves without ids remain uncorrelated and cannot prove a
+        # round trip (legacy evidence never becomes correlated implicitly).
+        self.assertNotEqual(stage["state"], STAGE_PROVEN)
+
+        correlated = [
+            (EVENT_HANDOFF_CREATE_CALLED, {"handoff_id": "hof_" + "a" * 32}),
+            (EVENT_HANDOFF_GET_CALLED, {"handoff_id": "hof_" + "a" * 32}),
+        ]
+        self.record("codex", correlated)
+        ladder = self.doctor_json()["routing"]["trust_ladder"]["stages"]
+        stage = next(
+            entry for entry in ladder if entry["stage"] == STAGE_HANDOFF_ROUND_TRIP
+        )
         self.assertEqual(stage["state"], STAGE_PROVEN)
-        # Truthful wording: no handoff-id correlation is persisted, so
-        # the claim says the routes were served, not that one write was
-        # matched to a read-back of that same write.
-        self.assertIn("read served", stage["evidence"].lower())
-        self.assertNotIn("read-back", stage["evidence"].lower())
+        self.assertIn("correlated", stage["evidence"].lower())
 
     def test_operator_proof_is_visible_as_the_stronger_class(self):
         self.record("codex", self.codex_session_events())
@@ -975,6 +1006,97 @@ class MultiHostEvidenceFileTests(unittest.TestCase):
         summary = summarize_runtime_evidence(str(ws), "a" * 12)
         self.assertFalse(summary["present"])
         self.assertTrue(summary["invalid"], "a mislabelled file is anomalous state")
+
+
+class R6IIdentityAndHandoffTests(unittest.TestCase):
+    """R6I: identity-bound runtime trust and correlated handoff proof."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6i-runtime-")
+        self.addCleanup(self._temp.cleanup)
+        self.ws = Path(self._temp.name) / "ws"
+        self.ws.mkdir()
+        (self.ws / ".git").mkdir()
+        self.p1 = "rlk_" + "1" * 32
+        self.w1 = "ws_" + "1" * 32
+        self.p2 = "rlk_" + "2" * 32
+        self.w2 = "ws_" + "2" * 32
+        product_cli.WorkspaceConfig(
+            project_id=self.p1, workspace_id=self.w1
+        ).save(self.ws)
+
+    def _recorder(self):
+        return EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+
+    def test_foreign_project_and_workspace_cannot_advance_runtime_trust(self):
+        recorder = self._recorder()
+        recorder.record(EVENT_CONTEXT_GET_CALLED)
+        product_cli.WorkspaceConfig(
+            project_id=self.p2, workspace_id=self.w2
+        ).save(self.ws)
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertEqual(summary["hosts"]["codex"]["state"], "foreign")
+        self.assertNotIn("context_get", runtime_stage_claims(summary))
+
+    def test_legacy_unbound_evidence_is_readable_but_not_current_when_pinned(self):
+        recorder = EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
+        # Simulate a legacy writer that had no workspace pin.
+        recorder._workspace_pin = lambda: {}  # type: ignore[method-assign]
+        recorder.record(EVENT_CONTEXT_GET_CALLED)
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertEqual(summary["hosts"]["codex"]["state"], "unbound")
+        self.assertNotIn("context_get", runtime_stage_claims(summary))
+
+    def test_current_event_from_any_host_wins_over_stale_first_host(self):
+        summary = {
+            "current_revision": "a" * 12,
+            "current_project_id": self.p1,
+            "current_workspace_id": self.w1,
+            "hosts": {
+                "codex": {
+                    "events": {
+                        EVENT_CONTEXT_GET_CALLED: {
+                            "revision": "b" * 12,
+                            "project_id": self.p1,
+                            "workspace_id": self.w1,
+                            "observed_at": "2026-01-01T00:00:00Z",
+                        }
+                    }
+                },
+                "zcode": {
+                    "events": {
+                        EVENT_CONTEXT_GET_CALLED: {
+                            "revision": "a" * 12,
+                            "project_id": self.p1,
+                            "workspace_id": self.w1,
+                            "observed_at": "2026-01-01T01:00:00Z",
+                        }
+                    }
+                },
+            },
+        }
+        self.assertIn("context_get", runtime_stage_claims(summary))
+
+    def test_only_same_handoff_create_and_get_prove_round_trip(self):
+        recorder = self._recorder()
+        recorder.record(
+            EVENT_HANDOFF_CREATE_CALLED,
+            {"handoff_id": "hof_" + "a" * 32},
+        )
+        recorder.record(
+            EVENT_HANDOFF_GET_CALLED,
+            {"handoff_id": "hof_" + "b" * 32},
+        )
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertNotIn("handoff_round_trip", runtime_stage_claims(summary))
+        recorder.record(
+            EVENT_HANDOFF_GET_CALLED,
+            {"handoff_id": "hof_" + "a" * 32},
+        )
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        self.assertIn("handoff_round_trip", runtime_stage_claims(summary))
+        raw = Path(host_evidence_path(str(self.ws), "codex")).read_text()
+        self.assertNotIn("hof_", raw)
 
 
 class UnknownRevisionTests(unittest.TestCase):

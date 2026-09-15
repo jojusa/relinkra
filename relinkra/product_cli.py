@@ -957,6 +957,7 @@ def _runtime_evidence_check(assessment) -> Optional[Check]:
             "'relinkra doctor'.",
         )
     parts = []
+    identity_degraded = False
     for host_id, host in sorted(hosts.items()):
         label = host_id
         if host_id == "host_unknown":
@@ -972,12 +973,24 @@ def _runtime_evidence_check(assessment) -> Optional[Check]:
                 f"{label}: evidence present, current revision could not be "
                 "read to classify it"
             )
+        elif state == "foreign":
+            identity_degraded = True
+            parts.append(
+                f"{label}: foreign project/workspace evidence ignored"
+            )
+        elif state == "unbound":
+            identity_degraded = True
+            parts.append(
+                f"{label}: legacy/unbound evidence ignored for current trust"
+            )
         else:
             parts.append(f"{label}: {state}")
     return Check(
         "Runtime evidence",
-        PASS,
+        WARN if identity_degraded else PASS,
         "self-observed runtime evidence — " + "; ".join(parts),
+        "Restart the host from this initialized project/workspace to record "
+        "fresh identity-bound evidence." if identity_degraded else "",
     )
 
 
@@ -1994,6 +2007,10 @@ def _runtime_label(verification_row: dict, runtime_host: Optional[dict]) -> str:
         return "stale"
     if state == "unknown":
         return "unknown"
+    if state == "foreign":
+        return "foreign"
+    if state == "unbound":
+        return "unbound"
     return "pending"
 
 

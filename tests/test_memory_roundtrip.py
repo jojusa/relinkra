@@ -315,14 +315,14 @@ class TestImmutableMemoryHistoryReal(_IsolatedStoreCase):
 
         current = self.services.memory_search(
             project_id=self.project_id,
-            query=None,
+            query="Immutable history probe",
         )
         self.assertEqual(current["count"], 1)
         self.assertEqual(current["memories"][0]["body"], "revision C")
 
         history = self.services.memory_search(
             project_id=self.project_id,
-            query=None,
+            query="Immutable history probe",
             include_history=True,
         )
         self.assertEqual(
@@ -353,6 +353,41 @@ class TestImmutableMemoryHistoryReal(_IsolatedStoreCase):
         self.assertEqual(len(rows), 3)
         physical_topics = [row.get("topic_key") for row in rows]
         self.assertEqual(len(physical_topics), len(set(physical_topics)))
+
+    def test_real_text_narrow_search_rejects_hidden_successor_chain(self):
+        store = self.make_store()
+        services, ids = self.make_services(store)
+        project_id = ids["a"]
+        first = services.memory_save(
+            project_id=project_id,
+            memory_type="decision",
+            title="Real narrow query A",
+            body="needle only in A",
+        )
+        target = first["memory_id"]
+        for title, body in (
+            ("Real narrow query B", "hidden successor B"),
+            ("Real narrow query C", "hidden successor C"),
+        ):
+            replacement, _ = services.memories.supersede(
+                memory_id=target,
+                project_id=project_id,
+                title=title,
+                body=body,
+            )
+            target = replacement.memory_id
+        current = services.memory_search(
+            project_id=project_id,
+            query="needle only in A",
+        )
+        self.assertEqual(current["count"], 0)
+        history = services.memory_search(
+            project_id=project_id,
+            query="needle only in A",
+            include_history=True,
+        )
+        self.assertEqual(history["count"], 1)
+        self.assertEqual(history["memories"][0]["memory_id"], first["memory_id"])
 
 
 @unittest.skipUnless(_ENGRAM_BIN, "engram is required for roundtrip proof")

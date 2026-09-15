@@ -295,6 +295,37 @@ class TestRetrievalPolicy(unittest.TestCase):
 
 
 class TestLifecycle(unittest.TestCase):
+    def test_text_narrow_current_query_validates_hidden_successor_chain(self):
+        service, _ = make_service()
+        first, _, _ = save_shared(service, title="Topic", body="needle Q")
+        second, _ = service.supersede(
+            memory_id=first.memory_id,
+            project_id=PID_A,
+            title="Replacement B",
+            body="hidden B",
+        )
+        service.supersede(
+            memory_id=second.memory_id,
+            project_id=PID_A,
+            title="Replacement C",
+            body="hidden C",
+        )
+
+        current = service.query(
+            project_id=PID_A,
+            scope="project_shared",
+            text="needle Q",
+            include_history=False,
+        )
+        self.assertEqual(current.memories, [])
+        historical = service.query(
+            project_id=PID_A,
+            scope="project_shared",
+            text="needle Q",
+            include_history=True,
+        )
+        self.assertEqual([memory.memory_id for memory in historical.memories], [first.memory_id])
+
     def test_same_topic_save_supersedes_prior(self):
         service, _ = make_service()
         first, _, _ = save_shared(service, title="Plan", body="v1")
@@ -768,7 +799,9 @@ class TestRetrievalCompletenessMetadata(unittest.TestCase):
         save_shared(service, title="Visible", body="partial probe")
         result = service.query(project_id=PID_A, text="partial probe")
         payload = result.to_dict()
-        self.assertEqual(payload["count"], 1)
+        # A partial head view cannot prove that the text match is current;
+        # fail closed rather than presenting a potentially superseded record.
+        self.assertEqual(payload["count"], 0)
         self.assertFalse(payload["backend_window_complete"])
         self.assertEqual(payload["backend_limit"], 20)
         self.assertEqual(payload["retrieval_scope"], "partial")

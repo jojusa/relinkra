@@ -800,7 +800,19 @@ class MCPServer:
             self._evidence.record(EVENT_TOOL_INVOKED, {"tool": name})
             route_event = _TOOL_EVIDENCE_EVENTS.get(name)
             if route_event is not None:
-                self._evidence.record(route_event)
+                route_detail = None
+                if name in ("handoff_create", "handoff_get"):
+                    handoff_ids = []
+                    if isinstance(payload, dict):
+                        handoff = payload.get("handoff")
+                        if isinstance(handoff, dict) and handoff.get("handoff_id"):
+                            handoff_ids.append(handoff["handoff_id"])
+                        for item in payload.get("handoffs") or []:
+                            if isinstance(item, dict) and item.get("handoff_id"):
+                                handoff_ids.append(item["handoff_id"])
+                    if handoff_ids:
+                        route_detail = {"handoff_ids": handoff_ids}
+                self._evidence.record(route_event, route_detail)
         return self._tool_result(payload, is_error=False)
 
     @staticmethod
