@@ -133,6 +133,7 @@ def render_inspect(
     *,
     reveal: bool = False,
     workspace_matches: Optional[bool] = None,
+    direct_cbm=None,
 ) -> str:
     lines = ["", f"{report.display_name} ({report.connector_id})", ""]
     rows = [
@@ -155,6 +156,21 @@ def render_inspect(
         rows.append(("Env keys", ", ".join(report.env_keys)))
     lines.extend(_aligned(rows))
     lines.append("")
+
+    if direct_cbm is not None and getattr(spec, "locations", ()):
+        lines.append("Direct CBM")
+        if direct_cbm.needs_attention:
+            lines.append(f"  {direct_cbm.headline()}")
+            for entry in direct_cbm.entries:
+                lines.append(f"    - {entry.location} ({entry.ref})")
+            for item in direct_cbm.unreadable:
+                lines.append(f"    - {item.location} could not be read")
+            lines.append(f"  {direct_cbm.remediation(report.connector_id)}")
+        else:
+            lines.append(
+                "  No direct CBM registration found in the scopes this host loads."
+            )
+        lines.append("")
 
     if report.locations:
         lines.append("Configuration locations")
@@ -264,9 +280,17 @@ _HOST_RUNTIME_ROWS = {
 
 
 def _check_next_line(spec, result, runtime) -> str:
-    """Exactly one next action for the compact check output."""
+    """Exactly one next action for the compact check output.
+
+    A visible direct-CBM bypass outranks every cosmetic state: no amount
+    of restarting makes a host correctly connected while the bypass is
+    still importable.
+    """
     agent = spec.connector_id
     host = spec.display_name
+    direct_cbm = getattr(result, "direct_cbm", None)
+    if direct_cbm is not None and direct_cbm.needs_attention:
+        return f"Next: {direct_cbm.remediation(agent)}"
     if result.valid and result.registration_state == REGISTRATION_ALREADY_CONNECTED:
         state = (runtime or {}).get("state") or "pending"
         if state == "observed":
@@ -293,14 +317,35 @@ def render_check_compact(spec, result, *, runtime=None, generated_state=None) ->
     Everything here is about THIS host only — no global tables, no
     per-host verification sections for hosts the user did not ask about.
     Those stay in ``--verbose`` and in the JSON payload.
+
+    R6J: a direct-CBM bypass gets its own headline line here, because
+    "✓ Config valid" beside a live bypass is exactly the misleading
+    result this output must never produce.
     """
     lines = ["", spec.display_name]
-    if result.valid and result.registration_state == REGISTRATION_ALREADY_CONNECTED:
+    direct_cbm = getattr(result, "direct_cbm", None)
+    bypass = direct_cbm is not None and direct_cbm.needs_attention
+    state = result.registration_state
+    valid_registration = bool(
+        result.valid and state == REGISTRATION_ALREADY_CONNECTED
+    )
+    if valid_registration:
         lines.append(f"{_GLYPH_OK} Config valid")
-    elif result.registration_state == REGISTRATION_ABSENT:
+    elif bypass:
+        # A visible bypass leads: "✓ Config valid" beside a live bypass is
+        # the one reading this output must never produce, and "Config
+        # needs attention" would misplace the problem on the file.
+        lines.append(f"{_GLYPH_ATTENTION} {direct_cbm.headline()}")
+        if state == REGISTRATION_ABSENT:
+            lines.append(f"{_GLYPH_PENDING} Registration absent")
+    elif state == REGISTRATION_ABSENT:
         lines.append(f"{_GLYPH_PENDING} Registration absent")
     else:
         lines.append(f"{_GLYPH_ATTENTION} Config needs attention")
+    if bypass:
+        for finding in result.findings:
+            lines.append(f"    - {finding}")
+    elif not valid_registration and state != REGISTRATION_ABSENT:
         for finding in result.findings:
             lines.append(f"    - {finding}")
     if result.matches_workspace is True:

@@ -493,3 +493,217 @@ def pinned_project_id(root) -> str:
         return config.project_id if config else ""
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Direct-CBM assessment (R6J)
+# ---------------------------------------------------------------------------
+
+#: Where a direct codebase-memory registration was found, and therefore
+#: what it means for the managed route.
+#:
+#: ``authoritative_scope``  a scope the host loads MCP servers from
+#:                          (including the apply target): the bypass is
+#:                          directly live and the write path already
+#:                          refuses it.
+#: ``legacy_import_source`` a retired/imported location the CURRENT
+#:                          product still watches and imports (Devin
+#:                          Desktop's ``~/.codeium/*`` files): the bypass
+#:                          is live through the import, but the file is
+#:                          never a Relinkra write target.
+#: ``unreadable``           a scope that could not be read or parsed, so
+#:                          the ABSENCE of a direct registration cannot
+#:                          be proven. Unknown is never reported as clean.
+DIRECT_CBM_NONE = "none"
+DIRECT_CBM_AUTHORITATIVE = "authoritative_scope"
+DIRECT_CBM_LEGACY = "legacy_import_source"
+DIRECT_CBM_UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DirectCbmEntry:
+    """One structurally identified direct CBM registration.
+
+    The configuration KEY is deliberately absent: a server name is
+    user-authored text and never reaches output (same rule as
+    ``BackendDetection``). ``ref`` is a synthetic, stable label built
+    from the declared location id, and ``markers`` are DECLARED marker
+    names, so the whole payload stays portable.
+    """
+
+    ref: str
+    location: str
+    relation: str
+    markers: Tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "ref": self.ref,
+            "location": self.location,
+            "relation": self.relation,
+            "markers": list(self.markers),
+        }
+
+
+@dataclass(frozen=True)
+class DirectCbmUnreadableScope:
+    """A declared scope whose direct-CBM state could not be verified."""
+
+    location: str
+    scope: str
+    relation: str
+
+    def to_dict(self) -> dict:
+        return {
+            "location": self.location,
+            "scope": self.scope,
+            "relation": self.relation,
+        }
+
+
+@dataclass(frozen=True)
+class DirectCbmState:
+    """The complete direct-CBM picture for one connector.
+
+    Read-only, structural and shared by ``inspect``, ``check``,
+    ``connect all`` and the apply preflight, so no two commands can
+    describe the same host differently. ``needs_attention`` is true when
+    a bypass was FOUND or when a scope could not be READ: both make the
+    "correctly connected" claim false, one because the bypass is known,
+    the other because its absence is unproven.
+    """
+
+    entries: Tuple[DirectCbmEntry, ...] = field(default_factory=tuple)
+    unreadable: Tuple[DirectCbmUnreadableScope, ...] = field(default_factory=tuple)
+
+    @property
+    def detected(self) -> bool:
+        return bool(self.entries)
+
+    @property
+    def relation(self) -> str:
+        """The most severe relation found, for classification."""
+        if any(
+            entry.relation == DIRECT_CBM_AUTHORITATIVE for entry in self.entries
+        ):
+            return DIRECT_CBM_AUTHORITATIVE
+        if self.entries:
+            return DIRECT_CBM_LEGACY
+        if self.unreadable:
+            return DIRECT_CBM_UNREADABLE
+        return DIRECT_CBM_NONE
+
+    @property
+    def needs_attention(self) -> bool:
+        return bool(self.entries or self.unreadable)
+
+    def _locations(self) -> str:
+        seen: List[str] = []
+        for item in (*self.entries, *self.unreadable):
+            if item.location not in seen:
+                seen.append(item.location)
+        return ", ".join(seen)
+
+    def headline(self) -> str:
+        """The one-line human disclosure. Empty when nothing to say."""
+        if self.detected:
+            if self.relation == DIRECT_CBM_AUTHORITATIVE:
+                return f"Direct CBM exposure detected ({self._locations()})"
+            return f"Legacy direct CBM bypass detected ({self._locations()})"
+        if self.unreadable:
+            return f"Direct CBM check inconclusive ({self._locations()})"
+        return ""
+
+    def finding(self, agent: str = "") -> str:
+        """The detailed finding text ``check`` reports."""
+        if self.detected:
+            where = ", ".join(f"'{entry.location}'" for entry in self.entries)
+            if self.relation == DIRECT_CBM_AUTHORITATIVE:
+                return (
+                    "direct codebase-memory (CBM) exposure: an authoritative "
+                    f"MCP scope this host loads ({where}) registers the "
+                    "codebase-memory backend directly. This agent can bypass "
+                    "Relinkra. " + self.remediation(agent)
+                )
+            return (
+                "direct codebase-memory (CBM) exposure: a legacy configuration "
+                f"the current product still imports ({where}) registers the "
+                "codebase-memory backend directly. This agent can bypass "
+                "Relinkra. " + self.remediation(agent)
+            )
+        if self.unreadable:
+            where = ", ".join(f"'{item.location}'" for item in self.unreadable)
+            return (
+                "direct codebase-memory (CBM) exposure could not be ruled "
+                f"out: {where} could not be read. " + self.remediation(agent)
+            )
+        return ""
+
+    def remediation(self, agent: str = "") -> str:
+        """What the user must do; descriptive, never destructive."""
+        target = f"relinkra connect {agent}" if agent else "relinkra connect"
+        if self.detected:
+            if self.relation == DIRECT_CBM_AUTHORITATIVE:
+                return (
+                    "Remove the direct codebase-memory registration, then "
+                    f"re-run '{target}' to route code graph access through "
+                    "Relinkra."
+                )
+            locations = ", ".join(
+                f"'{entry.location}'" for entry in self.entries
+            )
+            return (
+                "Remove the direct codebase-memory registration from the "
+                f"legacy configuration ({locations}), then re-run '{target}' "
+                "to route code graph access through Relinkra. Relinkra does "
+                "not remove or rewrite legacy or imported files itself."
+            )
+        return (
+            "Repair or remove the unreadable configuration, then re-run "
+            f"'{target}'; until then the absence of a direct CBM bypass "
+            "cannot be verified."
+        )
+
+    def refusal_reason(self) -> str:
+        """The apply refusal sentence for a bypass the write cannot fix."""
+        if self.detected:
+            scope = (
+                "a legacy configuration the current product still imports"
+                if self.relation == DIRECT_CBM_LEGACY
+                else "an authoritative MCP scope this host loads"
+            )
+            return (
+                f"a direct codebase-memory (CBM) registration is present in "
+                f"{scope} ({self._locations()}); this agent can bypass "
+                "Relinkra, so the connection cannot be reported as safe."
+            )
+        legacy = [
+            item.location
+            for item in self.unreadable
+            if item.relation == DIRECT_CBM_LEGACY
+        ]
+        others = [
+            item.location
+            for item in self.unreadable
+            if item.relation != DIRECT_CBM_LEGACY
+        ]
+        parts = []
+        if legacy:
+            parts.append(
+                "a legacy configuration the current product still imports "
+                f"({', '.join(legacy)}) could not be read"
+            )
+        if others:
+            parts.append(
+                f"an authoritative MCP scope ({', '.join(others)}) could not "
+                "be read"
+            )
+        return "; ".join(parts) + "; refusing to claim direct CBM is absent."
+
+    def to_dict(self) -> dict:
+        return {
+            "detected": self.detected,
+            "relation": self.relation,
+            "entries": [entry.to_dict() for entry in self.entries],
+            "unreadable": [item.to_dict() for item in self.unreadable],
+        }

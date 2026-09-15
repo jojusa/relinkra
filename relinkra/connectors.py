@@ -81,6 +81,7 @@ from .connector import (
     ConnectorPlan,
     ConnectorReport,
     ConnectorWarning,
+    DirectCbmState,
     LaunchContract,
     PlanOperation,
     UnknownConnectorError,
@@ -1147,10 +1148,12 @@ DEVIN_DESKTOP = ConnectorSpec(
         "are never the plan target.",
         "A direct codebase-memory (CBM) registration in a legacy file IS "
         "imported into the live host registry by the current product, so "
-        "check and apply surface it loudly as a finding; per the phase "
-        "contract it does not block apply to the current-product target "
-        "(only authoritative-scope CBM blocks), and Relinkra never "
-        "removes it.",
+        "it is a live bypass: inspect discloses it, check reports it as a "
+        "finding (not valid), 'connect all' refuses that host instead of "
+        "reporting no-op, and apply refuses until it is removed. Relinkra "
+        "never removes or rewrites the legacy file itself — remove the "
+        "direct entry there, then reconnect; only authoritative-scope CBM "
+        "also blocks by the ordinary write gate.",
         "Workspace scopes (.devin/mcp_config.local.json overriding "
         ".devin/mcp_config.json) and both user scopes are authoritative: "
         "an entry shadowing the managed name in any of them is reported "
@@ -1826,6 +1829,12 @@ class CheckResult:
     warnings: List[ConnectorWarning] = field(default_factory=list)
     matches_workspace: Optional[bool] = None
     target_ref: str = ""
+    #: R6J: the structural direct-CBM picture (see ``connector``). A live
+    #: bypass in a scope the host loads or imports is a real problem:
+    #: it makes ``valid`` false even when the managed registration itself
+    #: is perfect, because "correctly connected" is a claim about the
+    #: route, not only about one entry.
+    direct_cbm: Optional["DirectCbmState"] = None
 
     def to_dict(self) -> dict:
         return {
@@ -1836,6 +1845,9 @@ class CheckResult:
             "warnings": [w.to_dict() for w in self.warnings],
             "matches_workspace": self.matches_workspace,
             "target_ref": self.target_ref,
+            "direct_cbm": (
+                self.direct_cbm.to_dict() if self.direct_cbm is not None else None
+            ),
         }
 
 
@@ -1847,6 +1859,7 @@ def check_registration(
     shadow_hints: Tuple[str, ...] = (),
     authoritative_scope_finding: str = "",
     legacy_scope_findings: Tuple[str, ...] = (),
+    direct_cbm: Optional[DirectCbmState] = None,
 ) -> CheckResult:
     """Validate the registration that is already there, changing nothing.
 
@@ -1869,11 +1882,22 @@ def check_registration(
     never as findings: the ``valid``/exit semantics describe the
     CURRENT-product registration, and a legacy-scope fact must not flip
     them — but it must never pass silently either.
+
+    ``direct_cbm`` carries the structural direct-CBM picture (R6J). A
+    found bypass, or a scope whose contents could not be read, IS a real
+    problem: the route claim ("correctly connected through Relinkra") is
+    false while a direct CBM registration is live in any scope the host
+    loads or imports. It is therefore reported as a finding and flips
+    ``valid``/the exit code, regardless of which scope holds it. When the
+    caller already reports the same condition through
+    ``authoritative_scope_finding``, the duplicate prose is suppressed —
+    the structured picture still travels in the payload.
     """
     result = CheckResult(
         connector_id=spec.connector_id,
         registration_state=inspection.registration_state,
         target_ref=_target_ref(spec, inspection.location),
+        direct_cbm=direct_cbm,
     )
     result.warnings.extend(inspection.warnings)
     for message in legacy_scope_findings:
@@ -1883,6 +1907,9 @@ def check_registration(
         result.registration_state = REGISTRATION_UNKNOWN
         result.findings.append(authoritative_scope_finding)
         return result
+
+    if direct_cbm is not None and direct_cbm.needs_attention:
+        result.findings.append(direct_cbm.finding(spec.connector_id))
 
     if shadow_hints:
         joined = ", ".join(shadow_hints)

@@ -32,7 +32,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
@@ -48,11 +48,16 @@ from .config_merge import (
     ownership_test,
 )
 from .connector import (
+    DIRECT_CBM_AUTHORITATIVE,
+    DIRECT_CBM_LEGACY,
     DISCOVERY_CONFIG_MALFORMED,
     DISCOVERY_CONFIG_UNSUPPORTED,
     DISCOVERY_DISCOVERED,
     MANAGED_SERVER_NAME,
     PLAN_READY,
+    DirectCbmEntry,
+    DirectCbmState,
+    DirectCbmUnreadableScope,
     LaunchContract,
     pinned_project_id,
 )
@@ -269,6 +274,10 @@ class ApplyResult:
     refusal_reason: str = ""
     #: Portable backup identity (the file NAME, never its directory).
     backup_ref: str = ""
+    #: The R6J direct-CBM picture at apply time (portable dict). Present
+    #: on refusals too, so a script sees the classification even when the
+    #: write was stopped.
+    direct_cbm: Optional[dict] = None
     #: Machine-local values. Never rendered by to_dict.
     real_config_path: str = ""
     real_backup_path: str = ""
@@ -319,6 +328,7 @@ class ApplyResult:
             "backup_digest": self.backup_digest,
             "refusal_reason": self.refusal_reason,
             "error": self.error,
+            "direct_cbm": self.direct_cbm,
             "warnings": list(self.warnings),
             "actions": list(self.actions),
         }
@@ -360,6 +370,10 @@ class ConnectorSafetyPreflight:
     snapshot_exists: bool = False
     snapshot_text: Optional[str] = None
     snapshot_digest: Optional[str] = None
+    #: The R6J direct-CBM picture shared with the front door, ``check``
+    #: and ``connect all``. Populated even on refusals so the refusal
+    #: payload can name the bypass structurally instead of only in prose.
+    direct_cbm: Optional[DirectCbmState] = None
 
     @property
     def refused(self) -> bool:
@@ -666,17 +680,17 @@ def legacy_scope_findings(
 ) -> Tuple[str, ...]:
     """Human-readable findings about LEGACY/evidence-only MCP scopes.
 
-    Read-only and never blocking. A renamed host's retired locations are
-    not authoritative scopes, so a direct CBM entry there must NOT refuse
-    an apply to the current-product target — but it must never pass
-    silently either, because the current product may still READ the
-    legacy file (Devin Desktop watches ``~/.codeium/*/mcp_config.json``
-    and imports it into the live MCP registry, TrustedOnNonce, proven in
-    the shipped bundles). The legacy file is never modified or removed.
+    Read-only descriptive text, kept for warnings and diagnostics. R6J
+    moved the APPLY decision to :func:`direct_cbm_state`: a live bypass in
+    a legacy scope the current product still imports now refuses the
+    write instead of being a warning, because a written registration
+    beside a live bypass is exactly the misleading success this
+    capability removes. The legacy file itself is still never modified,
+    read as evidence only.
 
     Driven entirely off ``spec.legacy_location_ids``: connectors without
     legacy locations get an empty tuple and no behavior change. A legacy
-    file that cannot be read or parsed fails closed as a finding too —
+    file that cannot be read or parsed is reported as a finding too —
     "unknown" is never reported as "clean".
     """
     if not spec.legacy_location_ids:
@@ -736,6 +750,139 @@ def legacy_scope_findings(
                 "rewrites it — remove it by hand for the route to be clean."
             )
     return tuple(findings)
+
+
+def _containers_for_scope(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    location,
+    *,
+    active_location_id: str,
+) -> Tuple[Tuple[str, ...], ...]:
+    """Containers to walk in ONE scope, deduplicated and order-stable.
+
+    The static declared container covers every scope the host loads. The
+    workspace-resolved container (Claude Code's
+    ``projects[<key>].mcpServers``) is added only for the ACTIVE location,
+    because that is the container apply actually targets there; adding it
+    to foreign scopes would read a field the host never honors. Declared
+    inherited containers (Claude Code's top-level ``mcpServers``) are
+    honored beside the targeted one, exactly as the apply gate does.
+    """
+    paths: List[Tuple[str, ...]] = []
+    if spec.container_path:
+        paths.append(tuple(spec.container_path))
+    if location is not None and location.location_id == active_location_id:
+        resolved = container_path_for(spec, env.workspace_root)
+        if resolved and tuple(resolved) not in paths:
+            paths.append(tuple(resolved))
+    for inherited in spec.inherited_container_paths:
+        candidate = tuple(inherited)
+        if candidate and candidate not in paths:
+            paths.append(candidate)
+    return tuple(paths)
+
+
+def direct_cbm_state(
+    spec: ConnectorSpec,
+    env: DiscoveryEnvironment,
+    *,
+    inspection: Any = None,
+) -> DirectCbmState:
+    """Aggregate direct-CBM exposure across the scopes this host uses.
+
+    Read-only and fail-closed. Scans exactly the declared locations the
+    host loads MCP servers from (``mcp_authoritative`` — the apply target
+    among them) plus the connector's legacy/import locations, and
+    classifies each entry with the SAME structural predicate the apply
+    gate uses (:func:`classify_server_entry`), never by name or
+    substring. A scope that exists but cannot be read, parsed or walked
+    is recorded as UNREADABLE, never as clean: an unknown is not a
+    verified absence, and this capability promises that a reported
+    connection is not hiding an undisclosed direct-CBM route.
+
+    Nothing here writes, removes or rewrites anything. The state is built
+    once per command and shared by ``inspect``, ``check``, ``connect
+    all`` and the apply preflight, so no two surfaces can disagree about
+    the same host.
+    """
+    entries: List[DirectCbmEntry] = []
+    unreadable: List[DirectCbmUnreadableScope] = []
+    if not spec.locations or not spec.container_path:
+        return DirectCbmState()
+    legacy_ids = set(spec.legacy_location_ids)
+    active_location_id = (
+        inspection.location.location_id
+        if inspection is not None and inspection.location is not None
+        else ""
+    )
+    for location in spec.locations:
+        if location.location_id in legacy_ids:
+            relation = DIRECT_CBM_LEGACY
+        elif location.mcp_authoritative:
+            relation = DIRECT_CBM_AUTHORITATIVE
+        else:
+            # A discovery-only location the host does not load MCP servers
+            # from is not a live bypass route and is deliberately skipped.
+            continue
+        pure = location.build(env)
+        if pure is None:
+            continue
+        path = Path(str(pure))
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(
+                DirectCbmUnreadableScope(
+                    location.display_hint, location.scope, relation
+                )
+            )
+            continue
+        try:
+            if not _regular_non_reparse_file(path):
+                raise SafeWriteError("not a regular file")
+            adapter = adapter_for(location.config_format)
+            if adapter is None:
+                raise SafeWriteError("no parser for this configuration format")
+            document = adapter.parse(read_bounded_text(path))
+            if not isinstance(document, Mapping):
+                raise SafeWriteError("the configuration is not an object")
+        except (
+            OSError,
+            SafeWriteError,
+            ValueError,
+            TypeError,
+            RecursionError,
+            MergeError,
+        ):
+            unreadable.append(
+                DirectCbmUnreadableScope(
+                    location.display_hint, location.scope, relation
+                )
+            )
+            continue
+        counter = 0
+        for container_path in _containers_for_scope(
+            spec, env, location, active_location_id=active_location_id
+        ):
+            container = _container(document, container_path)
+            if not isinstance(container, Mapping):
+                continue
+            for _name, entry in sorted(container.items(), key=str):
+                if classify_server_entry(entry) != CLASS_CBM:
+                    continue
+                counter += 1
+                entries.append(
+                    DirectCbmEntry(
+                        ref=f"{location.location_id}#{counter}",
+                        location=location.display_hint,
+                        relation=relation,
+                        markers=classify_entry("", entry).markers,
+                    )
+                )
+    return DirectCbmState(entries=tuple(entries), unreadable=tuple(unreadable))
 
 
 def shadow_registration_hints(
@@ -886,7 +1033,15 @@ def connector_safety_preflight(
     apply write. It re-reads the target, validates the exact target path,
     scans target/inherited and sibling authoritative scopes, evaluates the
     merge/ownership decision, and re-reads a no-op target for semantic proof.
-    Devin legacy scopes are warnings, never refusals.
+
+    R6J: a live direct-CBM bypass the current product still imports from a
+    legacy scope — or a legacy scope whose contents could not be read, so
+    the absence of such a bypass cannot be proven — is a REFUSAL, not a
+    warning. Relinkra cannot reconcile a foreign import file from here
+    (the legacy file is never a write target), and reporting the host as
+    connected while the bypass stays live is exactly the misleading
+    result this capability removes. The refusal names the portable
+    location and the action a person must take; nothing is modified.
     """
     # Callers that already performed the front-door inspect/plan pass hand
     # those facts in only to build the user's plan. They are not authorization
@@ -906,6 +1061,9 @@ def connector_safety_preflight(
     snapshot_text: Optional[str] = None
     snapshot_digest: Optional[str] = None
     legacy_warnings = legacy_scope_findings(spec, env)
+    # Built once, early, so every refusal carries the structural picture
+    # and the front door can classify the bypass without re-scanning.
+    direct_cbm = direct_cbm_state(spec, env, inspection=inspection)
     warnings = tuple(
         f"{warning.code}: {warning.message}" for warning in inspection.warnings
     ) + legacy_warnings
@@ -928,6 +1086,7 @@ def connector_safety_preflight(
             adapter=adapter,
             readable=readable,
             format_supported=format_supported,
+            direct_cbm=direct_cbm,
         )
 
     if inspection.discovery_status in (
@@ -1051,6 +1210,26 @@ def connector_safety_preflight(
             ),
         )
 
+    # R6J: the legacy/import bypass. Authoritative direct CBM already
+    # refused above; everything that reaches this point and still needs
+    # attention was found in (or unreadable in) a legacy import scope.
+    # The legacy file is never a Relinkra write target, so the write
+    # cannot reconcile it: fail closed instead of writing a registration
+    # that would leave the bypass live while ``connect all`` reads green.
+    if direct_cbm is not None and direct_cbm.needs_attention:
+        extra: Tuple[str, ...] = ()
+        if direct_cbm.detected:
+            extra = (
+                "direct_cbm_exposure: a legacy configuration the current "
+                "product still imports registers the codebase-memory backend "
+                "directly; this agent can bypass Relinkra.",
+            )
+        return refused(
+            direct_cbm.refusal_reason(),
+            (direct_cbm.remediation(spec.connector_id),),
+            extra,
+        )
+
     if adapter is None or spec.entry_builder is None:
         return refused(
             "this host's configuration format is not writable in this phase.",
@@ -1152,6 +1331,7 @@ def connector_safety_preflight(
         snapshot_exists=snapshot_exists,
         snapshot_text=snapshot_text,
         snapshot_digest=snapshot_digest,
+        direct_cbm=direct_cbm,
     )
 
 
@@ -1236,6 +1416,8 @@ def _apply_inner(
     inspection = preflight.inspection
     result.warnings += preflight.warnings
     result.discovered = inspection.discovery_status == DISCOVERY_DISCOVERED
+    if preflight.direct_cbm is not None:
+        result.direct_cbm = preflight.direct_cbm.to_dict()
 
     location = preflight.location
     target = preflight.target
@@ -1321,6 +1503,14 @@ def _apply_inner(
         if unreadable is not None or scope_cbm or shadows:
             raise PreconditionError(
                 "authoritative configuration changed concurrently; nothing was overwritten"
+            )
+        # R6J: the legacy/import side of the same promise. A bypass (or an
+        # unreadable legacy scope) that appeared while this write was in
+        # flight fails the terminal gate exactly like an authoritative one.
+        if direct_cbm_state(spec, env, inspection=inspection).needs_attention:
+            raise PreconditionError(
+                "a direct codebase-memory bypass appeared in a legacy scope "
+                "concurrently; nothing was overwritten"
             )
 
     def _validate_post_authoritative_state(_candidate: str) -> None:
@@ -1956,6 +2146,7 @@ __all__ = [
     "apply_connector",
     "authoritative_scope_status",
     "classify_server_entry",
+    "direct_cbm_state",
     "entries_equivalent",
     "launch_fingerprint",
     "legacy_scope_findings",

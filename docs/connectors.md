@@ -287,6 +287,13 @@ planning and apply resolve the first current Devin location instead. The
 distinction is intentional and preserves legacy evidence without enabling a
 legacy write.
 
+That import is also why a direct CBM entry in a legacy file is treated as a
+live bypass (R6J): `inspect` discloses it, `check` reports it as a finding
+(never valid), `connect all` classifies the host as `legacy_bypass`/refused,
+and `apply` refuses until the entry is removed by hand — the legacy file
+itself is never rewritten. See "Direct-CBM bypasses on legacy/import scopes"
+above.
+
 ### Verification evidence schema
 
 Persisted connector proof uses `relinkra.connect-verification/v2`. The version
@@ -397,6 +404,38 @@ so it neither trips the gate nor is touched by the rewrite. Claude Code is the
 opposite case: its top-level `mcpServers` IS inherited beside the targeted
 project scope, so the connector declares it as an inherited container and the
 gate scans both.
+
+### Direct-CBM bypasses on legacy/import scopes (R6J)
+
+The normal architecture routes the code graph through Relinkra:
+`agent -> Relinkra MCP -> CBM`. A host configuration that registers CBM
+directly is a bypass, and one in a scope the host still imports is a *live*
+bypass even when it is not the write target. Devin Desktop watches and imports
+its legacy `~/.codeium/*/mcp_config.json` files (TrustedOnNonce), so a direct
+CBM entry there routes the agent around Relinkra's identity, relevance, budget
+and trust layer.
+
+Relinkra therefore classifies the bypass structurally (what an entry LAUNCHES,
+using the declared marker table — never a name substring):
+
+- `inspect` discloses it under `direct_cbm`
+  (`detected` / `relation` / `entries` / `unreadable`) and prints
+  "Legacy direct CBM bypass detected";
+- `check` reports it as a finding, so the host is NOT valid and the compact
+  output leads with the removal action instead of a cosmetic pending state;
+- `connect all` classifies the host as `legacy_bypass` and refuses it — never
+  `already_valid`/no-op — and the aggregate exit code is a human decision;
+- `apply` refuses while the bypass lives: a written registration beside a live
+  bypass would be the misleading success this check exists to prevent.
+
+Remediation is descriptive, never destructive, and uses the ordinary connector
+safety/consent flow for whatever Relinkra owns. A legacy/import file is never a
+write target, so Relinkra does not remove or rewrite it; the user removes the
+direct entry (or disables it in the host), then reconnects. After the bypass is
+gone, `apply`/`check` are green and a second run is an idempotent no-op. An
+unreadable legacy scope fails closed the same way: absence of a bypass cannot
+be claimed when it cannot be verified. This is configuration classification
+only — it adds no restriction on native source/search/edit/test tools.
 
 ### What survives a merge
 

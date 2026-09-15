@@ -1,4 +1,4 @@
-"""Tests for the Devin Desktop connector write path (R4C.1E Gate B).
+"""Tests for the Devin Desktop connector write path (R4C.1E Gate B + R6J).
 
 Gate B opens apply/rollback/verify for devin-desktop after the Gate B1
 machine evidence proved the mirror semantics (PROVEN_MULTI_SOURCE):
@@ -9,9 +9,12 @@ machine evidence proved the mirror semantics (PROVEN_MULTI_SOURCE):
   on POSIX it is ``~/.config/devin/mcp_config.json``;
 * the legacy ``~/.codeium/*/mcp_config.json`` files are watched one-way
   import sources (TrustedOnNonce), evidence-only, never write targets;
-* a direct CBM entry in a LEGACY scope is surfaced loudly (check
-  warning, apply warning) but never blocks the apply — only
-  authoritative-scope CBM blocks.
+* R6J: a direct CBM entry in a LEGACY scope is imported into the live
+  host registry by the current product, so it is a live bypass: inspect
+  discloses it, check reports it as a finding (not valid), ``connect
+  all`` classifies the host as ``legacy_bypass``/refused, and apply
+  refuses until it is removed. The legacy file itself is still never
+  modified or removed — remediation is an explicit user action.
 
 Every test drives the real CLI through ``main(argv)`` or the real engine
 against a fixture home plus a fake repository, with host discovery
@@ -391,7 +394,7 @@ class DevinDesktopApplyBasicsTests(ConnectApplyDevinDesktopCase):
 
 
 class DevinDesktopDirectCbmTests(ConnectApplyDevinDesktopCase):
-    """B4.3/B4.4/B4.18 — authoritative CBM blocks; legacy CBM is loud."""
+    """B4.3/B4.4/B4.18 + R6J — authoritative CBM blocks; legacy CBM blocks too."""
 
     def test_direct_cbm_in_the_current_scope_refuses_the_apply(self):
         # B4.3: a direct CBM entry in the authoritative apply target
@@ -424,51 +427,45 @@ class DevinDesktopDirectCbmTests(ConnectApplyDevinDesktopCase):
         self.assertFalse(payload["write_attempted"])
         self.assertEqual(path.read_bytes(), before)
 
-    def test_direct_cbm_in_a_legacy_scope_is_surfaced_but_never_blocks(self):
-        # B4.4 + B4.18: the legacy file IS imported into the live host
-        # registry by the current product, so the finding must be loud —
-        # but per the phase contract it does not block the apply, and it
-        # does not change check's valid/exit semantics for the current
-        # registration. It is surfaced as a WARNING, never as a finding:
-        # ``valid`` is defined as "no findings" and a legacy-scope fact
-        # must not flip it.
+    def test_direct_cbm_in_a_legacy_scope_blocks_and_is_disclosed(self):
+        # R6J: the legacy file IS imported into the live host registry by
+        # the current product, so a direct CBM entry there is a live
+        # bypass. Apply refuses (nothing written), check is NOT valid,
+        # and the structured state names the legacy relation. The legacy
+        # file itself is still never touched.
         path = self.current_config({"mcpServers": {}})
         legacy = self.legacy_config({"mcpServers": {"memory-helper": dict(_CBM_ENTRY)}})
         legacy_before = legacy.read_bytes()
-        # The generic scanner reports exactly one finding, per scope.
+        # The generic scanner still reports the fact, per scope.
         findings = legacy_scope_findings(DEVIN_DESKTOP, self.env())
         self.assertEqual(len(findings), 1)
         self.assertIn("codebase-memory", findings[0])
         self.assertIn("legacy", findings[0])
         code, payload, _ = self.run_json("apply", "devin-desktop")
-        self.assertEqual(code, EXIT_OK, payload)
-        self.assertTrue(payload["write_succeeded"])
-        self.assertTrue(
-            any(
-                "direct_cbm_exposure" in warning and "legacy" in warning
-                for warning in payload["warnings"]
-            ),
-            payload["warnings"],
+        self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+        self.assertFalse(payload["write_attempted"])
+        self.assertFalse(payload["backup_created"])
+        self.assertIn("direct codebase-memory", payload["refusal_reason"])
+        self.assertEqual(
+            payload["direct_cbm"]["relation"], "legacy_import_source"
         )
-        self.assert_semantic_registration(path)
+        self.assertTrue(payload["direct_cbm"]["detected"])
+        self.assertFalse(
+            (self.repo / ".devin" / "mcp_config.local.json").exists()
+        )
         self.assertEqual(legacy.read_bytes(), legacy_before)
         document = json.loads(legacy.read_text(encoding="utf-8"))
         self.assertEqual(document["mcpServers"]["memory-helper"], _CBM_ENTRY)
-        # Check: the current registration is clean, so check stays VALID
-        # with exit 0 — and the legacy CBM is right there in the warnings.
+        # Check: a valid-looking current registration is NOT reported
+        # valid while the live bypass remains — it is a finding.
         code, check, _ = self.run_json("check", "devin-desktop")
-        self.assertEqual(code, EXIT_OK, check)
-        self.assertTrue(check["valid"])
-        legacy_warnings = [
-            warning for warning in check["warnings"]
-            if warning["code"] == "legacy_scope"
-        ]
-        self.assertTrue(legacy_warnings, check["warnings"])
+        self.assertEqual(code, EXIT_ACTION_REQUIRED, check)
+        self.assertFalse(check["valid"])
         self.assertTrue(
-            any("codebase-memory" in warning["message"] for warning in legacy_warnings)
-        )
-        self.assertFalse(
             any("codebase-memory" in finding for finding in check["findings"])
+        )
+        self.assertEqual(
+            check["direct_cbm"]["relation"], "legacy_import_source"
         )
 
     def test_legacy_cbm_findings_cover_both_legacy_scopes(self):
@@ -481,17 +478,21 @@ class DevinDesktopDirectCbmTests(ConnectApplyDevinDesktopCase):
         self.assertEqual(CLAUDE.legacy_location_ids, ())
         self.assertEqual(legacy_scope_findings(CLAUDE, self.env()), ())
 
-    def test_an_unreadable_legacy_scope_fails_closed_as_a_finding(self):
+    def test_an_unreadable_legacy_scope_blocks_the_apply(self):
+        # R6J: an unreadable legacy file means the absence of a direct
+        # CBM bypass CANNOT be verified — unknown is never clean, so the
+        # write refuses instead of claiming a connection it cannot prove.
         legacy = self.legacy_config("{ broken")
         before = legacy.read_bytes()
         findings = legacy_scope_findings(DEVIN_DESKTOP, self.env())
         self.assertEqual(len(findings), 1)
         self.assertIn("could not be read", findings[0])
-        # It is a finding, never a crash and never a write blocker.
         self.current_config({"mcpServers": {}})
         code, payload, _ = self.run_json("apply", "devin-desktop")
-        self.assertEqual(code, EXIT_OK, payload)
-        self.assertTrue(payload["write_succeeded"])
+        self.assertEqual(code, EXIT_ACTION_REQUIRED, payload)
+        self.assertFalse(payload["write_attempted"])
+        self.assertIn("could not be read", payload["refusal_reason"])
+        self.assertEqual(payload["direct_cbm"]["relation"], "unreadable")
         self.assertEqual(legacy.read_bytes(), before)
 
     def test_a_stat_denied_legacy_scope_is_a_finding_never_absent(self):

@@ -74,6 +74,7 @@ from .connect_verification import (
     record_verification,
 )
 from .connector import (
+    DIRECT_CBM_LEGACY,
     PLAN_READY,
     REGISTRATION_ALREADY_CONNECTED,
     REGISTRATION_ABSENT,
@@ -87,6 +88,7 @@ from .connector_apply import (
     apply_connector,
     authoritative_scope_status,
     connector_safety_preflight,
+    direct_cbm_state,
     launch_fingerprint,
     legacy_scope_findings,
     preferred_connector_target_path,
@@ -398,6 +400,11 @@ def cmd_inspect(args) -> int:
     generated_state = _add_generated_state_guidance(spec, root, inspection)
     _add_discovery_note(spec, inspection)
 
+    # R6J: read-only structural direct-CBM assessment. Disclosed on every
+    # inspect, whether or not a workspace is known, so a legacy bypass
+    # cannot hide behind a healthy-looking registration.
+    direct_cbm = direct_cbm_state(spec, env, inspection=inspection)
+
     # R6E: answer "does the registration point at THIS workspace?"
     # directly, so a user does not need inspect + check just to learn
     # it. Same engine check uses; read-only, and None (unknown) when
@@ -415,7 +422,7 @@ def cmd_inspect(args) -> int:
             launch,
             shadow_hints=shadow_hints,
             authoritative_scope_finding=unreadable_scope_finding or "",
-            legacy_scope_findings=legacy_scope_findings(spec, env),
+            direct_cbm=direct_cbm,
         )
         workspace_matches = check_result.matches_workspace
 
@@ -426,6 +433,7 @@ def cmd_inspect(args) -> int:
     payload = report.to_dict()
     payload["format_evidence"] = spec.format_evidence
     payload["workspace_matches"] = workspace_matches
+    payload["direct_cbm"] = direct_cbm.to_dict()
     if spec.connector_id == "zcode":
         payload["zcode_generated_state"] = generated_state
     if reveal:
@@ -437,6 +445,7 @@ def cmd_inspect(args) -> int:
             report,
             reveal=reveal,
             workspace_matches=workspace_matches,
+            direct_cbm=direct_cbm,
         ),
         as_json=args.json,
         allow_paths=reveal,
@@ -571,6 +580,8 @@ def cmd_connect(args) -> int:
                 "actions": list(preflight.actions),
             }
         )
+        if preflight.direct_cbm is not None:
+            payload["direct_cbm"] = preflight.direct_cbm.to_dict()
         code = _emit(
             payload,
             render_plan(plan)
@@ -673,6 +684,7 @@ def _evaluate_host(agent: str, root, env) -> dict:
         inspection = inspect_connector(spec, env)
         generated_state = _add_generated_state_guidance(spec, root, inspection)
         _add_discovery_note(spec, inspection)
+        direct_cbm = direct_cbm_state(spec, env, inspection=inspection)
         unreadable_scope_finding, shadow_hints = authoritative_scope_status(
             spec,
             env,
@@ -684,7 +696,7 @@ def _evaluate_host(agent: str, root, env) -> dict:
             launch,
             shadow_hints=shadow_hints,
             authoritative_scope_finding=unreadable_scope_finding or "",
-            legacy_scope_findings=legacy_scope_findings(spec, env),
+            direct_cbm=direct_cbm,
         )
         plan = build_plan(spec, inspection, launch)
         preflight = connector_safety_preflight(
@@ -708,11 +720,15 @@ def _evaluate_host(agent: str, root, env) -> dict:
     row["display_name"] = spec.display_name
     row["restart_instruction"] = spec.restart_instruction
     row["warnings"] = [warning.to_dict() for warning in inspection.warnings]
+    row["direct_cbm"] = direct_cbm.to_dict()
     if spec.connector_id == "zcode":
         row["zcode_generated_state"] = generated_state
 
+    bypass = direct_cbm.needs_attention
     state = check_result.registration_state
-    if not check_result.findings and state == REGISTRATION_ALREADY_CONNECTED:
+    if state == REGISTRATION_ALREADY_CONNECTED and (
+        not check_result.findings or bypass
+    ):
         config_label = "valid"
     elif state == REGISTRATION_ABSENT:
         config_label = "absent"
@@ -730,9 +746,25 @@ def _evaluate_host(agent: str, root, env) -> dict:
         row["workspace"] = "differs"
 
     if preflight.refused:
-        row["classification"] = "unsafe/refused"
+        # R6J: a live legacy direct-CBM bypass is its own classification,
+        # never a generic refusal and never a healthy no-op: the row must
+        # identify the agent and the bypass at a glance.
+        if direct_cbm.relation == DIRECT_CBM_LEGACY:
+            row["classification"] = "legacy_bypass"
+        elif bypass:
+            row["classification"] = "unsafe"
+        else:
+            row["classification"] = "unsafe/refused"
         row["action"] = OUTCOME_REFUSED
         row["detail"] = preflight.refusal_reason
+    elif bypass:
+        # The preflight refuses on the same state, so this is a fail-closed
+        # net: never classify a host healthy while the bypass is visible.
+        row["classification"] = (
+            "legacy_bypass" if direct_cbm.relation == DIRECT_CBM_LEGACY else "unsafe"
+        )
+        row["action"] = OUTCOME_REFUSED
+        row["detail"] = direct_cbm.finding(agent)
     elif plan.status != PLAN_READY:
         row["classification"] = "unavailable"
         row["action"] = OUTCOME_UNAVAILABLE
@@ -764,6 +796,10 @@ def cmd_all(args) -> int:
     ``connect <agent>``, never a weaker batch shortcut:
 
     - already valid hosts are safe no-ops;
+    - a host holding a direct-CBM bypass — including a legacy file the
+      current product still imports — is classified ``legacy_bypass`` and
+      refused, never folded into a healthy no-op: the aggregate result is
+      a human decision, and the per-host row names the agent;
     - every write asks per host, interactively; a non-interactive run
       (no one to answer) declines every write rather than inventing a
       consent flag — nothing is written without an explicit per-host
@@ -971,6 +1007,12 @@ def cmd_check(args) -> int:
     reported state (pending/observed/stale/unknown), never an inference
     from file existence. Self-observed runtime evidence is displayed as
     exactly that — never as an externally attested fact.
+
+    R6J: a live direct-CBM registration in any scope this host loads or
+    imports (including a legacy file the current product still imports)
+    is a real problem, not a warning: it is reported as a finding, flips
+    ``valid`` and the exit code, and the compact output leads with the
+    removal action instead of a cosmetic pending state.
     """
     try:
         spec = resolve_connector(args.agent)
@@ -990,6 +1032,7 @@ def cmd_check(args) -> int:
     inspection = inspect_connector(spec, env)
     generated_state = _add_generated_state_guidance(spec, root, inspection)
     _add_discovery_note(spec, inspection)
+    direct_cbm = direct_cbm_state(spec, env, inspection=inspection)
     unreadable_scope_finding, shadow_hints = authoritative_scope_status(
         spec,
         env,
@@ -1001,7 +1044,7 @@ def cmd_check(args) -> int:
         launch,
         shadow_hints=shadow_hints,
         authoritative_scope_finding=unreadable_scope_finding or "",
-        legacy_scope_findings=legacy_scope_findings(spec, env),
+        direct_cbm=direct_cbm,
     )
     fingerprint = launch_fingerprint(launch)
     verification = _verification_section(root, spec.connector_id, fingerprint)
