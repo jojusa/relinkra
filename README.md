@@ -305,7 +305,10 @@ reduction ladder under a token budget:
   returned lengths, a continuation reference) and recorded in
   `truncated_source_ids`.
 - Token accounting uses the `cpt1` estimation method and is reported
-  with the packet, so an agent can see how its budget was spent.
+  with the packet, so an agent can see how its budget was spent. The
+  reported figures are final-packet cpt1 tokens over the exact delivered
+  serialization (an approximation, not an exact provider tokenizer
+  count).
 - When a budget cannot hold the must-keep skeleton, the error carries
   budget guidance (`minimum_useful_tokens`, `recommended_max_tokens`) —
   never a bare retry.

@@ -39,6 +39,7 @@ from .context_budget import (
     BudgetValidationError,
     apply_budget,
     resolve_budget,
+    settle_delivered_status,
 )
 from .context_builder import (
     ContextBuildError,
@@ -87,7 +88,7 @@ from .memory import (
 from .linkage import LinkageService
 from .registry import Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
-from .salience import build_status
+from .salience import settle_packet_status
 
 CONTRACT_VERSION = "relinkra.mcp/v1"
 
@@ -725,6 +726,7 @@ class RelinkraServices:
                         "max_estimated_tokens": resolved.max_estimated_tokens,
                     },
                 ) from None
+            original_packet = packet
             packet = result.packet
             if ranked is not None:
                 packet.diagnostics["relevance"] = {
@@ -733,6 +735,12 @@ class RelinkraServices:
                     "as_of": ranked.as_of,
                 }
             attach_budget(packet, result.decisions)
+            # attach_budget shifted the delivered bytes after the ladder
+            # settled the status block: re-settle the accounting over the
+            # exact final packet BEFORE the report is rebound to it.
+            settle_delivered_status(
+                original_packet, packet, result.decisions, resolved
+            )
             result.reconcile_final_packet(packet)
             if not result.satisfied:
                 raise ServiceError(
@@ -764,9 +772,11 @@ class RelinkraServices:
             # additive status block (guardrail omissions, salience
             # counts, sufficiency, token accounting). The R4D sidecar
             # channel marks the agent-facing path; legacy direct-builder
-            # consumers keep their exact wire form.
+            # consumers keep their exact wire form. The block settles to
+            # a fixed point over the final bytes, so the reported totals
+            # include the block itself.
             if packet.explainability:
-                packet.packet_status = build_status(packet)
+                settle_packet_status(packet)
 
         payload: Dict[str, Any] = {
             "packet_version": packet.packet_version,

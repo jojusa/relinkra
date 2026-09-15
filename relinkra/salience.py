@@ -585,3 +585,108 @@ def shrink_status(status: dict) -> Optional[dict]:
             del shrunk[key]
             return shrunk
     return None
+
+
+# Bounded settle rounds for the self-referential status block. The block
+# ships inside the payload its own accounting measures, so each round
+# re-measures the packet WITH the previous block attached; like the
+# budget diagnostics totals, digit-width changes settle in one or two
+# rounds and the bound only guards pathological oscillation.
+STATUS_SETTLE_MAX_ROUNDS = 8
+
+
+def _strip_token_accounting(status: dict) -> dict:
+    return {k: v for k, v in status.items() if k != "token_accounting"}
+
+
+def _status_claim_settled(attached: dict, rebuilt: dict) -> bool:
+    """True when ``rebuilt`` re-measures to exactly the attached block.
+
+    When the attached block ships WITHOUT ``token_accounting``
+    (conservative fallback below), the self-referential totals are
+    excluded from the comparison — and must stay excluded from the
+    shipped block, so a stale claim can never reappear.
+    """
+    if attached and "token_accounting" not in attached:
+        rebuilt = _strip_token_accounting(rebuilt)
+    return rebuilt == attached
+
+
+def _attach_settled_rebuild(attached: dict, rebuilt: dict) -> dict:
+    """The block to attach next, honoring an active conservative mode."""
+    if attached and "token_accounting" not in attached:
+        return _strip_token_accounting(rebuilt)
+    return rebuilt
+
+
+def _conservative_status_choice(
+    packet: ContextPacket,
+    candidates: Tuple[dict, ...],
+    chars_per_token: float,
+) -> dict:
+    """Deterministically pick the block to ship when no state is exactly
+    self-consistent. For each candidate the packet is serialized WITH it
+    attached and the actual cpt1 total is measured; exact matches win,
+    then over-estimates (never ship an under-count), ties by the larger
+    claim. Bounded: two candidates, one serialization each.
+    """
+    def rank(block: dict) -> Tuple[int, int]:
+        accounting = block.get("token_accounting") or {}
+        claimed = accounting.get("total_estimated_tokens")
+        previous = packet.packet_status
+        packet.packet_status = block
+        try:
+            actual = _tokens_for_chars(
+                len(packet.to_json()), chars_per_token
+            )
+        finally:
+            packet.packet_status = previous
+        if claimed is None:
+            return (3, 0)
+        delta = claimed - actual
+        order = 0 if delta == 0 else (1 if delta > 0 else 2)
+        return (order, claimed)
+
+    return min(candidates, key=rank)
+
+
+def settle_packet_status(
+    packet: ContextPacket,
+    *,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    max_rounds: int = STATUS_SETTLE_MAX_ROUNDS,
+) -> dict:
+    """Rebuild ``packet.packet_status`` over the EXACT bytes that ship.
+
+    The status block is part of the payload its ``token_accounting``
+    measures, so ``build_status`` must never run on a packet without the
+    block already attached: attaching it afterwards would deliver a
+    packet larger than the reported ``total_estimated_tokens``. Because
+    the block also carries numbers whose digit width changes the
+    serialized size, measurement is self-referential: each round
+    rebuilds the block from the packet WITH the previous block attached
+    and stops when the block re-measures to itself (equality with the
+    attached block implies the embedded totals were measured over the
+    final bytes). Call this as the LAST step before serialization,
+    after every mutation of the packet.
+
+    Conservative fallback when the bound is exhausted: at an exact
+    digit boundary the block's own totals can chase each other (two
+    states, each measuring the other's byte length) and no
+    self-consistent state exists. The shipped state is then chosen
+    deterministically by :func:`_conservative_status_choice` — exact if
+    possible, else the over-estimating one, never an under-count.
+    """
+    attached = packet.packet_status
+    rebuilt = build_status(packet, chars_per_token=chars_per_token)
+    for _ in range(max_rounds):
+        if _status_claim_settled(attached, rebuilt):
+            return attached
+        attached = _attach_settled_rebuild(attached, rebuilt)
+        packet.packet_status = attached
+        rebuilt = build_status(packet, chars_per_token=chars_per_token)
+    attached = _conservative_status_choice(
+        packet, (attached, rebuilt), chars_per_token
+    )
+    packet.packet_status = attached
+    return attached

@@ -85,6 +85,13 @@ only fits inside the reserve is reported unsatisfiable.
 - `len()` counts Unicode code points: cpt1 may diverge from real provider
   tokenizers (especially CJK/emoji). The method/version fields exist so a
   future exact-tokenizer adapter can replace it without changing policy.
+- Reported totals describe the **final packet that is actually
+  delivered**: the agent-visible `packet_status` block is part of the
+  measured payload, so its own cpt1 contribution is included. The block
+  is settled to a fixed point over the exact shipped bytes; at an exact
+  digit boundary a self-consistent state can provably not exist, and the
+  settle then ships the deterministic conservative state (at most one
+  token over, never under).
 
 ## Fixed section policy
 
@@ -176,7 +183,10 @@ packets, and on unbudgeted agent-facing packets): `packet_complete`,
 evidence is present), per-tier `salience` counts and cpt1
 `token_accounting` (`useful_payload_tokens`, `metadata_tokens`,
 `compression_ratio`, `duplicate_items_suppressed`,
-`duplicate_tokens_estimated` with its method label). Under extreme
+`duplicate_tokens_estimated` with its method label). `total_estimated_tokens`
+is the **final packet cpt1 tokens** figure: cpt1 over the exact
+delivered serialization, `packet_status` included — never an exact
+provider tokenizer count. Under extreme
 pressure the block shrinks along a fixed key order instead of ever
 breaking the budget guarantee. Per-type omission counts
 (`omitted_item_types`) live in the budget REPORT, not in the block, so

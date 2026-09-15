@@ -36,6 +36,7 @@ from .context_budget import (
     BudgetValidationError,
     apply_budget,
     resolve_budget,
+    settle_delivered_status,
 )
 from .context_builder import (
     ContextBuildError,
@@ -53,6 +54,7 @@ from .explainability import (
 from .memory import MemoryError, MemoryService, sanitize_error
 from .registry import DEFAULT_REGISTRY_PATH, Registry, RegistryError
 from .relevance import RELEVANCE_VERSION, RelevanceError, score_packet
+from .salience import settle_packet_status
 
 DEFAULT_REGISTRY = DEFAULT_REGISTRY_PATH
 
@@ -307,8 +309,15 @@ def main(
         except BudgetValidationError as exc:
             return _fail(str(exc))
         if result.satisfied:
+            original_packet = packet
             packet = result.packet
             attach_budget(packet, result.decisions)
+            # attach_budget shifted the delivered bytes after the ladder
+            # settled the status block: re-settle before the report is
+            # rebound to the final bytes.
+            settle_delivered_status(
+                original_packet, packet, result.decisions, budget
+            )
             result.reconcile_final_packet(packet)
         if not result.satisfied:
             error_doc = {
@@ -347,10 +356,10 @@ def main(
     elif args.explain and packet.explainability:
         # R6C: unbudgeted agent-facing packets carry the additive status
         # block (guardrail omissions, salience, sufficiency, accounting).
-        # Legacy no-explain output stays byte-identical.
-        from .salience import build_status
-
-        packet.packet_status = build_status(packet)
+        # The block settles to a fixed point over the final bytes so the
+        # reported totals include the block itself. Legacy no-explain
+        # output stays byte-identical.
+        settle_packet_status(packet)
 
     if args.explain and args.format == "markdown":
         print(human_summary(packet), end="")

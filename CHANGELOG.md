@@ -72,6 +72,18 @@ R6F sections below are part of the same unreleased 0.1.4 pool.
   remains Relinkra-first, source-authoritative, and expand-on-demand;
   token optimization removes redundancy, never evidence.
 
+### Fixed
+
+- Final-packet token accounting: the `packet_status` cpt1 totals now
+  measure the exact delivered packet — the block is settled onto the
+  packet before measurement instead of being appended afterwards, so
+  unbudgeted packets no longer under-count the bytes they ship. The
+  same re-settlement runs after post-ladder metadata attach on budgeted
+  packets. At an exact digit boundary no self-consistent state exists;
+  the settle then ships the deterministic conservative state (at most
+  one token over, never under). These are cpt1 approximations over the
+  serialized packet, not exact provider tokenizer counts.
+
 ## Unreleased — R6E multiagent UX and routing
 
 Not yet published; no version bump.

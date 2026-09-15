@@ -167,6 +167,9 @@ from .salience import (  # noqa: F401  (re-exported: the shared classification
     IMPORTANT_MEMORY_TYPES,
     MUST_KEEP,
     STRUCTURAL_EVIDENCE_KINDS,
+    _attach_settled_rebuild,
+    _conservative_status_choice,
+    _status_claim_settled,
     build_status,
     build_status_skeleton,
     classify_git_fact,
@@ -1089,30 +1092,123 @@ def _settle_packet_status(
     """Rebuild the TRUE packet_status block to a fixed point: the block
     carries token accounting measured over the payload it ships in, so
     each round re-settles the self-referential diagnostics totals and
-    rebuilds until the block stops changing (bounded rounds; digit-width
-    convergence exactly like the diagnostics totals)."""
+    rebuilds until the block re-measures to itself (bounded rounds;
+    digit-width convergence exactly like the diagnostics totals).
+
+    Conservative fallback: near a digit boundary the block totals and
+    the diagnostics totals can chase each other (both are part of the
+    bytes they measure) and neither state is exactly self-consistent.
+    The shipped state is then chosen deterministically by
+    :func:`_conservative_status_choice` — exact if possible, else the
+    over-estimating one, never an under-count."""
     omitted_pairs = _omitted_items(packet, actions)
     budget_truncated = _budget_truncated(actions)
-    working.packet_status = build_status(
-        working,
-        original_packet=packet,
-        budget_omitted_items=omitted_pairs,
-        budget_truncated=budget_truncated,
-        chars_per_token=cpt,
-    )
-    for _ in range(3):
-        _budget_stats(packet, working, budget, actions, True)
-        rebuilt = build_status(
+
+    def rebuild() -> dict:
+        return build_status(
             working,
             original_packet=packet,
             budget_omitted_items=omitted_pairs,
             budget_truncated=budget_truncated,
             chars_per_token=cpt,
         )
-        if rebuilt == working.packet_status:
-            break
-        working.packet_status = rebuilt
-    _budget_stats(packet, working, budget, actions, True)
+
+    def settle_pass() -> bool:
+        """One bounded settle round: rebuild until the block re-measures
+        to itself, else apply the conservative choice. Returns whether
+        the shipped block is exactly self-consistent."""
+        attached = working.packet_status
+        rebuilt = rebuild()
+        for _ in range(3):
+            if _status_claim_settled(attached, rebuilt):
+                return True
+            attached = _attach_settled_rebuild(attached, rebuilt)
+            working.packet_status = attached
+            _budget_stats(packet, working, budget, actions, True)
+            rebuilt = rebuild()
+        if _status_claim_settled(attached, rebuilt):
+            return True
+        working.packet_status = _conservative_status_choice(
+            working, (attached, rebuilt), cpt
+        )
+        _budget_stats(packet, working, budget, actions, True)
+        return False
+
+    if not settle_pass():
+        # The trailing diagnostics refresh can shift bytes across a width
+        # boundary after the conservative choice; one re-pass settles the
+        # claim over the refreshed bytes (bounded, deterministic).
+        settle_pass()
+
+
+def _actions_from_decisions(
+    decisions: List[BudgetDecision],
+) -> Dict[Tuple[str, str, int], Tuple[str, str]]:
+    """Rebuild the ladder's (kind, source_id, occurrence) action map from
+    the audit decisions. Decisions are emitted in original packet order,
+    one row per content unit, so the same (section, source_id) counting
+    reproduces the exact occurrence indices; snippet rows carry their
+    parent fact's occurrence under the ``snippet:`` source-id prefix."""
+    actions: Dict[Tuple[str, str, int], Tuple[str, str]] = {}
+    counters: Dict[Tuple[str, str], int] = {}
+    for decision in decisions or ():
+        if decision.section == "essential":
+            continue
+        key = (decision.section, decision.source_id)
+        occurrence = counters.get(key, 0)
+        counters[key] = occurrence + 1
+        kind = _SECTION_KINDS.get(decision.section)
+        if kind is None:
+            continue
+        source_id = decision.source_id
+        if source_id.startswith("snippet:"):
+            actions[("snippet", source_id[len("snippet:"):], occurrence)] = (
+                decision.action,
+                decision.reason,
+            )
+        else:
+            actions[(kind, source_id, occurrence)] = (
+                decision.action,
+                decision.reason,
+            )
+    return actions
+
+
+def settle_delivered_status(
+    packet: ContextPacket,
+    working: ContextPacket,
+    decisions: List[BudgetDecision],
+    budget: ContextBudget,
+) -> None:
+    """Re-settle ``working``'s status block after post-ladder mutations.
+
+    The ladder settled ``packet_status`` against ITS final bytes; any
+    additive metadata attached afterwards (per-item budget treatments,
+    freshness tags) shifts those bytes, leaving the block's
+    ``token_accounting`` describing a packet that is no longer the one
+    delivered. This rebuilds the block and the self-referential
+    diagnostics totals to a fixed point over the exact delivered
+    payload. Call BEFORE ``reconcile_final_packet`` so the report is
+    rebound to the settled bytes.
+
+    When the ladder already SHRANK the block (extreme pressure; no
+    ``token_accounting`` key left), the shrink decision is preserved:
+    only the self-referential diagnostics totals are refreshed, and the
+    block is never grown back over a budget that forced it down.
+    """
+    actions = _actions_from_decisions(decisions)
+    status = working.packet_status
+    if status and "token_accounting" not in status:
+        _budget_stats(packet, working, budget, actions, True)
+        return
+    _settle_packet_status(
+        packet,
+        working,
+        budget,
+        actions,
+        budget.chars_per_token,
+        current_handoff_memory_id(packet),
+    )
 
 
 def _shrink_to_fit(
