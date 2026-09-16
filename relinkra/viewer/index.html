@@ -56,7 +56,52 @@
     </section>
 
     <section id="panel-metrics" class="panel" hidden>
-      <p class="placeholder">No ContextPacket metrics recorded yet</p>
+      <p id="metrics-status" class="advisory" aria-live="polite">No ContextPacket metrics recorded yet. Run an agent through Relinkra first.</p>
+      <p id="metrics-stale" class="advisory" hidden>Metrics are from an earlier revision.</p>
+      <p id="metrics-meta" class="muted" aria-live="polite"></p>
+      <section class="metric-card metric-primary-card">
+        <h2>Latest context</h2>
+        <div class="metrics-primary">
+          <div class="metric-value"><span>Final CPT1</span><strong id="metric-final-cpt1">UNKNOWN</strong></div>
+          <div class="metric-value"><span>Useful CPT1</span><strong id="metric-useful-cpt1">UNKNOWN</strong></div>
+          <div class="metric-value"><span>Metadata CPT1</span><strong id="metric-metadata-cpt1">UNKNOWN</strong></div>
+        </div>
+      </section>
+      <div class="metrics-grid">
+        <section class="metric-card"><h2>Composition</h2><dl id="metrics-composition" class="facts">
+          <div class="fact"><dt>Memory facts</dt><dd id="metric-memory-facts">UNKNOWN</dd></div>
+          <div class="fact"><dt>Code references</dt><dd id="metric-code-references">UNKNOWN</dd></div>
+          <div class="fact"><dt>Code facts</dt><dd id="metric-code-facts">UNKNOWN</dd></div>
+          <div class="fact"><dt>Handoffs</dt><dd id="metric-handoffs">UNKNOWN</dd></div>
+          <div class="fact"><dt>Pending / blockers</dt><dd id="metric-pending">UNKNOWN</dd></div>
+          <div class="fact"><dt>Git facts</dt><dd id="metric-git-facts">UNKNOWN</dd></div>
+        </dl></section>
+        <section class="metric-card"><h2>Status</h2><dl id="metrics-quality" class="facts">
+          <div class="fact"><dt>Packet complete</dt><dd id="metric-packet-complete">UNKNOWN</dd></div>
+          <div class="fact"><dt>Retrieval</dt><dd id="metric-retrieval-complete">UNKNOWN</dd></div>
+          <div class="fact"><dt>Budget</dt><dd id="metric-budget-exhausted">UNKNOWN</dd></div>
+          <div class="fact"><dt>Truncation</dt><dd id="metric-truncated">UNKNOWN</dd></div>
+          <div class="fact"><dt>Context sufficiency</dt><dd id="metric-context-sufficiency">UNKNOWN</dd></div>
+          <div class="fact"><dt>Omitted sections</dt><dd id="metric-omitted-sections">UNKNOWN</dd></div>
+          <div class="fact"><dt>Omitted high-salience</dt><dd id="metric-omitted-high">UNKNOWN</dd></div>
+        </dl></section>
+        <section class="metric-card"><h2>Runtime identity</h2><dl id="metrics-identity" class="facts">
+          <div class="fact"><dt>Project</dt><dd id="metric-project-id">UNKNOWN</dd></div>
+          <div class="fact"><dt>Workspace</dt><dd id="metric-workspace-id">UNKNOWN</dd></div>
+          <div class="fact"><dt>Revision</dt><dd id="metric-revision">UNKNOWN</dd></div>
+          <div class="fact"><dt>Host bucket</dt><dd id="metric-host-bucket">UNKNOWN</dd></div>
+          <div class="fact"><dt>Currentness</dt><dd id="metric-currentness">UNKNOWN</dd></div>
+        </dl></section>
+      </div>
+      <section class="metric-card metrics-history-card">
+        <h2>Recent observations</h2>
+        <div class="table-scroll">
+          <table id="metrics-history" class="metrics-table">
+            <thead><tr><th scope="col">Timestamp</th><th scope="col">Final CPT1</th><th scope="col">Useful CPT1</th><th scope="col">Metadata CPT1</th><th scope="col">Composition</th><th scope="col">Complete</th><th scope="col">Truncated</th></tr></thead>
+            <tbody id="metrics-history-body"></tbody>
+          </table>
+        </div>
+      </section>
     </section>
 
     <section id="panel-status" class="panel">

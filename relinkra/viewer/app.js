@@ -8,6 +8,7 @@
     status: document.getElementById("panel-status")
   };
   var statusLoaded = false;
+  var metricsLoaded = false;
 
   // -- graph explorer constants (bounds mirror the server contract) ----
 
@@ -52,6 +53,9 @@
     });
     if (name === "status") {
       loadStatus();
+    }
+    if (name === "metrics") {
+      loadMetrics();
     }
     if (name === "graph") {
       loadGraphAdvisory();
@@ -985,6 +989,141 @@
         clearFields();
         action.textContent = "Could not load status from the local server.";
       });
+  }
+
+  // -- metrics (VIS-3) -----------------------------------------------
+
+  function yesNoUnknown(value) {
+    if (value === true) return "YES";
+    if (value === false) return "NO";
+    return "UNKNOWN";
+  }
+
+  function metricValue(value) {
+    if (typeof value === "number" && isFinite(value)) return String(value);
+    if (typeof value === "string" && value !== "") return value;
+    return "UNKNOWN";
+  }
+
+  function setMetric(id, value) {
+    setText(id, value);
+  }
+
+  function resetMetrics() {
+    [
+      "metric-final-cpt1", "metric-useful-cpt1", "metric-metadata-cpt1",
+      "metric-memory-facts", "metric-code-references", "metric-code-facts",
+      "metric-handoffs", "metric-pending", "metric-git-facts",
+      "metric-packet-complete", "metric-retrieval-complete",
+      "metric-budget-exhausted", "metric-truncated", "metric-context-sufficiency",
+      "metric-omitted-sections", "metric-omitted-high", "metric-project-id", "metric-workspace-id",
+      "metric-revision", "metric-host-bucket", "metric-currentness"
+    ].forEach(function (id) { setMetric(id, "UNKNOWN"); });
+    document.getElementById("metrics-meta").textContent = "";
+    document.getElementById("metrics-stale").hidden = true;
+    clearChildren(document.getElementById("metrics-history-body"));
+  }
+
+  function contextSufficiencyText(value) {
+    if (!value || typeof value !== "object") return "UNKNOWN";
+    var parts = [];
+    Object.keys(value).sort().forEach(function (key) {
+      if (typeof value[key] === "string") parts.push(key + ": " + value[key]);
+    });
+    return parts.length ? parts.join(", ") : "UNKNOWN";
+  }
+
+  function compositionText(value) {
+    value = value || {};
+    return "M " + metricValue(value.memory_facts) +
+      " · refs " + metricValue(value.code_references) +
+      " · facts " + metricValue(value.code_facts) +
+      " · handoffs " + metricValue(value.handoffs) +
+      " · pending " + metricValue(value.pending) +
+      " · git " + metricValue(value.git_facts);
+  }
+
+  function renderHistory(historyPayload) {
+    var body = document.getElementById("metrics-history-body");
+    clearChildren(body);
+    (historyPayload && Array.isArray(historyPayload.history) ? historyPayload.history : []).forEach(function (item) {
+      var row = element("tr");
+      var accounting = item.accounting || {};
+      var quality = item.quality || {};
+      [
+        item.observed_at || "UNKNOWN",
+        metricValue(accounting.final_cpt1),
+        metricValue(accounting.useful_cpt1),
+        metricValue(accounting.metadata_cpt1),
+        compositionText(item.composition),
+        yesNoUnknown(quality.packet_complete),
+        yesNoUnknown(quality.truncated)
+      ].forEach(function (value) { row.appendChild(element("td", null, value)); });
+      body.appendChild(row);
+    });
+  }
+
+  function renderMetrics(payload, historyPayload) {
+    var observation = payload && payload.observation;
+    var status = document.getElementById("metrics-status");
+    resetMetrics();
+    if (!observation) {
+      status.textContent = payload && payload.storage === "degraded"
+        ? "Metrics storage is degraded; no valid current observation is available."
+        : "No ContextPacket metrics recorded yet. Run an agent through Relinkra first.";
+      renderHistory(historyPayload);
+      return;
+    }
+    var accounting = observation.accounting || {};
+    var composition = observation.composition || {};
+    var quality = observation.quality || {};
+    var retrieval = observation.retrieval || {};
+    var identity = observation.identity || {};
+    setMetric("metric-final-cpt1", metricValue(accounting.final_cpt1));
+    setMetric("metric-useful-cpt1", metricValue(accounting.useful_cpt1));
+    setMetric("metric-metadata-cpt1", metricValue(accounting.metadata_cpt1));
+    setMetric("metric-memory-facts", metricValue(composition.memory_facts));
+    setMetric("metric-code-references", metricValue(composition.code_references));
+    setMetric("metric-code-facts", metricValue(composition.code_facts));
+    setMetric("metric-handoffs", metricValue(composition.handoffs));
+    setMetric("metric-pending", metricValue(composition.pending));
+    setMetric("metric-git-facts", metricValue(composition.git_facts));
+    setMetric("metric-packet-complete", yesNoUnknown(quality.packet_complete));
+    setMetric("metric-retrieval-complete", yesNoUnknown(retrieval.complete));
+    setMetric("metric-budget-exhausted", yesNoUnknown(quality.budget_exhausted));
+    setMetric("metric-truncated", yesNoUnknown(quality.truncated));
+    setMetric("metric-context-sufficiency", contextSufficiencyText(quality.context_sufficiency));
+    var omittedSections = quality.omitted_sections;
+    setMetric("metric-omitted-sections", Array.isArray(omittedSections)
+      ? (omittedSections.length ? omittedSections.join(", ") : "NONE")
+      : "UNKNOWN");
+    setMetric("metric-omitted-high", metricValue(quality.omitted_high_salience));
+    setMetric("metric-project-id", metricValue(identity.project_id));
+    setMetric("metric-workspace-id", metricValue(identity.workspace_id));
+    setMetric("metric-revision", metricValue(identity.revision));
+    setMetric("metric-host-bucket", metricValue(observation.host_bucket));
+    setMetric("metric-currentness", String(payload.currentness || "unknown").toUpperCase());
+    status.textContent = "Latest observation: " + String(payload.currentness || "unknown").toUpperCase();
+    if (payload.currentness === "stale") {
+      document.getElementById("metrics-stale").hidden = false;
+    } else if (payload.currentness === "foreign") {
+      status.textContent += ". Metrics belong to another project or workspace.";
+    }
+    var age = typeof observation.age_seconds === "number" ? Math.round(observation.age_seconds) + "s ago" : "age unknown";
+    document.getElementById("metrics-meta").textContent =
+      "Observed " + (observation.observed_at || "UNKNOWN") + " (" + age + ") · revision " + (identity.revision || "UNKNOWN");
+    renderHistory(historyPayload);
+  }
+
+  function loadMetrics() {
+    if (metricsLoaded) return;
+    var status = document.getElementById("metrics-status");
+    requestJson("/api/metrics/current", function (current) {
+      fetch("/api/metrics/history", { cache: "no-store", headers: { Accept: "application/json" } })
+        .then(function (response) { return response.json(); })
+        .then(function (history) { metricsLoaded = true; renderMetrics(current, history); })
+        .catch(function () { metricsLoaded = true; renderMetrics(current, null); });
+    }, function () { status.textContent = "Metrics are unavailable."; });
   }
 
   setKind("symbol");

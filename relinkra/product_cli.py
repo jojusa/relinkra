@@ -53,6 +53,7 @@ from . import (
     cbm_acquire,
     cbm_indexing,
     cbm_support,
+    context_metrics,
     viewer,
     viewer_graph,
 )
@@ -3236,6 +3237,40 @@ def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
     }
 
 
+def _viewer_metrics_identity(root: str, project_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve only the path-free identity needed to classify observations."""
+    try:
+        config = WorkspaceConfig.load(Path(root))
+    except Exception:
+        config = None
+    workspace_id = _viewer_workspace_id(root, config)
+    try:
+        revision = git_head_sha(root)
+    except Exception:
+        revision = None
+    return project_id, workspace_id, revision
+
+
+def _viewer_metrics_current_payload(root: str, project_id: str, params=None) -> Dict[str, Any]:
+    project, workspace, revision = _viewer_metrics_identity(root, project_id)
+    return context_metrics.metrics_payload(
+        root, project_id=project, workspace_id=workspace, revision=revision
+    )
+
+
+def _viewer_metrics_history_payload(root: str, project_id: str, params=None) -> Dict[str, Any]:
+    project, workspace, revision = _viewer_metrics_identity(root, project_id)
+    requested_limit = None
+    if isinstance(params, dict):
+        values = params.get("limit") or []
+        if values:
+            requested_limit = values[0]
+    return context_metrics.metrics_payload(
+        root, project_id=project, workspace_id=workspace, revision=revision,
+        history=True, limit=requested_limit,
+    )
+
+
 def cmd_cbm_open(args) -> int:
     """Serve the read-only local viewer for this workspace until Ctrl+C.
 
@@ -3258,11 +3293,19 @@ def cmd_cbm_open(args) -> int:
     def graph_node_provider(params: Dict[str, List[str]]) -> Tuple[int, dict]:
         return _viewer_graph_node_payload(root, project_id, params)
 
+    def metrics_current_provider(params=None) -> Dict[str, Any]:
+        return _viewer_metrics_current_payload(root, project_id, params)
+
+    def metrics_history_provider(params=None) -> Dict[str, Any]:
+        return _viewer_metrics_history_payload(root, project_id, params)
+
     try:
         server = viewer.create_server(
             status_provider,
             graph_search_provider=graph_search_provider,
             graph_node_provider=graph_node_provider,
+            metrics_current_provider=metrics_current_provider,
+            metrics_history_provider=metrics_history_provider,
             port=args.port,
         )
     except OSError as exc:

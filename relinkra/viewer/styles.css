@@ -291,6 +291,31 @@ main {
   font-size: 0.9rem;
 }
 
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.metric-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  background: var(--panel, transparent);
+}
+
+.metric-card h2 { margin: 0 0 0.7rem; font-size: 1rem; }
+.metric-primary-card { margin-bottom: 1rem; }
+.metrics-primary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.75rem; }
+.metric-value { padding: 0.8rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.metric-value span { display: block; color: var(--muted); font-size: 0.78rem; }
+.metric-value strong { display: block; margin-top: 0.25rem; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 1.15rem; }
+.metrics-history-card { margin-top: 1rem; }
+.table-scroll { overflow-x: auto; }
+.metrics-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.metrics-table th, .metrics-table td { padding: 0.5rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.metrics-table th { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }
+
 #graph-advisory,
 #graph-cap {
   border-left-color: #c98a00;

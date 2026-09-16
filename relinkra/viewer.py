@@ -2,8 +2,9 @@
 
 A minimal loopback HTTP server that serves the packaged viewer shell
 (``relinkra/viewer/``) plus JSON routes whose payloads callers supply:
-one status route and two bounded graph-explorer routes (search and
-node). This module knows nothing about CBM, Engram, or the graph: it
+one status route, two bounded graph-explorer routes (search and node), and
+two read-only metrics routes (current and history). This module knows
+nothing about CBM, Engram, or the graph: it
 sequences no workflow, executes no backend, reads no database, and
 persists nothing.
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import http.server
 import importlib.resources
+import inspect
 import json
 import os
 import socketserver
@@ -67,11 +69,17 @@ STATUS_PATH = "/api/status"
 GRAPH_SEARCH_PATH = "/api/graph/search"
 GRAPH_NODE_PATH = "/api/graph/node"
 
+# Exact-match metrics routes. Providers own identity resolution and storage;
+# this transport remains a path-free read-only shell.
+METRICS_CURRENT_PATH = "/api/metrics/current"
+METRICS_HISTORY_PATH = "/api/metrics/history"
+
 #: Fixed, non-sensitive failure body for a status provider that raises.
 _STATUS_ERROR = {"error": "status unavailable"}
 
 #: Fixed, non-sensitive failure body for an absent/failing graph provider.
 _GRAPH_ERROR = {"error": "graph unavailable"}
+_METRICS_ERROR = {"error": "metrics unavailable"}
 
 _ASSET_CACHE: Dict[str, Optional[bytes]] = {}
 
@@ -152,6 +160,9 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
         if path in (GRAPH_SEARCH_PATH, GRAPH_NODE_PATH):
             self._serve_graph(path)
             return
+        if path in (METRICS_CURRENT_PATH, METRICS_HISTORY_PATH):
+            self._serve_metrics(path)
+            return
         self._respond(404, _TEXT, b"Not found")
 
     def _serve_status(self) -> None:
@@ -205,6 +216,50 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         self._respond(status, _JSON, body)
 
+    def _serve_metrics(self, path: str) -> None:
+        attribute = (
+            "metrics_current_provider"
+            if path == METRICS_CURRENT_PATH
+            else "metrics_history_provider"
+        )
+        provider: Optional[Callable[..., Any]] = getattr(self.server, attribute, None)
+        is_history = path == METRICS_HISTORY_PATH
+        empty = (
+            {"schema_version": 1, "history": [], "count": 0,
+             "no_data": True, "storage": "unavailable"}
+            if is_history
+            else {"schema_version": 1, "currentness": "unknown",
+                  "observation": None, "no_data": True,
+                  "storage": "unavailable"}
+        )
+        if provider is None:
+            body = json.dumps(empty, indent=2, sort_keys=True).encode("utf-8")
+            self._respond(200, _JSON, body)
+            return
+        try:
+            params = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query, keep_blank_values=True
+            )
+            try:
+                signature = inspect.signature(provider)
+                accepts_params = any(
+                    parameter.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                       inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                       inspect.Parameter.VAR_POSITIONAL)
+                    for parameter in signature.parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_params = False
+            payload = provider(params) if accepts_params else provider()
+            if not isinstance(payload, dict):
+                raise ValueError("metrics provider returned a non-object")
+            body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        except Exception:
+            body = json.dumps(_METRICS_ERROR, indent=2, sort_keys=True).encode("utf-8")
+            self._respond(500, _JSON, body)
+            return
+        self._respond(200, _JSON, body)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         self._serve()
 
@@ -255,10 +310,14 @@ class ViewerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         status_provider: Optional[Callable[[], Any]] = None,
         graph_search_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
         graph_node_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        metrics_current_provider: Optional[Callable[[], Any]] = None,
+        metrics_history_provider: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.status_provider = status_provider
         self.graph_search_provider = graph_search_provider
         self.graph_node_provider = graph_node_provider
+        self.metrics_current_provider = metrics_current_provider
+        self.metrics_history_provider = metrics_history_provider
         super().__init__(server_address, RequestHandlerClass)
 
 
@@ -267,6 +326,8 @@ def create_server(
     *,
     graph_search_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
     graph_node_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    metrics_current_provider: Optional[Callable[[], Any]] = None,
+    metrics_history_provider: Optional[Callable[[], Any]] = None,
     port: int = 0,
     host: str = VIEWER_HOST,
 ) -> ViewerServer:
@@ -285,6 +346,8 @@ def create_server(
         status_provider,
         graph_search_provider,
         graph_node_provider,
+        metrics_current_provider,
+        metrics_history_provider,
     )
 
 

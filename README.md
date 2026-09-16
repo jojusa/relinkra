@@ -418,8 +418,14 @@ accept `--path`, `--json`, and `--mode fast`.
   50 nodes initially and 100 after expansion, always reporting what was
   trimmed instead of dropping it silently. Coverage, truncation, and stale or
   missing-index indicators are shown, so a bounded graph result never claims
-  to be complete. The Metrics tab remains a placeholder: no metrics
-  persistence ships yet.
+  to be complete. The Metrics tab shows bounded, local observations from
+  final ContextPackets (CPT1 accounting and quality/composition signals).
+  CPT1 is Relinkra's deterministic accounting metric, not provider/model
+  billing tokens. Metrics are observability only: they do not claim model
+  token usage or savings. The local store retains bounded counts, flags and
+  accounting only — never prompts, memory bodies, source snippets, task text
+  or handoff bodies — and records stay under `.relinkra/` rather than being
+  sent to a host.
 - **No automatic lifecycle.** Opening the viewer never indexes or refreshes;
   stale or missing indexes are reported with the exact command to run.
 - **Options.** `--path`, `--port PORT` (default `0`: the OS picks a free

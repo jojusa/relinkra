@@ -31,6 +31,7 @@ import sys
 from typing import Optional
 
 from . import cbm_support
+from .context_metrics import record_context_observation
 from .cbm_adapter import CBMAdapterError
 from .context_budget import (
     BudgetValidationError,
@@ -360,6 +361,11 @@ def main(
         # reported totals include the block itself. Legacy no-explain
         # output stays byte-identical.
         settle_packet_status(packet)
+
+    # Observability is deliberately after every final settlement and before
+    # any wire serialization. A missing/failed local metrics write never
+    # changes the successful context response.
+    record_context_observation(args.workspace_root, packet)
 
     if args.explain and args.format == "markdown":
         print(human_summary(packet), end="")

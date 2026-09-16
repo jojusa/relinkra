@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import __version__, cbm_support
+from .context_metrics import record_context_observation
 from .cbm_adapter import (
     ARCHITECTURE_MAX_LIMIT,
     CBMAdapterError,
@@ -777,6 +778,11 @@ class RelinkraServices:
             # include the block itself.
             if packet.explainability:
                 settle_packet_status(packet)
+
+        # Metrics are a local, best-effort side channel.  Capture only after
+        # every budget/status settlement so CPT1 values describe the exact
+        # final packet, and before any portable serialization occurs.
+        record_context_observation(self.config.workspace_root, packet)
 
         payload: Dict[str, Any] = {
             "packet_version": packet.packet_version,
