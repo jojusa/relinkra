@@ -83,6 +83,94 @@ class _FakeAdapter:
         return {"total_nodes": self.nodes, "total_edges": self.edges}
 
 
+class _FakeGraphAdapter:
+    """Recording stand-in for the VIS-2 bounded graph adapter."""
+
+    instances = []
+    search_page = None
+    neighborhood = None
+    lookup = None
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.search_calls = []
+        self.neighborhood_calls = []
+        self.lookup_calls = []
+        _FakeGraphAdapter.instances.append(self)
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+        cls.search_page = None
+        cls.neighborhood = None
+        cls.lookup = None
+
+    def search_graph_page(self, *, query=None, file_path=None, limit=20):
+        self.search_calls.append(
+            {"query": query, "file_path": file_path, "limit": limit}
+        )
+        if self.search_page is None:
+            return {"results": [], "total": 0, "has_more": False}
+        return self.search_page
+
+    def graph_neighborhood(
+        self,
+        *,
+        qualified_name,
+        depth=1,
+        include_tests=True,
+        inbound_limit=20,
+        outbound_limit=20,
+    ):
+        self.neighborhood_calls.append(
+            {
+                "qualified_name": qualified_name,
+                "depth": depth,
+                "include_tests": include_tests,
+            }
+        )
+        if self.neighborhood is None:
+            return {
+                "inbound": [],
+                "outbound": [],
+                "coverage": {
+                    "inbound": {
+                        "returned": 0,
+                        "limit": 20,
+                        "truncated": False,
+                        "total": None,
+                    },
+                    "outbound": {
+                        "returned": 0,
+                        "limit": 20,
+                        "truncated": False,
+                        "total": None,
+                    },
+                },
+            }
+        return self.neighborhood
+
+    def graph_node_lookup(self, relative_qualified_name, *, project=None, limit=50):
+        self.lookup_calls.append(relative_qualified_name)
+        return self.lookup
+
+
+GRAPH_CANDIDATE = {
+    "name": "func",
+    "qualified_name": f"{PROJECT}.relinkra.x.func",
+    "relative_qualified_name": "relinkra.x.func",
+    "label": "Function",
+    "file_path": "relinkra/x.py",
+    "start_line": 3,
+    "end_line": 9,
+    "is_test": False,
+    "in_degree": 2,
+    "out_degree": 1,
+}
+
+GRAPH_PID = "rlk_" + "a" * 32
+
+
 def _walk_strings(value):
     if isinstance(value, str):
         yield value
@@ -99,6 +187,7 @@ class ViewerCLITestCase(unittest.TestCase):
 
     def setUp(self):
         _FakeAdapter.reset()
+        _FakeGraphAdapter.reset()
         if shutil.which("git") is None:
             self.skipTest("git is required for the cbm open CLI tests")
         tmp = tempfile.mkdtemp(prefix="rlk-viewer-cli-")
@@ -214,8 +303,14 @@ class CbmOpenServerTests(ViewerCLITestCase):
         created = []
         calls = []
 
-        def tracking_create(provider, *, port=0, host=product_cli.viewer.VIEWER_HOST):
-            server = real_create(provider, port=port, host=host)
+        def tracking_create(
+            provider,
+            *,
+            port=0,
+            host=product_cli.viewer.VIEWER_HOST,
+            **providers,
+        ):
+            server = real_create(provider, port=port, host=host, **providers)
             created.append(server)
             self.addCleanup(server.server_close)
             return server
@@ -276,8 +371,14 @@ class CbmOpenServerTests(ViewerCLITestCase):
         real_create = product_cli.viewer.create_server
         created = []
 
-        def tracking_create(provider, *, port=0, host=product_cli.viewer.VIEWER_HOST):
-            server = real_create(provider, port=port, host=host)
+        def tracking_create(
+            provider,
+            *,
+            port=0,
+            host=product_cli.viewer.VIEWER_HOST,
+            **providers,
+        ):
+            server = real_create(provider, port=port, host=host, **providers)
             created.append(server)
             self.addCleanup(server.server_close)
             return server
@@ -297,6 +398,179 @@ class CbmOpenServerTests(ViewerCLITestCase):
         self.assertEqual(payload["port"], created[0].server_address[1])
         self.assertEqual(payload["url"], f"http://127.0.0.1:{payload['port']}")
         self.assertNotIn("Relinkra Viewer", out)
+
+    def test_open_passes_the_graph_providers_into_create_server(self):
+        captured = {}
+        real_create = product_cli.viewer.create_server
+
+        def tracking_create(provider, **kwargs):
+            captured.update(kwargs)
+            return real_create(provider, **kwargs)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(product_cli.viewer, "create_server", tracking_create)
+            )
+            stack.enter_context(
+                mock.patch.object(product_cli.viewer, "run_forever", mock.Mock())
+            )
+            code, out, err = self.run_cli("cbm", "open", "--no-open", "--json")
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("graph_search_provider", captured)
+        self.assertIn("graph_node_provider", captured)
+        self.assertTrue(callable(captured["graph_search_provider"]))
+        self.assertTrue(callable(captured["graph_node_provider"]))
+        self.assertIn("port", captured)
+
+
+class ViewerGraphPayloadTests(ViewerCLITestCase):
+    """VIS-2 graph routes: the CBM gate and the shaped payloads."""
+
+    def graph_patches(self, binary=BIN, adapter=True):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            mock.patch.object(
+                product_cli.cbm_support,
+                "resolve_cbm_binary",
+                lambda root=None, environ=None: binary,
+            )
+        )
+        if adapter:
+            stack.enter_context(
+                mock.patch.object(product_cli, "CBMCLIAdapter", _FakeGraphAdapter)
+            )
+        return stack
+
+    def test_search_returns_the_bounded_payload(self):
+        self.register_record()
+        self.write_managed_db()
+        _FakeGraphAdapter.search_page = {
+            "results": [dict(GRAPH_CANDIDATE)],
+            "total": 3,
+            "has_more": True,
+        }
+        with self.graph_patches():
+            status, payload = product_cli._viewer_graph_search_payload(
+                self.repo,
+                {"q": ["widget"], "kind": ["symbol"], "limit": ["5"]},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["viewer_contract"], "relinkra.viewer/v1")
+        self.assertEqual(payload["coverage"]["notice"], "Showing 1 of 3 matches.")
+        self.assertEqual(payload["results"][0]["key"], "relinkra.x.func")
+        adapter = _FakeGraphAdapter.instances[0]
+        self.assertEqual(
+            adapter.search_calls,
+            [{"query": "widget", "file_path": None, "limit": 5}],
+        )
+        self.assertEqual(adapter.kwargs["cbm_project_name"], PROJECT)
+
+    def test_node_returns_the_bounded_payload(self):
+        self.register_record()
+        self.write_managed_db()
+        _FakeGraphAdapter.lookup = dict(GRAPH_CANDIDATE)
+        with self.graph_patches():
+            status, payload = product_cli._viewer_graph_node_payload(
+                self.repo,
+                GRAPH_PID,
+                {"key": ["relinkra.x.func"]},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["focal"]["name"], "func")
+        self.assertEqual(payload["focal"]["key"], "relinkra.x.func")
+        reference = payload["focal"]["reference"]
+        self.assertRegex(reference["code_reference_id"], r"^ref_[0-9a-f]{32}$")
+        self.assertEqual(payload["coverage"]["node_caps"], {"initial": 50, "expanded": 100})
+        self.assertEqual(len(_FakeGraphAdapter.instances), 1)
+        self.assertIs(
+            _FakeGraphAdapter.instances[0].neighborhood_calls[0]["include_tests"],
+            True,
+        )
+
+    def test_missing_binary_is_503_with_a_setup_action(self):
+        with mock.patch.object(
+            product_cli.cbm_support,
+            "resolve_cbm_binary",
+            mock.Mock(return_value=None),
+        ), mock.patch.object(product_cli, "CBMCLIAdapter", _FakeGraphAdapter):
+            status, payload = product_cli._viewer_graph_search_payload(
+                self.repo, {"q": ["x"]}
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            payload,
+            {
+                "error": "cbm_unavailable",
+                "message": "CBM is unavailable.",
+                "next_action": "relinkra cbm setup",
+            },
+        )
+        self.assertEqual(_FakeGraphAdapter.instances, [])
+
+    def test_missing_index_is_409_with_an_index_action(self):
+        with self.graph_patches():
+            status, payload = product_cli._viewer_graph_node_payload(
+                self.repo, GRAPH_PID, {"key": ["a.b"]}
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "index_missing")
+        self.assertEqual(
+            payload["message"], "The CBM index is missing for this workspace."
+        )
+        self.assertEqual(payload["next_action"], "relinkra cbm index")
+        self.assertEqual(_FakeGraphAdapter.instances, [])
+
+    def test_invalid_params_are_400_without_touching_cbm(self):
+        resolver = mock.Mock(return_value=BIN)
+        with mock.patch.object(
+            product_cli.cbm_support, "resolve_cbm_binary", resolver
+        ), mock.patch.object(product_cli, "CBMCLIAdapter", _FakeGraphAdapter):
+            status, payload = product_cli._viewer_graph_search_payload(
+                self.repo, {}
+            )
+            node_status, node_payload = product_cli._viewer_graph_node_payload(
+                self.repo, GRAPH_PID, {}
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            payload,
+            {
+                "error": "missing_query",
+                "message": "a non-empty q parameter is required",
+                "next_action": None,
+            },
+        )
+        self.assertEqual(node_status, 400)
+        self.assertEqual(node_payload["error"], "missing_key")
+        resolver.assert_not_called()
+        self.assertEqual(_FakeGraphAdapter.instances, [])
+
+    def test_error_payloads_are_path_free_and_hygienic(self):
+        with mock.patch.object(
+            product_cli.cbm_support,
+            "resolve_cbm_binary",
+            lambda root=None, environ=None: None,
+        ):
+            _, payload = product_cli._viewer_graph_search_payload(
+                self.repo, {"q": ["x"]}
+            )
+        text = json.dumps(payload, indent=2, sort_keys=True)
+        self.assertNotIn(str(Path(self.repo)), text)
+        self.assertNotIn(str(Path(self.repo).resolve()), text)
+        self.assertNotIn(os.path.expanduser("~"), text)
+        for marker in (
+            ".codebase-memory",
+            "codebase-memory-mcp",
+            "cache",
+            "bin",
+            BIN,
+            "\\",
+        ):
+            self.assertNotIn(marker, text)
+        for value in _walk_strings(payload):
+            self.assertFalse(contains_absolute_path(value), value)
+            self.assertNotIn("\\", value)
 
 
 class ViewerStatusPayloadTests(ViewerCLITestCase):

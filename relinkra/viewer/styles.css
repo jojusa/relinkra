@@ -123,3 +123,280 @@ main {
   border-radius: 4px;
   background: var(--panel);
 }
+
+/* -- graph explorer --------------------------------------------------- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.graph-search {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0 0 1rem;
+}
+
+.graph-search input[type="search"] {
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.graph-kind {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.graph-kind .kind {
+  padding: 0.4rem 0.8rem;
+  border: 0;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.graph-kind .kind + .kind {
+  border-left: 1px solid var(--line);
+}
+
+.graph-kind .kind[aria-pressed="true"] {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.graph-search button[type="submit"] {
+  padding: 0.45rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.graph-search button[type="submit"]:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.graph-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr) 280px;
+  gap: 0.9rem;
+  align-items: start;
+}
+
+@media (max-width: 1000px) {
+  .graph-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.graph-column {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  min-width: 0;
+}
+
+.graph-column h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.muted {
+  margin: 0 0 0.5rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  min-height: 1em;
+}
+
+.results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.results button {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.results button:hover {
+  border-color: var(--accent);
+}
+
+.result-name {
+  display: block;
+  font-weight: 600;
+}
+
+.result-qn,
+.result-file {
+  display: block;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.results .badge {
+  display: inline-block;
+  margin-top: 0.3rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.advisory {
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.9rem;
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+  font-size: 0.9rem;
+}
+
+#graph-advisory,
+#graph-cap {
+  border-left-color: #c98a00;
+}
+
+#graph-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.graph-node {
+  cursor: pointer;
+}
+
+.graph-node rect {
+  fill: var(--panel);
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.graph-node.selected rect {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.graph-node text {
+  pointer-events: none;
+  fill: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.graph-node text.badge {
+  fill: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.edge {
+  stroke: var(--muted);
+  stroke-width: 1.5;
+}
+
+.edge.test {
+  stroke-dasharray: 6 4;
+}
+
+.graph-arrow {
+  fill: var(--muted);
+}
+
+.detail-facts {
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+.detail-facts dt {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.detail-facts dd {
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.graph-detail-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.9rem;
+}
+
+.graph-detail-actions button {
+  flex: 1 1 auto;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.graph-detail-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.copy-value {
+  width: 100%;
+  margin-top: 0.6rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.8rem;
+}

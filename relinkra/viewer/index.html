@@ -21,7 +21,38 @@
 
   <main>
     <section id="panel-graph" class="panel" hidden>
-      <p class="placeholder">Graph explorer will load here</p>
+      <form id="graph-search-form" class="graph-search" autocomplete="off">
+        <label class="visually-hidden" for="graph-query">Search the code graph</label>
+        <input id="graph-query" type="search" placeholder="Search symbol or file&hellip;" maxlength="200">
+        <div class="graph-kind" role="group" aria-label="Search kind">
+          <button type="button" class="kind" data-kind="symbol" aria-pressed="true">Symbol</button>
+          <button type="button" class="kind" data-kind="file" aria-pressed="false">File</button>
+        </div>
+        <button type="submit" id="graph-search-button">Search</button>
+      </form>
+      <p id="graph-advisory" class="advisory" hidden></p>
+      <div class="graph-layout">
+        <div class="graph-column">
+          <h2>Results</h2>
+          <p id="graph-results-status" class="muted" aria-live="polite"></p>
+          <ul id="graph-results" class="results"></ul>
+        </div>
+        <div class="graph-column">
+          <h2>Focal graph</h2>
+          <p id="graph-coverage" class="muted" aria-live="polite"></p>
+          <svg id="graph-svg" viewBox="0 0 960 560" role="img" aria-label="Bounded relationship graph"></svg>
+          <p id="graph-cap" class="advisory" hidden></p>
+        </div>
+        <div class="graph-column">
+          <h2>Node detail</h2>
+          <dl id="graph-detail" class="facts detail-facts"></dl>
+          <div class="graph-detail-actions">
+            <button type="button" id="graph-copy" disabled>Copy reference</button>
+            <button type="button" id="graph-expand" disabled>Expand neighbors</button>
+          </div>
+          <input id="graph-copy-value" class="copy-value" type="text" readonly hidden aria-label="Reference to copy">
+        </div>
+      </div>
     </section>
 
     <section id="panel-metrics" class="panel" hidden>

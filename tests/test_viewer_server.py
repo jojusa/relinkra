@@ -21,11 +21,12 @@ from relinkra import viewer
 class ViewerServerCase(unittest.TestCase):
     """Shared helpers: servers that are always stopped and closed."""
 
-    def make_server(self, provider=None, *, port=0, host=viewer.VIEWER_HOST):
+    def make_server(self, provider=None, *, port=0, host=viewer.VIEWER_HOST, **providers):
         server = viewer.create_server(
             provider if provider is not None else (lambda: {"status": "ok"}),
             port=port,
             host=host,
+            **providers,
         )
         self.addCleanup(server.server_close)
         return server
@@ -42,8 +43,8 @@ class ViewerServerCase(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return thread
 
-    def serve(self, provider=None):
-        server = self.make_server(provider)
+    def serve(self, provider=None, **providers):
+        server = self.make_server(provider, **providers)
         self.serve_in_background(server)
         return server
 
@@ -109,8 +110,12 @@ class StaticRouteTests(ViewerServerCase):
         server = self.serve()
         _, _, body = self.request(server, "GET", "/")
         html = body.decode("utf-8")
-        self.assertIn("Graph explorer will load here", html)
         self.assertIn("No ContextPacket metrics recorded yet", html)
+        # VIS-2 replaced the graph placeholder with the real explorer
+        # skeleton: the search form ships, the placeholder string is gone.
+        self.assertNotIn("Graph explorer will load here", html)
+        self.assertIn('id="graph-search-form"', html)
+        self.assertIn('id="graph-query"', html)
 
     def test_query_strings_are_ignored(self):
         server = self.serve()
@@ -305,6 +310,297 @@ class LifecycleTests(ViewerServerCase):
             viewer.webbrowser, "open", side_effect=RuntimeError("no browser")
         ):
             self.assertFalse(viewer.open_browser("http://127.0.0.1:1"))
+
+
+class GraphRouteTests(ViewerServerCase):
+    """VIS-2 graph routes: parsed params, fixed failures, exact matching."""
+
+    def test_realistic_node_payload_round_trips_through_the_server(self):
+        key = "relinkra.cbm_adapter.strip_project_slug"
+        payload = {
+            "viewer_contract": "relinkra.viewer/v1",
+            "focal": {
+                "key": key,
+                "name": "strip_project_slug",
+                "qualified_name": key,
+                "file_path": "relinkra/cbm_adapter.py",
+                "label": "Function",
+                "start_line": 112,
+                "end_line": 125,
+                "in_degree": 5,
+                "out_degree": 1,
+                "complexity": 2,
+                "lines": 14,
+                "is_test": None,
+                "is_exported": True,
+                "is_entry_point": False,
+                "reference": {
+                    "code_reference_id": "ref_" + "a" * 32,
+                    "project_id": "rlk_" + "b" * 32,
+                    "workspace_id": "ws_" + "c" * 32,
+                    "reference_kind": "symbol",
+                    "file_path": "relinkra/cbm_adapter.py",
+                    "symbol_name": "strip_project_slug",
+                    "qualified_name": key,
+                    "symbol_kind": "Function",
+                    "language": "python",
+                    "start_line": 112,
+                    "end_line": 125,
+                    "cbm_project_name": "C-Desarrollos-relinkra",
+                    "commit_sha": None,
+                    "repository_identity": None,
+                },
+            },
+            "inbound": [
+                {
+                    "key": "relinkra.cbm_adapter.CBMCLIAdapter",
+                    "name": "CBMCLIAdapter",
+                    "qualified_name": "relinkra.cbm_adapter.CBMCLIAdapter",
+                    "hop": 1,
+                    "relationship": "caller",
+                    "direction": "inbound",
+                    "is_test": None,
+                }
+            ],
+            "outbound": [
+                {
+                    "key": "relinkra.identity.git_head_sha",
+                    "name": "git_head_sha",
+                    "qualified_name": "relinkra.identity.git_head_sha",
+                    "hop": 1,
+                    "relationship": "dependency",
+                    "direction": "outbound",
+                    "is_test": None,
+                }
+            ],
+            "coverage": {
+                "depth": 1,
+                "include_tests": True,
+                "inbound": {
+                    "returned": 1,
+                    "limit": 20,
+                    "truncated": False,
+                    "total": None,
+                    "notice": "Showing 1 inbound relationships; no "
+                    "authoritative total exists, so more may exist.",
+                },
+                "outbound": {
+                    "returned": 1,
+                    "limit": 20,
+                    "truncated": False,
+                    "total": None,
+                    "notice": "Showing 1 outbound relationships; no "
+                    "authoritative total exists, so more may exist.",
+                },
+                "complete": False,
+                "node_caps": {"initial": 50, "expanded": 100},
+                "notice": "The bounded graph result may be incomplete. CBM "
+                "reports no relationship total, and test-code relationships "
+                "are included; nodes marked TEST are identified by CBM. "
+                "Verify important claims against current source.",
+            },
+        }
+        server = self.serve(graph_node_provider=lambda params: (200, payload))
+        status, headers, body = self.request(
+            server, "GET", "/api/graph/node?key=" + key
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(
+            body.decode("utf-8"),
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
+        self.assert_contract_headers(headers)
+
+    def test_search_provider_receives_parsed_params_fresh_per_request(self):
+        calls = []
+
+        def provider(params):
+            calls.append(params)
+            return 200, {"call": len(calls)}
+
+        server = self.serve(graph_search_provider=provider)
+        first = json.loads(
+            self.request(
+                server, "GET", "/api/graph/search?q=x&kind=symbol&limit=5"
+            )[2]
+        )
+        second = json.loads(
+            self.request(
+                server, "GET", "/api/graph/search?q=x&kind=symbol&limit=5"
+            )[2]
+        )
+        self.assertEqual(first, {"call": 1})
+        self.assertEqual(second, {"call": 2})
+        self.assertEqual(
+            calls[0], {"q": ["x"], "kind": ["symbol"], "limit": ["5"]}
+        )
+        self.assertEqual(
+            calls[1], {"q": ["x"], "kind": ["symbol"], "limit": ["5"]}
+        )
+
+    def test_node_provider_receives_parsed_params(self):
+        calls = []
+
+        def provider(params):
+            calls.append(params)
+            return 200, {"focal": None}
+
+        server = self.serve(graph_node_provider=provider)
+        status, headers, body = self.request(
+            server, "GET", "/api/graph/node?key=relinkra.cbm_adapter"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            calls, [{"key": ["relinkra.cbm_adapter"]}]
+        )
+        self.assertEqual(json.loads(body), {"focal": None})
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assert_contract_headers(headers)
+
+    def test_graph_payload_echoes_exactly(self):
+        payload = {
+            "viewer_contract": "relinkra.viewer/v1",
+            "coverage": {"returned": 0, "complete": False},
+        }
+        server = self.serve(
+            graph_search_provider=lambda params: (200, payload),
+            graph_node_provider=lambda params: (400, {"error": "missing_key"}),
+        )
+        status, headers, body = self.request(
+            server, "GET", "/api/graph/search?q=x"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assert_contract_headers(headers)
+
+        status, headers, body = self.request(server, "GET", "/api/graph/node")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "missing_key"})
+        self.assert_contract_headers(headers)
+
+    def test_absent_provider_is_a_fixed_503(self):
+        server = self.serve()
+        for path in ("/api/graph/search?q=x", "/api/graph/node?key=a"):
+            with self.subTest(path=path):
+                status, headers, body = self.request(server, "GET", path)
+                self.assertEqual(status, 503)
+                self.assertEqual(
+                    headers["content-type"], "application/json; charset=utf-8"
+                )
+                self.assertEqual(json.loads(body), {"error": "graph unavailable"})
+                self.assert_contract_headers(headers)
+
+    def test_provider_failure_is_a_bare_500_and_server_survives(self):
+        class Boom(Exception):
+            pass
+
+        def broken(params):
+            raise Boom("secret detail")
+
+        server = self.serve(graph_search_provider=broken)
+        status, headers, body = self.request(
+            server, "GET", "/api/graph/search?q=x"
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "graph unavailable"})
+        self.assertNotIn(b"Traceback", body)
+        self.assertNotIn(b"secret detail", body)
+        self.assert_contract_headers(headers)
+
+        status, _, body = self.request(server, "GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Relinkra Viewer", body)
+
+    def test_malformed_provider_returns_are_500(self):
+        malformed = (
+            {"status": 200},
+            None,
+            "not a tuple",
+            (None, {"error": "x"}),
+            (True, {"error": "x"}),
+            ("200", {"error": "x"}),
+            (200, object()),
+        )
+        for result in malformed:
+            with self.subTest(result=result):
+                server = self.serve(
+                    graph_search_provider=lambda params, r=result: r
+                )
+                status, _, body = self.request(
+                    server, "GET", "/api/graph/search?q=x"
+                )
+                self.assertEqual(status, 500)
+                self.assertEqual(
+                    json.loads(body), {"error": "graph unavailable"}
+                )
+
+    def test_unknown_graph_shapes_stay_plain_404(self):
+        server = self.serve()
+        for path in (
+            "/api/graph",
+            "/api/graph/",
+            "/api/graph/search/extra",
+            "/api/graph/node/extra",
+            "/api/graph/search/../node",
+        ):
+            with self.subTest(path=path):
+                status, headers, body = self.request(server, "GET", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(
+                    headers["content-type"], "text/plain; charset=utf-8"
+                )
+                self.assert_contract_headers(headers)
+                self.assertNotIn(path.encode("utf-8"), body)
+
+    def test_graph_methods_are_405_with_allow_and_no_cors(self):
+        server = self.serve(
+            graph_search_provider=lambda params: (200, {"ok": True})
+        )
+        for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            with self.subTest(method=method):
+                status, headers, _ = self.request(
+                    server, method, "/api/graph/search"
+                )
+                self.assertEqual(status, 405)
+                self.assertEqual(headers.get("allow"), "GET, HEAD")
+                self.assertNotIn("access-control-allow-origin", headers)
+
+    def test_graph_head_returns_headers_without_a_body(self):
+        server = self.serve(
+            graph_search_provider=lambda params: (200, {"ok": True})
+        )
+        get_status, get_headers, get_body = self.request(
+            server, "GET", "/api/graph/search?q=x"
+        )
+        head_status, head_headers, head_body = self.request(
+            server, "HEAD", "/api/graph/search?q=x"
+        )
+        self.assertEqual(get_status, 200)
+        self.assertEqual(head_status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertGreater(len(get_body), 0)
+        self.assertEqual(
+            head_headers.get("content-length"), get_headers.get("content-length")
+        )
+        self.assertEqual(
+            head_headers.get("content-type"), get_headers.get("content-type")
+        )
+
+    def test_query_strings_do_not_leak_into_responses(self):
+        server = self.serve(
+            graph_search_provider=lambda params: (200, {"searched": True})
+        )
+        hostile = "%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+        status, _, body = self.request(
+            server, "GET", f"/api/graph/search?q={hostile}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"searched": True})
+        self.assertNotIn(b"script", body.lower())
+        self.assertNotIn(hostile.encode("utf-8"), body)
 
 
 if __name__ == "__main__":

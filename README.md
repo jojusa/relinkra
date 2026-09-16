@@ -409,10 +409,17 @@ accept `--path`, `--json`, and `--mode fast`.
 
 - **Loopback-only.** It binds `127.0.0.1` and nothing else; there is no
   `--host` option.
-- **Read-only and local-only.** It serves a static shell plus one JSON status
-  route built from the same honest CBM facts as `cbm status`. No graph
-  search, no relationship expansion, and no metrics persistence ship today;
-  the Graph and Metrics tabs are placeholders.
+- **Read-only and local-only.** It serves a static shell, one JSON status
+  route built from the same honest CBM facts as `cbm status`, and two bounded
+  graph routes. The Graph tab searches symbols and files (default limit 20)
+  and draws a bounded focal graph (depth 1; up to 20 inbound and 20 outbound
+  relationships), marking test relationships only when CBM identifies them
+  (`is_test` is never inferred). Node expansion is explicit and bounded: up to
+  50 nodes initially and 100 after expansion, always reporting what was
+  trimmed instead of dropping it silently. Coverage, truncation, and stale or
+  missing-index indicators are shown, so a bounded graph result never claims
+  to be complete. The Metrics tab remains a placeholder: no metrics
+  persistence ships yet.
 - **No automatic lifecycle.** Opening the viewer never indexes or refreshes;
   stale or missing indexes are reported with the exact command to run.
 - **Options.** `--path`, `--port PORT` (default `0`: the OS picks a free

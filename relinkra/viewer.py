@@ -1,8 +1,9 @@
-"""Relinkra-owned read-only local viewer (VIS-1).
+"""Relinkra-owned read-only local viewer (VIS-1/VIS-2).
 
 A minimal loopback HTTP server that serves the packaged viewer shell
-(``relinkra/viewer/``) plus one JSON status route whose payload a caller
-supplies. This module knows nothing about CBM, Engram, or the graph: it
+(``relinkra/viewer/``) plus JSON routes whose payloads callers supply:
+one status route and two bounded graph-explorer routes (search and
+node). This module knows nothing about CBM, Engram, or the graph: it
 sequences no workflow, executes no backend, reads no database, and
 persists nothing.
 
@@ -15,9 +16,10 @@ Boundaries that are intentional and tested:
   404 with no path echo and no file content;
 - only ``GET`` and ``HEAD`` are served; everything else is 405 with
   ``Allow: GET, HEAD``;
-- the status payload is produced fresh per request by the caller's
-  ``status_provider``; a raising provider becomes a fixed 500 JSON body,
-  never a traceback, and never kills the server.
+- payloads are produced fresh per request by the caller's providers; a
+  raising or malformed provider becomes a fixed 500 JSON body, never a
+  traceback, and never kills the server; a graph route without a
+  provider is a fixed 503.
 
 There is no daemon mode, no PID file, no persistence, no service
 registration, and no CORS surface.
@@ -61,8 +63,15 @@ _ROUTES = {
 #: Exact-match status route (kept separate: its body is not an asset).
 STATUS_PATH = "/api/status"
 
+#: Exact-match graph-explorer routes (bodies come from caller providers).
+GRAPH_SEARCH_PATH = "/api/graph/search"
+GRAPH_NODE_PATH = "/api/graph/node"
+
 #: Fixed, non-sensitive failure body for a status provider that raises.
 _STATUS_ERROR = {"error": "status unavailable"}
+
+#: Fixed, non-sensitive failure body for an absent/failing graph provider.
+_GRAPH_ERROR = {"error": "graph unavailable"}
 
 _ASSET_CACHE: Dict[str, Optional[bytes]] = {}
 
@@ -140,6 +149,9 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == STATUS_PATH:
             self._serve_status()
             return
+        if path in (GRAPH_SEARCH_PATH, GRAPH_NODE_PATH):
+            self._serve_graph(path)
+            return
         self._respond(404, _TEXT, b"Not found")
 
     def _serve_status(self) -> None:
@@ -156,6 +168,42 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
             self._respond(500, _JSON, body)
             return
         self._respond(200, _JSON, body)
+
+    def _serve_graph(self, path: str) -> None:
+        """Serve one graph route from the caller's provider.
+
+        The provider receives the parsed query mapping (blank values
+        kept) and must return ``(status, payload)``. Absent, raising, or
+        malformed providers never escape: they become fixed JSON bodies
+        and the server keeps serving.
+        """
+        attribute = (
+            "graph_search_provider"
+            if path == GRAPH_SEARCH_PATH
+            else "graph_node_provider"
+        )
+        provider: Optional[Callable[[Dict[str, Any]], Any]] = getattr(
+            self.server, attribute, None
+        )
+        error_body = json.dumps(
+            dict(_GRAPH_ERROR), indent=2, sort_keys=True
+        ).encode("utf-8")
+        if provider is None:
+            self._respond(503, _JSON, error_body)
+            return
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(self.path).query, keep_blank_values=True
+        )
+        try:
+            result = provider(params)
+            status, payload = result
+            if isinstance(status, bool) or not isinstance(status, int):
+                raise ValueError("graph provider returned an invalid status")
+            body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        except Exception:
+            self._respond(500, _JSON, error_body)
+            return
+        self._respond(status, _JSON, body)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         self._serve()
@@ -205,14 +253,20 @@ class ViewerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         server_address: Tuple[str, int],
         RequestHandlerClass: type = _ViewerRequestHandler,
         status_provider: Optional[Callable[[], Any]] = None,
+        graph_search_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        graph_node_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self.status_provider = status_provider
+        self.graph_search_provider = graph_search_provider
+        self.graph_node_provider = graph_node_provider
         super().__init__(server_address, RequestHandlerClass)
 
 
 def create_server(
     status_provider: Optional[Callable[[], Any]],
     *,
+    graph_search_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    graph_node_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
     port: int = 0,
     host: str = VIEWER_HOST,
 ) -> ViewerServer:
@@ -221,8 +275,17 @@ def create_server(
     ``port=0`` asks the OS for a free port; ``server_address[1]`` then
     carries the chosen port. The socket binds only to ``host``, which
     defaults to the loopback interface; there is no wildcard option.
+    ``graph_search_provider`` / ``graph_node_provider`` receive the
+    parsed query mapping (``urllib.parse.parse_qs``, blank values kept)
+    and must return ``(status, payload)``.
     """
-    return ViewerServer((str(host), int(port)), _ViewerRequestHandler, status_provider)
+    return ViewerServer(
+        (str(host), int(port)),
+        _ViewerRequestHandler,
+        status_provider,
+        graph_search_provider,
+        graph_node_provider,
+    )
 
 
 def run_forever(server: ViewerServer) -> None:

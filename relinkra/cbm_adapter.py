@@ -61,6 +61,19 @@ TRACE_MAX_FIELD_CHARS = 256
 TRACE_MAX_PAYLOAD_BYTES = 24 * 1024
 TRACE_DIRECTIONS = frozenset(("inbound", "outbound", "both"))
 
+# VIS-2 bounded graph-explorer bounds: search and per-side relationship
+# caps share one hard maximum, and depth reuses the TRACE_MAX_DEPTH
+# ceiling. The node caps are frontend enforcement values the API reports
+# but never enforces per request.
+GRAPH_SEARCH_DEFAULT_LIMIT = 20
+GRAPH_SEARCH_MAX_LIMIT = 20
+GRAPH_RELATION_DEFAULT_LIMIT = 20
+GRAPH_RELATION_MAX_LIMIT = 20
+GRAPH_DEFAULT_DEPTH = 1
+GRAPH_MAX_DEPTH = 3
+GRAPH_NODE_LOOKUP_LIMIT = 50
+GRAPH_NODE_MAX_PAYLOAD_BYTES = 32 * 1024
+
 
 class CBMAdapterError(Exception):
     """Raised when the CBM CLI fails or returns an unusable payload."""
@@ -77,6 +90,17 @@ class CBMProjectNotIndexedError(CBMAdapterError):
     """
 
 
+class CBMNodeNotFoundError(CBMAdapterError):
+    """Raised when a WORKING CBM backend reports the traced symbol absent.
+
+    Distinguishable from outages so the graph explorer can classify an
+    honest 404 (the symbol is no longer resolvable) instead of a backend
+    failure. Only the anchored CBM "function not found" envelope maps
+    here; any other trace failure stays an outage-class
+    ``CBMAdapterError``.
+    """
+
+
 # CBM's stable error phrase for an absent/unindexed project, embedded in
 # a JSON error envelope on stderr (exit 1) or a structured payload. The
 # stderr match is ANCHORED: _run shapes failures as "cbm <tool> failed:
@@ -86,6 +110,19 @@ class CBMProjectNotIndexedError(CBMAdapterError):
 # outage-class (mirroring the "symbol not found" precedent).
 _PROJECT_NOT_INDEXED_RE = re.compile(
     r'^cbm [a-z_]+ failed: \{"error"\s*:\s*"project not found or not indexed"',
+    re.IGNORECASE,
+)
+
+# CBM 0.9.0 exits 1 with the same anchored shape for a trace_path lookup
+# miss. Only the envelope at the START of the failure detail maps to
+# ``CBMNodeNotFoundError``; an outage whose stderr merely mentions the
+# phrase later stays an outage-class error. Real stderr prefixes the
+# envelope with CBM's own ``level=info`` log lines (proven against the
+# certified binary), so whole leading log lines are tolerated before the
+# envelope while any other leading text still means outage.
+_TRACE_NOT_FOUND_RE = re.compile(
+    r'^cbm trace_path failed: (?:level=[^\n]*\n)*'
+    r'\{\s*"error"\s*:\s*"function not found"',
     re.IGNORECASE,
 )
 
@@ -749,6 +786,260 @@ class CBMCLIAdapter:
         self._ensure_payload_bound(result, TRACE_MAX_PAYLOAD_BYTES, "trace")
         return result
 
+    def search_graph_page(
+        self,
+        *,
+        query: Optional[str] = None,
+        file_path: Optional[str] = None,
+        project: Optional[str] = None,
+        limit: int = GRAPH_SEARCH_DEFAULT_LIMIT,
+    ) -> dict:
+        """One bounded search_graph page: rich nodes plus coverage counts.
+
+        Exactly one of ``query`` (bm25 symbol search) or ``file_path``
+        (path-substring file search) is required. ``total`` is CBM's
+        authoritative full match count and ``has_more`` its truncation
+        evidence; both are preserved verbatim (or None when absent or
+        malformed) because the viewer reports them as coverage facts.
+        Candidates that cannot be focal-traced (empty project-relative
+        qn) are dropped.
+        """
+        if bool(query) == bool(file_path):
+            raise CBMAdapterError(
+                "exactly one of query or file_path is required"
+            )
+        slug = self._project(project)
+        limit = self._bounded_limit(limit, GRAPH_SEARCH_MAX_LIMIT, "limit")
+        flags = ["--project", slug, "--limit", str(limit)]
+        if query:
+            flags += ["--query", str(query)]
+        else:
+            flags += ["--file-pattern", str(file_path)]
+        payload = self._run_or_classify("search_graph", flags)
+        if not isinstance(payload, dict):
+            raise CBMAdapterError(
+                "cbm search_graph returned a non-object payload"
+            )
+        if "error" in payload:
+            raise CBMAdapterError("cbm search_graph returned an error payload")
+        raw_results = payload.get("results")
+        if not isinstance(raw_results, list):
+            raise CBMAdapterError("cbm search_graph returned malformed results")
+        candidates = []
+        for node in raw_results:
+            if not isinstance(node, dict):
+                raise CBMAdapterError(
+                    "cbm search_graph returned a malformed result"
+                )
+            candidate = self._normalize_node(node, cbm_project_name=slug)
+            if candidate is None:
+                continue
+            if not (candidate.get("relative_qualified_name") or "").strip():
+                # No project-relative qn means the node cannot be the
+                # focal target of a later trace; never offer it.
+                continue
+            candidates.append(candidate)
+        raw_total = payload.get("total")
+        total = (
+            raw_total
+            if isinstance(raw_total, int)
+            and not isinstance(raw_total, bool)
+            and raw_total >= 0
+            else None
+        )
+        raw_has_more = payload.get("has_more")
+        has_more = raw_has_more if isinstance(raw_has_more, bool) else None
+        return {"results": candidates, "total": total, "has_more": has_more}
+
+    def graph_neighborhood(
+        self,
+        *,
+        qualified_name: str,
+        project: Optional[str] = None,
+        depth: int = GRAPH_DEFAULT_DEPTH,
+        include_tests: bool = True,
+        inbound_limit: int = GRAPH_RELATION_DEFAULT_LIMIT,
+        outbound_limit: int = GRAPH_RELATION_DEFAULT_LIMIT,
+    ) -> dict:
+        """One bounded both-direction call trace around a relative qn.
+
+        ``qualified_name`` is the PROJECT-RELATIVE semantic qn; the full
+        CBM qn is reconstructed with the resolved slug because the
+        certified CLI only resolves the full form in ``trace_path``.
+        Exactly one ``trace_path`` call returns both sides. CBM reports
+        no relationship total, so coverage always states that the result
+        may be incomplete and is not proof of absence.
+        """
+        relative_qn = str(qualified_name or "").strip()
+        if not relative_qn:
+            raise CBMAdapterError("a qualified_name is required")
+        slug = self._project(project)
+        depth = self._bounded_limit(
+            depth, GRAPH_MAX_DEPTH, "depth", minimum=1
+        )
+        inbound_limit = self._bounded_limit(
+            inbound_limit, GRAPH_RELATION_MAX_LIMIT, "inbound_limit"
+        )
+        outbound_limit = self._bounded_limit(
+            outbound_limit, GRAPH_RELATION_MAX_LIMIT, "outbound_limit"
+        )
+        if not isinstance(include_tests, bool):
+            raise CBMAdapterError("include_tests must be a boolean")
+        full_qn = f"{slug}.{relative_qn}"
+        flags = [
+            "--project", slug,
+            "--function-name", full_qn,
+            "--direction", "both",
+            "--depth", str(depth),
+            "--mode", "calls",
+            "--include-tests", "true" if include_tests else "false",
+        ]
+        try:
+            payload = self._run_or_classify("trace_path", flags)
+        except CBMAdapterError as exc:
+            if _TRACE_NOT_FOUND_RE.search(str(exc)):
+                raise CBMNodeNotFoundError(
+                    "cbm trace_path reported the symbol as not found"
+                ) from exc
+            raise
+        if not isinstance(payload, dict):
+            raise CBMAdapterError(
+                "cbm trace_path returned a non-object payload"
+            )
+        if not payload:
+            raise CBMAdapterError("cbm trace_path returned an empty payload")
+        target = self._required_text(payload, "function", "trace_path")
+        if target != full_qn:
+            raise CBMAdapterError(
+                "cbm trace_path returned a mismatched function"
+            )
+        returned_direction = self._required_text(
+            payload, "direction", "trace_path"
+        ).lower()
+        returned_mode = self._required_text(payload, "mode", "trace_path").lower()
+        if returned_direction != "both" or returned_mode != "calls":
+            raise CBMAdapterError(
+                "cbm trace_path returned an unexpected direction or mode"
+            )
+        inbound = self._normalize_trace_entries(
+            payload, "callers", "caller", slug, depth
+        )
+        outbound = self._normalize_trace_entries(
+            payload, "callees", "dependency", slug, depth
+        )
+        for item in inbound:
+            item["direction"] = "inbound"
+        for item in outbound:
+            item["direction"] = "outbound"
+        inbound.sort(
+            key=lambda item: (
+                item["hop"], item["relationship"],
+                item["qualified_name"], item["name"],
+            )
+        )
+        outbound.sort(
+            key=lambda item: (
+                item["hop"], item["relationship"],
+                item["qualified_name"], item["name"],
+            )
+        )
+        inbound_truncated = len(inbound) > inbound_limit
+        outbound_truncated = len(outbound) > outbound_limit
+        inbound = inbound[:inbound_limit]
+        outbound = outbound[:outbound_limit]
+        tests_note = (
+            "Test-code relationships are included."
+            if include_tests
+            else "Test-code relationships are excluded; a relationship "
+            "living in a test file is invisible here."
+        )
+        result = {
+            "target": self._bounded_text(
+                strip_project_slug(target, slug), TRACE_MAX_FIELD_CHARS
+            ),
+            "depth": depth,
+            "include_tests": include_tests,
+            "inbound": inbound,
+            "outbound": outbound,
+            "coverage": {
+                "depth": depth,
+                "include_tests": include_tests,
+                "inbound": {
+                    "returned": len(inbound),
+                    "limit": inbound_limit,
+                    "truncated": inbound_truncated,
+                    "total": None,
+                },
+                "outbound": {
+                    "returned": len(outbound),
+                    "limit": outbound_limit,
+                    "truncated": outbound_truncated,
+                    "total": None,
+                },
+                "complete": False,
+                "qualification": (
+                    "The backend reports no relationship total, so this "
+                    "bounded result may be incomplete and is not proof of "
+                    "absence. " + tests_note + " Verify important claims "
+                    "against current source."
+                ),
+            },
+        }
+        self._ensure_payload_bound(
+            result, GRAPH_NODE_MAX_PAYLOAD_BYTES, "graph"
+        )
+        return result
+
+    def graph_node_lookup(
+        self,
+        relative_qualified_name: str,
+        *,
+        project: Optional[str] = None,
+        limit: int = GRAPH_NODE_LOOKUP_LIMIT,
+    ) -> Optional[dict]:
+        """Exact-match node lookup by PROJECT-RELATIVE qualified name.
+
+        ``--qn-pattern`` is a pattern filter, so CBM may return
+        overmatches. Only a candidate whose stripped
+        ``relative_qualified_name`` equals the requested qn exactly is
+        returned; no exact match is None, never a best-effort guess.
+        """
+        relative_qn = str(relative_qualified_name or "").strip()
+        if not relative_qn:
+            raise CBMAdapterError("a qualified_name is required")
+        slug = self._project(project)
+        limit = self._bounded_limit(limit, GRAPH_NODE_LOOKUP_LIMIT, "limit")
+        payload = self._run_or_classify(
+            "search_graph",
+            [
+                "--project", slug,
+                "--qn-pattern", relative_qn,
+                "--limit", str(limit),
+            ],
+        )
+        if not isinstance(payload, dict):
+            raise CBMAdapterError(
+                "cbm search_graph returned a non-object payload"
+            )
+        if "error" in payload:
+            raise CBMAdapterError("cbm search_graph returned an error payload")
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise CBMAdapterError("cbm search_graph returned malformed results")
+        for node in results:
+            if not isinstance(node, dict):
+                raise CBMAdapterError(
+                    "cbm search_graph returned a malformed result"
+                )
+            candidate = self._normalize_node(node, cbm_project_name=slug)
+            if candidate is None:
+                continue
+            if (
+                candidate.get("relative_qualified_name") or ""
+            ).strip() == relative_qn:
+                return candidate
+        return None
+
     @staticmethod
     def _bounded_limit(value, maximum: int, name: str, minimum: int = 1) -> int:
         if isinstance(value, bool):
@@ -1000,6 +1291,10 @@ class CBMCLIAdapter:
                 ),
                 "hop": hop,
             }
+            # The authoritative test marker is preserved ONLY when CBM
+            # says True: an absent key means UNKNOWN, never False.
+            if item.get("is_test") is True:
+                record["is_test"] = True
             normalized[(relationship, relative_qn, hop)] = record
         return list(normalized.values())
 
@@ -1111,7 +1406,7 @@ class CBMCLIAdapter:
             return None
         qn = str(node.get("qualified_name") or "").strip()
         slug = (cbm_project_name or self.cbm_project_name or "").strip()
-        return {
+        candidate = {
             "name": node.get("name"),
             "qualified_name": qn,
             "relative_qualified_name": strip_project_slug(qn, slug),
@@ -1121,6 +1416,20 @@ class CBMCLIAdapter:
             "end_line": _int_or_none(node.get("end_line")),
             "cbm_project_name": slug or None,
         }
+        # Rich file/qn-search fields are preserved additively and only
+        # when well-typed: a missing or malformed field stays absent
+        # instead of becoming a None-valued key, so a query-mode node
+        # keeps exactly its historical key set. Never copied: docstring,
+        # signature, rank, last_modified, and the internal fp/sp/bt rows.
+        for flag in ("is_test", "is_exported", "is_entry_point"):
+            value = node.get(flag)
+            if isinstance(value, bool):
+                candidate[flag] = value
+        for count in ("in_degree", "out_degree", "complexity", "lines"):
+            value = node.get(count)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                candidate[count] = value
+        return candidate
 
     def _normalize_file_path(self, value) -> str:
         path = str(value or "").strip().replace("\\", "/")

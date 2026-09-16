@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -104,6 +105,24 @@ def _read_startup_json(stream):
         except ValueError:
             continue
         return payload
+
+
+def _probe(url, path, method="GET"):
+    """One HTTP request returning ``(status, body_text)``; always closed.
+
+    urllib raises ``HTTPError`` for 4xx/5xx responses, so the error body
+    is read from the exception and the exception closed explicitly to
+    stay ResourceWarning-clean.
+    """
+    request = urllib.request.Request(url + path, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read().decode("utf-8")
+        finally:
+            exc.close()
 
 
 class CleanInstallTests(unittest.TestCase):
@@ -615,7 +634,13 @@ class CleanInstallTests(unittest.TestCase):
         self.assertNotIn("--host", result.stdout)
 
     def test_step_n_installed_viewer_serves_loopback_status(self):
-        """The installed viewer serves assets and status over 127.0.0.1."""
+        """The installed viewer serves assets, status, and the graph routes.
+
+        The disposable environment cannot carry a certified indexed
+        backend, so the VIS-2 probes pin the installed ROUTES, request
+        validation, and the honest bounded degradation (503/409 with a
+        next action) instead of a live graph result.
+        """
         if shutil.which("git") is None:
             self.skipTest("git is required for the viewer smoke test")
         self._installed()
@@ -650,6 +675,33 @@ class CleanInstallTests(unittest.TestCase):
                 status = json.loads(response.read().decode("utf-8"))
             self.assertIn("cbm", status)
             self.assertIn("workspace", status)
+
+            status_code, text = _probe(
+                url, "/api/graph/search?kind=bogus&q=x"
+            )
+            self.assertEqual(status_code, 400)
+            self.assertEqual(json.loads(text)["error"], "invalid_kind")
+
+            status_code, text = _probe(url, "/api/graph/search")
+            self.assertEqual(status_code, 400)
+            self.assertEqual(json.loads(text)["error"], "missing_query")
+
+            status_code, text = _probe(url, "/api/graph/node")
+            self.assertEqual(status_code, 400)
+            self.assertEqual(json.loads(text)["error"], "missing_key")
+
+            status_code, text = _probe(url, "/api/graph/search?q=demo")
+            self.assertIn(status_code, (409, 503))
+            body = json.loads(text)
+            self.assertIn(
+                body["error"], ("cbm_unavailable", "index_missing")
+            )
+            self.assertTrue(body["next_action"])
+
+            status_code, _ = _probe(
+                url, "/api/graph/search", method="POST"
+            )
+            self.assertEqual(status_code, 405)
         finally:
             watchdog.cancel()
             process.terminate()

@@ -54,6 +54,7 @@ from . import (
     cbm_indexing,
     cbm_support,
     viewer,
+    viewer_graph,
 )
 from .app_service import (
     CONTRACT_VERSION,
@@ -3066,6 +3067,98 @@ def _viewer_workspace_id(root: str, config: Optional[WorkspaceConfig]) -> Option
     return None
 
 
+# --- VIS-2 graph routes -----------------------------------------------------
+
+
+def _viewer_graph_prepare(
+    root: str,
+) -> Tuple[
+    Optional[CBMCLIAdapter], Optional[WorkspaceConfig], Optional[Tuple[int, dict]]
+]:
+    """VIS-2 graph routes: (adapter, config, error_response) CBM gate.
+
+    The graph routes report honest bounded states instead of raising: a
+    missing binary is 503 cbm_unavailable, a missing stored index is 409
+    index_missing, and success returns an adapter bound to the stored
+    managed graph plus the workspace config for later id lookup.
+    Construction alone executes nothing; the adapter's own SHA-256 gate
+    still protects every execution.
+    """
+    binary = cbm_support.resolve_cbm_binary(root)
+    if not binary:
+        return None, None, (
+            503,
+            {
+                "error": "cbm_unavailable",
+                "message": "CBM is unavailable.",
+                "next_action": "relinkra cbm setup",
+            },
+        )
+    config = None
+    record = None
+    try:
+        config = WorkspaceConfig.load(Path(root))
+        record = _cbm_record_for_root(Path(root), config)
+    except (RegistryError, OSError, ValueError):
+        record = None
+    adapter = _viewer_stored_adapter(root, record, binary)
+    if adapter is None:
+        return None, config, (
+            409,
+            {
+                "error": "index_missing",
+                "message": "The CBM index is missing for this workspace.",
+                "next_action": "relinkra cbm index",
+            },
+        )
+    return adapter, config, None
+
+
+def _viewer_graph_search_payload(
+    root: str, params: Dict[str, List[str]]
+) -> Tuple[int, dict]:
+    """``(status, payload)`` for one bounded graph search request.
+
+    Parameters are validated before the CBM gate, so a malformed request
+    is a 400 that never touches the backend.
+    """
+    try:
+        query, kind, limit = viewer_graph.parse_search_params(params)
+    except viewer_graph.GraphAPIError as exc:
+        return exc.status, exc.to_dict()
+    adapter, _config, error = _viewer_graph_prepare(root)
+    if error is not None:
+        return error
+    try:
+        payload = viewer_graph.search_payload(kind, query, limit, adapter)
+    except viewer_graph.GraphAPIError as exc:
+        return exc.status, exc.to_dict()
+    return 200, payload
+
+
+def _viewer_graph_node_payload(
+    root: str, project_id: str, params: Dict[str, List[str]]
+) -> Tuple[int, dict]:
+    """``(status, payload)`` for one bounded focal-node request."""
+    try:
+        key = viewer_graph.parse_node_params(params)
+    except viewer_graph.GraphAPIError as exc:
+        return exc.status, exc.to_dict()
+    adapter, config, error = _viewer_graph_prepare(root)
+    if error is not None:
+        return error
+    try:
+        payload = viewer_graph.node_payload(
+            key,
+            adapter,
+            project_id=project_id,
+            workspace_id=_viewer_workspace_id(root, config),
+        )
+    except viewer_graph.GraphAPIError as exc:
+        return exc.status, exc.to_dict()
+    return 200, payload
+
+
 def _viewer_git_value(probe, root: str) -> Optional[str]:
     """A git fact for the status payload, or None when unreadable."""
     try:
@@ -3159,8 +3252,19 @@ def cmd_cbm_open(args) -> int:
     def status_provider() -> Dict[str, Any]:
         return _viewer_status_payload(root, project_id)
 
+    def graph_search_provider(params: Dict[str, List[str]]) -> Tuple[int, dict]:
+        return _viewer_graph_search_payload(root, params)
+
+    def graph_node_provider(params: Dict[str, List[str]]) -> Tuple[int, dict]:
+        return _viewer_graph_node_payload(root, project_id, params)
+
     try:
-        server = viewer.create_server(status_provider, port=args.port)
+        server = viewer.create_server(
+            status_provider,
+            graph_search_provider=graph_search_provider,
+            graph_node_provider=graph_node_provider,
+            port=args.port,
+        )
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
             _fail(
