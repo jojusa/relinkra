@@ -476,10 +476,12 @@ def classify_currentness(
     identity = _mapping(observation.get("identity"))
     if not identity.get("project_id") or not identity.get("workspace_id"):
         return "unknown"
-    if project_id and workspace_id and (
-        identity.get("project_id") != project_id
-        or identity.get("workspace_id") != workspace_id
-    ):
+    # A mismatch in EITHER settled identity is foreign on its own: an
+    # observation from another project must never be excused by an
+    # unresolved effective workspace (and vice versa).
+    if project_id and identity.get("project_id") != project_id:
+        return "foreign"
+    if workspace_id and identity.get("workspace_id") != workspace_id:
         return "foreign"
     if not project_id or not workspace_id or not revision:
         return "unknown"

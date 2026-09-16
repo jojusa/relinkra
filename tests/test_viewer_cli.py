@@ -226,7 +226,7 @@ class ViewerCLITestCase(unittest.TestCase):
 
     def register_record(self):
         """Create a real registry record (pure registry + git, no CBM)."""
-        cbm_indexing.register_mapping(
+        return cbm_indexing.register_mapping(
             str(product_cli.registry_path(Path(self.repo))),
             self.repo,
             PROJECT,
@@ -591,10 +591,10 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
             stack.enter_context(
                 mock.patch.object(product_cli, "CBMCLIAdapter", _FakeAdapter)
             )
-        return product_cli._viewer_status_payload(self.repo, "rlk_fixture")
+        return product_cli._viewer_status_payload(self.repo)
 
     def test_ready_reports_stored_revision_counts_and_no_next_action(self):
-        self.register_record()
+        workspace = self.register_record()
         self.write_managed_db()
         head = git_head_sha(str(self.repo))
         _FakeAdapter.stored_head = head
@@ -608,7 +608,18 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
         self.assertEqual(payload["cbm"]["edges"], 30)
         self.assertIsNone(payload["cbm"]["next_action"])
 
-        self.assertEqual(payload["project"], {"project_id": "rlk_fixture"})
+        # The registered identity is effective: for this fixture the
+        # registry record is the local_root project the viewer must truth.
+        self.assertEqual(payload["project"]["project_id"], workspace["project_id"])
+        self.assertEqual(
+            payload["project"]["registered_project_id"], workspace["project_id"]
+        )
+        self.assertEqual(
+            payload["project"]["live_project_id"], workspace["project_id"]
+        )
+        self.assertEqual(payload["project"]["identity_state"], "registered")
+        self.assertFalse(payload["project"]["migration_available"])
+        self.assertIsNone(payload["project"]["recommended_action"])
         self.assertEqual(payload["revision"]["current"], head)
         self.assertEqual(payload["revision"]["indexed"], head)
         self.assertEqual(payload["revision"]["indexed_source"], "stored_branch")
@@ -706,7 +717,7 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
             stack.enter_context(
                 mock.patch.object(product_cli, "CBMCLIAdapter", _FakeAdapter)
             )
-            payload = product_cli._viewer_status_payload(self.repo, "rlk_fixture")
+            payload = product_cli._viewer_status_payload(self.repo)
         self.assertEqual(payload["cbm"]["availability"], "UNAVAILABLE")
         self.assertEqual(payload["cbm"]["state"], "UNAVAILABLE")
         self.assertEqual(payload["cbm"]["next_action"], "relinkra cbm setup")
@@ -744,7 +755,7 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
             stack.enter_context(
                 mock.patch.object(product_cli, "CBMCLIAdapter", _FakeAdapter)
             )
-            payload = product_cli._viewer_status_payload(self.repo, "rlk_fixture")
+            payload = product_cli._viewer_status_payload(self.repo)
         self.assertEqual(payload["cbm"]["availability"], "UNSUPPORTED")
         self.assertEqual(payload["cbm"]["state"], "UNSUPPORTED")
         self.assertEqual(payload["cbm"]["next_action"], "relinkra cbm setup")
@@ -761,7 +772,7 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
             stack.enter_context(
                 mock.patch.object(product_cli, "CBMCLIAdapter", _FakeAdapter)
             )
-            payload = product_cli._viewer_status_payload(self.repo, "rlk_fixture")
+            payload = product_cli._viewer_status_payload(self.repo)
         self.assertEqual(payload["cbm"]["availability"], "UNTRUSTED")
         self.assertEqual(payload["cbm"]["state"], "UNTRUSTED")
         self.assertEqual(payload["cbm"]["next_action"], "relinkra cbm setup")
@@ -775,7 +786,7 @@ class ViewerStatusPayloadTests(ViewerCLITestCase):
             "resolve_cbm_binary",
             lambda root=None, environ=None: None,
         ):
-            payload = product_cli._viewer_status_payload(self.repo, "rlk_fixture")
+            payload = product_cli._viewer_status_payload(self.repo)
         self.assertFalse(payload["workspace"]["initialized"])
         self.assertIsNone(payload["workspace"]["workspace_id"])
 

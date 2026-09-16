@@ -121,6 +121,55 @@ unlocked if the primitive is unavailable). Loads are strictly validated
 `RegistryError` on any malformed content. No server, no runtime dependencies
 — Python 3.14 stdlib only.
 
+## Effective identity and migration (VIS-4)
+
+A workspace can be registered under a weak identity (no usable remote) and
+later gain a strong Git remote, producing two derivations: the persisted
+registration and the live remote. The contract is:
+
+- **The registered identity stays EFFECTIVE until an explicit migration.**
+  The stronger current derivation is disclosed as a live **candidate**
+  (`live_project_id`), never silently promoted, aliased, or relabeled.
+- **A registration is valid only for its own workspace.** The registry
+  record must exist AND its canonical path must be the workspace's own
+  canonical path. A copied `.relinkra/`, a repurposed checkout, a fork, or
+  a changed remote is a mismatch, not an inheritance: project A never
+  inherits project B's trust.
+- **The identity state is explicit.** `identity_state` is one of
+  `registered` (no mismatch), `migration_available` (registered ≠ live,
+  `migration_available: true`, `recommended_action: "relinkra init"`),
+  `unregistered` (no valid registration), or `unknown` (unresolvable or
+  ambiguous, fail closed). One shared resolver
+  (`relinkra/effective_identity.py`) owns these semantics for the viewer,
+  doctor, metrics, and the CLI.
+- **The explicit transition is `relinkra init`.** It derives the strong
+  identity, appends the new project/workspace, and rewrites the config
+  while preserving the old registry records. Nothing migrates
+  automatically.
+- **Historical state is never merged or relabeled.** Memories, handoffs,
+  runtime evidence, metrics observations, and CBM records remain bound to
+  the identity they were recorded under (`relinkra init` shares no
+  memory with the previous project). Metrics classify each observation
+  against the effective identity: equal project+workspace+revision is
+  CURRENT, a different project/workspace is FOREIGN, a different revision
+  is STALE, and an unresolved identity is UNKNOWN.
+
+Identity surfaces, all read-only:
+
+- Viewer status: `project.project_id` is the **effective** project id;
+  `project.registered_project_id`, `project.live_project_id`,
+  `project.identity_state`, `project.migration_available`, and
+  `project.recommended_action` disclose the pre-migration condition. The
+  workspace block likewise carries
+  `registered_workspace_id`/`live_workspace_id`. Graph viewing is never
+  blocked by a pending migration.
+- Doctor: the `Project identity` row and the `identity` payload section
+  report the same facts with the exact next action; inspection never
+  mutates the registry or the config.
+- Context CLI: registry validation is preserved. The registered effective
+  identity is accepted; the unregistered live candidate is rejected until
+  an explicit `relinkra init`.
+
 ## Internal/legacy implementation detail
 
 The registry API and module-level CLI below are retained for internal and

@@ -54,6 +54,7 @@ from . import (
     cbm_indexing,
     cbm_support,
     context_metrics,
+    effective_identity,
     viewer,
     viewer_graph,
 )
@@ -1387,6 +1388,77 @@ def check_registered_revision(project: Optional[dict]) -> Optional[Check]:
 
 
 # ---------------------------------------------------------------------------
+# Effective identity (VIS-4)
+# ---------------------------------------------------------------------------
+
+
+def _workspace_effective_identity(
+    root: Path, config: Optional[WorkspaceConfig] = None
+) -> effective_identity.EffectiveIdentity:
+    """Resolve effective identity through the one shared resolver.
+
+    A valid persisted registration stays effective until an explicit
+    migration; the stronger current Git derivation is only a disclosed
+    candidate. Read-only: no registry/config state is written.
+    """
+    if config is None:
+        config = WorkspaceConfig.load(root)
+    return effective_identity.resolve_effective_identity(
+        str(root),
+        registry_path=str(registry_path(root)),
+        registered_project_id=(config.project_id if config else None) or None,
+        registered_workspace_id=(config.workspace_id if config else None) or None,
+    )
+
+
+def _identity_check(identity: effective_identity.EffectiveIdentity) -> Check:
+    """One doctor row for the effective-identity state, always actionable."""
+    if identity.identity_state == effective_identity.IDENTITY_STATE_REGISTERED:
+        if identity.live_project_id is None:
+            detail = (
+                "registered identity is effective; the current repository "
+                "identity could not be derived"
+            )
+        elif identity.live_project_id == identity.registered_project_id:
+            detail = "registered identity matches the current repository"
+        else:  # pragma: no cover - defensive; state would be migration_available
+            detail = "registered identity is effective"
+        return Check("Project identity", PASS, detail)
+    if (
+        identity.identity_state
+        == effective_identity.IDENTITY_STATE_MIGRATION_AVAILABLE
+    ):
+        return Check(
+            "Project identity",
+            WARN,
+            f"registered project {identity.registered_project_id} is "
+            f"effective; detected Git project {identity.live_project_id} "
+            "is a migration candidate",
+            "Review the detected identity, then run 'relinkra init' to "
+            "migrate explicitly. Historical state stays bound to the "
+            "registered project until you do.",
+        )
+    if identity.identity_state == effective_identity.IDENTITY_STATE_UNREGISTERED:
+        detected = (
+            f"detected Git project {identity.live_project_id} is not registered"
+            if identity.live_project_id
+            else "no Git project could be detected"
+        )
+        return Check(
+            "Project identity",
+            WARN,
+            f"this workspace has no valid registration; {detected}",
+            "Run 'relinkra init' to register this workspace.",
+        )
+    return Check(
+        "Project identity",
+        WARN,
+        "the effective project identity could not be resolved",
+        "Run 'relinkra init' from inside the workspace.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1727,10 +1799,16 @@ def cmd_doctor(args) -> int:
     # Set only when services came up: the trusted deep health doctor
     # earned through the CBM trust ladder, else the shallow report.
     health: Optional[dict] = None
+    # Effective identity is independent of the service layer: a workspace
+    # can have an unreadable registry (services FAIL) and doctor must
+    # still disclose which identity is effective and which is a candidate.
+    identity: Optional[effective_identity.EffectiveIdentity] = None
 
     if resolved.root is not None:
         checks.append(check_config(resolved.root, resolved.config))
         checks.append(check_registry(resolved.root))
+        identity = _workspace_effective_identity(resolved.root, resolved.config)
+        checks.append(_identity_check(identity))
         revision_check = check_registered_revision(resolved.project)
         if revision_check is not None:
             checks.append(revision_check)
@@ -1782,22 +1860,14 @@ def cmd_doctor(args) -> int:
                     health = resolved.health or {}
             checks.extend(component_checks(health))
             checks.append(check_mcp(resolved.services, resolved.health))
-            checks.append(
-                Check("Project identity", PASS, "resolved")
-                if resolved.project
-                else Check(
-                    "Project identity",
-                    WARN,
-                    "no registered project resolved",
-                    "Run 'relinkra init'.",
-                )
-            )
 
     payload: Dict[str, Any] = {
         "relinkra_version": __version__,
         "contract_version": CONTRACT_VERSION,
         "checks": [check.to_dict() for check in checks],
     }
+    if identity is not None:
+        payload["identity"] = identity.to_dict()
     if resolved.project:
         payload["revision"] = {
             key: resolved.project.get(key)
@@ -3048,46 +3118,23 @@ def _cbm_graph_counts(
     return nodes, edges
 
 
-def _viewer_workspace_id(root: str, config: Optional[WorkspaceConfig]) -> Optional[str]:
-    """The pinned workspace id, else the registry lookup, else None.
-
-    A pinned id in the workspace config wins; otherwise the registry is
-    scanned for the workspace whose canonical path is this root. Any
-    registry failure means "unknown", never a crash.
-    """
-    if config is not None and config.workspace_id:
-        return config.workspace_id
-    try:
-        registry = Registry(str(registry_path(Path(root))))
-        canonical = canonicalize_path(root)
-        for workspace in registry.workspaces.values():
-            if workspace.canonical_path == canonical:
-                return workspace.workspace_id or None
-    except (RegistryError, OSError, ValueError):
-        return None
-    return None
-
-
 # --- VIS-2 graph routes -----------------------------------------------------
 
 
 def _viewer_graph_prepare(
     root: str,
-) -> Tuple[
-    Optional[CBMCLIAdapter], Optional[WorkspaceConfig], Optional[Tuple[int, dict]]
-]:
-    """VIS-2 graph routes: (adapter, config, error_response) CBM gate.
+) -> Tuple[Optional[CBMCLIAdapter], Optional[Tuple[int, dict]]]:
+    """VIS-2 graph routes: (adapter, error_response) CBM gate.
 
     The graph routes report honest bounded states instead of raising: a
     missing binary is 503 cbm_unavailable, a missing stored index is 409
     index_missing, and success returns an adapter bound to the stored
-    managed graph plus the workspace config for later id lookup.
-    Construction alone executes nothing; the adapter's own SHA-256 gate
-    still protects every execution.
+    managed graph. Construction alone executes nothing; the adapter's own
+    SHA-256 gate still protects every execution.
     """
     binary = cbm_support.resolve_cbm_binary(root)
     if not binary:
-        return None, None, (
+        return None, (
             503,
             {
                 "error": "cbm_unavailable",
@@ -3104,7 +3151,7 @@ def _viewer_graph_prepare(
         record = None
     adapter = _viewer_stored_adapter(root, record, binary)
     if adapter is None:
-        return None, config, (
+        return None, (
             409,
             {
                 "error": "index_missing",
@@ -3112,7 +3159,7 @@ def _viewer_graph_prepare(
                 "next_action": "relinkra cbm index",
             },
         )
-    return adapter, config, None
+    return adapter, None
 
 
 def _viewer_graph_search_payload(
@@ -3127,7 +3174,7 @@ def _viewer_graph_search_payload(
         query, kind, limit = viewer_graph.parse_search_params(params)
     except viewer_graph.GraphAPIError as exc:
         return exc.status, exc.to_dict()
-    adapter, _config, error = _viewer_graph_prepare(root)
+    adapter, error = _viewer_graph_prepare(root)
     if error is not None:
         return error
     try:
@@ -3140,20 +3187,27 @@ def _viewer_graph_search_payload(
 def _viewer_graph_node_payload(
     root: str, project_id: str, params: Dict[str, List[str]]
 ) -> Tuple[int, dict]:
-    """``(status, payload)`` for one bounded focal-node request."""
+    """``(status, payload)`` for one bounded focal-node request.
+
+    The code reference carries the EFFECTIVE identity, not the live
+    candidate. ``project_id`` is the caller's live derivation, used only
+    as a last-resort label when the effective identity cannot be resolved
+    at all; graph viewing is never blocked by a pending migration.
+    """
     try:
         key = viewer_graph.parse_node_params(params)
     except viewer_graph.GraphAPIError as exc:
         return exc.status, exc.to_dict()
-    adapter, config, error = _viewer_graph_prepare(root)
+    adapter, error = _viewer_graph_prepare(root)
     if error is not None:
         return error
+    identity = _workspace_effective_identity(Path(root))
     try:
         payload = viewer_graph.node_payload(
             key,
             adapter,
-            project_id=project_id,
-            workspace_id=_viewer_workspace_id(root, config),
+            project_id=identity.effective_project_id or project_id,
+            workspace_id=identity.effective_workspace_id,
         )
     except viewer_graph.GraphAPIError as exc:
         return exc.status, exc.to_dict()
@@ -3169,7 +3223,7 @@ def _viewer_git_value(probe, root: str) -> Optional[str]:
     return value or None
 
 
-def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
+def _viewer_status_payload(root: str) -> Dict[str, Any]:
     """The viewer's status payload for one workspace.
 
     Deterministic and path-free by construction: only ids, shas, branch,
@@ -3177,8 +3231,15 @@ def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
     indexed revision always comes from the STORED Branch probe
     (``graph_index_head``); ``index_status`` is deliberately never
     consulted because its head is live-derived.
+
+    ``project.project_id`` is the EFFECTIVE project id: a valid
+    registration stays authoritative until an explicit migration, and the
+    stronger live derivation is disclosed as a candidate instead of
+    replacing it. ``identity_state`` and ``migration_available`` expose
+    the pre-migration condition without aliasing either identity.
     """
     config = WorkspaceConfig.load(Path(root))
+    identity = _workspace_effective_identity(Path(root), config)
     try:
         record = _cbm_record_for_root(Path(root), config)
     except (RegistryError, OSError, ValueError):
@@ -3217,7 +3278,14 @@ def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
             "state": display,
             "worktree_drift": freshness["worktree_drift"],
         },
-        "project": {"project_id": project_id},
+        "project": {
+            "project_id": identity.effective_project_id,
+            "registered_project_id": identity.registered_project_id,
+            "live_project_id": identity.live_project_id,
+            "identity_state": identity.identity_state,
+            "migration_available": identity.migration_available,
+            "recommended_action": identity.recommended_action,
+        },
         "revision": {
             "current": _viewer_git_value(git_head_sha, root),
             "indexed": indexed,
@@ -3232,34 +3300,41 @@ def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
             "branch": _viewer_git_value(git_branch, root),
             "initialized": bool(config is not None and config.workspace_id),
             "os_family": normalize_os_family(sys.platform),
-            "workspace_id": _viewer_workspace_id(root, config),
+            "workspace_id": identity.effective_workspace_id,
+            "registered_workspace_id": identity.registered_workspace_id,
+            "live_workspace_id": identity.live_workspace_id,
         },
     }
 
 
-def _viewer_metrics_identity(root: str, project_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve only the path-free identity needed to classify observations."""
-    try:
-        config = WorkspaceConfig.load(Path(root))
-    except Exception:
-        config = None
-    workspace_id = _viewer_workspace_id(root, config)
+def _viewer_metrics_identity(root: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """The EFFECTIVE identity an observation must match to be CURRENT.
+
+    A legitimate fresh packet from the registered legacy workspace
+    therefore classifies as CURRENT even while a stronger live identity
+    exists; a live-candidate observation is FOREIGN, never relabeled.
+    """
+    identity = _workspace_effective_identity(Path(root))
     try:
         revision = git_head_sha(root)
     except Exception:
         revision = None
-    return project_id, workspace_id, revision
+    return (
+        identity.effective_project_id,
+        identity.effective_workspace_id,
+        revision,
+    )
 
 
-def _viewer_metrics_current_payload(root: str, project_id: str, params=None) -> Dict[str, Any]:
-    project, workspace, revision = _viewer_metrics_identity(root, project_id)
+def _viewer_metrics_current_payload(root: str, params=None) -> Dict[str, Any]:
+    project, workspace, revision = _viewer_metrics_identity(root)
     return context_metrics.metrics_payload(
         root, project_id=project, workspace_id=workspace, revision=revision
     )
 
 
-def _viewer_metrics_history_payload(root: str, project_id: str, params=None) -> Dict[str, Any]:
-    project, workspace, revision = _viewer_metrics_identity(root, project_id)
+def _viewer_metrics_history_payload(root: str, params=None) -> Dict[str, Any]:
+    project, workspace, revision = _viewer_metrics_identity(root)
     requested_limit = None
     if isinstance(params, dict):
         values = params.get("limit") or []
@@ -3282,22 +3357,22 @@ def cmd_cbm_open(args) -> int:
     resolved = _cbm_resolve_or_report(args.path, "open")
     if resolved is None:
         return EXIT_ACTION_REQUIRED
-    root, project_id = resolved
+    root, live_project_id = resolved
 
     def status_provider() -> Dict[str, Any]:
-        return _viewer_status_payload(root, project_id)
+        return _viewer_status_payload(root)
 
     def graph_search_provider(params: Dict[str, List[str]]) -> Tuple[int, dict]:
         return _viewer_graph_search_payload(root, params)
 
     def graph_node_provider(params: Dict[str, List[str]]) -> Tuple[int, dict]:
-        return _viewer_graph_node_payload(root, project_id, params)
+        return _viewer_graph_node_payload(root, live_project_id, params)
 
     def metrics_current_provider(params=None) -> Dict[str, Any]:
-        return _viewer_metrics_current_payload(root, project_id, params)
+        return _viewer_metrics_current_payload(root, params)
 
     def metrics_history_provider(params=None) -> Dict[str, Any]:
-        return _viewer_metrics_history_payload(root, project_id, params)
+        return _viewer_metrics_history_payload(root, params)
 
     try:
         server = viewer.create_server(

@@ -906,6 +906,19 @@
     return "unavailable";
   }
 
+  function identityStateText(value) {
+    if (value === "registered") {
+      return "Registered";
+    }
+    if (value === "migration_available") {
+      return "Migration available";
+    }
+    if (value === "unregistered") {
+      return "Not registered";
+    }
+    return "Unknown";
+  }
+
   function describeStatus(payload) {
     var cbm = payload.cbm || {};
     var availability = cbm.availability;
@@ -931,6 +944,10 @@
 
   function clearFields() {
     setText("fact-project-id", "unavailable");
+    setText("fact-registered-project-id", "unavailable");
+    setText("fact-live-project-id", "unavailable");
+    setText("fact-identity-state", "unavailable");
+    setText("fact-identity-action", "unavailable");
     setText("fact-workspace-id", "unavailable");
     setText("fact-availability", "unavailable");
     setText("fact-state", "unavailable");
@@ -949,6 +966,13 @@
     var workspace = payload.workspace || {};
 
     setText("fact-project-id", stateText(project.project_id));
+    setText(
+      "fact-registered-project-id",
+      stateText(project.registered_project_id)
+    );
+    setText("fact-live-project-id", stateText(project.live_project_id));
+    setText("fact-identity-state", identityStateText(project.identity_state));
+    setText("fact-identity-action", stateText(project.recommended_action));
     if (workspace.initialized === true) {
       setText("fact-workspace-id", stateText(workspace.workspace_id));
     } else {

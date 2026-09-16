@@ -93,6 +93,18 @@ class ShellSkeletonTests(unittest.TestCase):
         self.assertIn('id="fact-project-id"', self.html)
         self.assertNotIn("Graph explorer will load here", self.html)
 
+    def test_effective_identity_surfaces_ship_in_the_status_panel(self):
+        for element_id, label in (
+            ("fact-project-id", "Effective project"),
+            ("fact-registered-project-id", "Registered project"),
+            ("fact-live-project-id", "Detected Git project"),
+            ("fact-identity-state", "Identity state"),
+            ("fact-identity-action", "Recommended action"),
+        ):
+            with self.subTest(element_id=element_id):
+                self.assertIn(label, self.html)
+                self.assertIn(f'id="{element_id}"', self.html)
+
 
 class AppScriptTests(unittest.TestCase):
     """The renderer talks only to the bounded viewer routes."""
@@ -117,6 +129,21 @@ class AppScriptTests(unittest.TestCase):
 
     def test_svg_is_built_with_the_namespace_api(self):
         self.assertIn("createElementNS", self.js)
+
+    def test_identity_fields_are_rendered_from_the_status_payload(self):
+        for field in (
+            "registered_project_id",
+            "live_project_id",
+            "identity_state",
+            "recommended_action",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, self.js)
+        self.assertIn("Migration available", self.js)
+        self.assertIn('setText("fact-registered-project-id"', self.js)
+        self.assertIn('setText("fact-live-project-id"', self.js)
+        self.assertIn('setText("fact-identity-state"', self.js)
+        self.assertIn('setText("fact-identity-action"', self.js)
 
     def test_no_html_injection_or_eval_primitives(self):
         for name in ("index.html", "app.js", "styles.css"):
