@@ -399,10 +399,26 @@ relinkra cbm setup
 relinkra cbm status
 relinkra cbm index
 relinkra cbm refresh
+relinkra cbm open
 ```
 
 `setup` also accepts `--from-file PATH` and `--json`; `index` and `refresh`
 accept `--path`, `--json`, and `--mode fast`.
+
+`open` starts the Relinkra-owned viewer for this workspace:
+
+- **Loopback-only.** It binds `127.0.0.1` and nothing else; there is no
+  `--host` option.
+- **Read-only and local-only.** It serves a static shell plus one JSON status
+  route built from the same honest CBM facts as `cbm status`. No graph
+  search, no relationship expansion, and no metrics persistence ship today;
+  the Graph and Metrics tabs are placeholders.
+- **No automatic lifecycle.** Opening the viewer never indexes or refreshes;
+  stale or missing indexes are reported with the exact command to run.
+- **Options.** `--path`, `--port PORT` (default `0`: the OS picks a free
+  port), `--no-open` (do not launch the default browser), and `--json`
+  (print only the startup object: `host`, `port`, `url`). Stop it with
+  Ctrl+C.
 
 `status` distinguishes missing, ready, stale, unavailable, unsupported, and
 unknown states, reporting index freshness as drift against the registered
@@ -410,7 +426,8 @@ revision (`STALE_COMMITTED`, `STALE_WORKTREE`, `STALE_BOTH`) with a next
 action. A successful `cbm index` or `refresh` reports only reliable fields:
 `nodes`, `edges`, the workspace `revision`, freshness drift flags, and
 measured `elapsed_seconds`. CBM remains behind Relinkra; agents should not
-install or register it directly. There is no CBM web UI.
+install or register it directly. Upstream CBM's own web server is not used,
+bundled, or documented as a supported surface.
 
 See [CBM backend](docs/cbm-backend.md) for certified acquisition, cache
 behavior, and limitations.

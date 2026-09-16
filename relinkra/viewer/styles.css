@@ -1,0 +1,125 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --panel: #ffffff;
+  --text: #1c1c1e;
+  --muted: #5c5c66;
+  --line: #d8d8de;
+  --accent: #2f6fed;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141416;
+    --panel: #1d1d21;
+    --text: #ececf1;
+    --muted: #9a9aa5;
+    --line: #33333a;
+    --accent: #7aa2ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 2rem 1.5rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.app-label {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  max-width: 860px;
+  margin: 1.5rem auto 0;
+  padding: 0 0 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.tab.active,
+.tab[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.panel {
+  margin-top: 1.5rem;
+}
+
+.placeholder {
+  padding: 2rem;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--muted);
+  text-align: center;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+}
+
+.fact {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.fact dt {
+  margin: 0 0 0.2rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.fact dd {
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+
+.action {
+  margin: 1.25rem 0 0;
+  padding: 0.9rem 1rem;
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+}

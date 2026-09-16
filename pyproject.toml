@@ -55,3 +55,9 @@ packages = ["relinkra"]
 
 [tool.setuptools.dynamic]
 version = { attr = "relinkra.__version__" }
+
+# The read-only viewer shell (VIS-1) ships as package DATA, not a
+# subpackage: plain files served by relinkra.viewer from the installed
+# wheel/sdist, never imported.
+[tool.setuptools.package-data]
+relinkra = ["viewer/*.html", "viewer/*.css", "viewer/*.js"]

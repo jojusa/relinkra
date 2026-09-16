@@ -26,7 +26,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
 
 try:
@@ -82,6 +84,26 @@ def _raise_infrastructure_failure(reason: str) -> None:
     if os.environ.get(ENV_ARTIFACT):
         raise RuntimeError("strict artifact E2E failure: " + reason)
     raise unittest.SkipTest(reason)
+
+
+def _read_startup_json(stream):
+    """Accumulate stdout until it holds one complete JSON object, or None.
+
+    The caller bounds the wait by killing the child from a watchdog
+    timer, which turns a stall into EOF instead of a hung test.
+    """
+    decoder = json.JSONDecoder()
+    buffer = ""
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        buffer += line
+        try:
+            payload, _ = decoder.raw_decode(buffer.lstrip())
+        except ValueError:
+            continue
+        return payload
 
 
 class CleanInstallTests(unittest.TestCase):
@@ -575,6 +597,70 @@ class CleanInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         response = json.loads(result.stdout)
         self.assertEqual(response["result"]["serverInfo"]["name"], "relinkra")
+
+    def test_step_m_cbm_open_help_is_installed(self):
+        self._installed()
+        cls = type(self)
+        result = subprocess.run(
+            [str(cls._script("relinkra")), "cbm", "open", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            cwd=str(cls._fresh_dir("cwd-m")),
+            env=cls._clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("open", result.stdout)
+        self.assertIn("--no-open", result.stdout)
+        self.assertNotIn("--host", result.stdout)
+
+    def test_step_n_installed_viewer_serves_loopback_status(self):
+        """The installed viewer serves assets and status over 127.0.0.1."""
+        if shutil.which("git") is None:
+            self.skipTest("git is required for the viewer smoke test")
+        self._installed()
+        cls = type(self)
+        repo = self._work_repo()
+        process = subprocess.Popen(
+            [
+                str(cls._script("relinkra")),
+                "cbm",
+                "open",
+                "--no-open",
+                "--json",
+            ],
+            cwd=str(repo),
+            env=cls._sandbox_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        watchdog = threading.Timer(60.0, process.kill)
+        watchdog.start()
+        try:
+            payload = _read_startup_json(process.stdout)
+            self.assertIsNotNone(payload, "viewer printed no startup JSON")
+            self.assertEqual(payload["host"], "127.0.0.1")
+            url = payload["url"]
+            with urllib.request.urlopen(url + "/", timeout=30) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"Relinkra Viewer", response.read())
+            with urllib.request.urlopen(url + "/api/status", timeout=30) as response:
+                self.assertEqual(response.status, 200)
+                status = json.loads(response.read().decode("utf-8"))
+            self.assertIn("cbm", status)
+            self.assertIn("workspace", status)
+        finally:
+            watchdog.cancel()
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=30)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 class ArtifactResolutionTests(unittest.TestCase):

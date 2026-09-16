@@ -184,6 +184,31 @@ class RealBuildContractTests(unittest.TestCase):
             artifact_checks.inspect_artifact(self.sdist).kind, "sdist"
         )
 
+    def test_wheel_contains_the_viewer_assets(self):
+        with zipfile.ZipFile(self.wheel) as archive:
+            names = set(archive.namelist())
+        for member in (
+            "relinkra/viewer/index.html",
+            "relinkra/viewer/app.js",
+            "relinkra/viewer/styles.css",
+        ):
+            with self.subTest(member=member):
+                self.assertIn(member, names)
+
+    def test_sdist_contains_the_viewer_assets(self):
+        with tarfile.open(self.sdist, "r:gz") as archive:
+            names = set(archive.getnames())
+        for member in (
+            "relinkra/viewer/index.html",
+            "relinkra/viewer/app.js",
+            "relinkra/viewer/styles.css",
+        ):
+            with self.subTest(member=member):
+                self.assertTrue(
+                    any(name.endswith(member) for name in names),
+                    f"{member} is missing from the sdist",
+                )
+
 
 class SyntheticArtifactCase(unittest.TestCase):
     """Hermetic mutation proofs over crafted archives (no build)."""

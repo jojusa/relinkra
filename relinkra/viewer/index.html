@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Relinkra Viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>Relinkra Viewer</h1>
+    <p class="app-label">read-only &middot; local only</p>
+  </header>
+
+  <nav class="tabs" aria-label="Viewer sections">
+    <button class="tab" type="button" data-tab="graph">Graph</button>
+    <button class="tab" type="button" data-tab="metrics">Metrics</button>
+    <button class="tab" type="button" data-tab="status" aria-selected="true">Status</button>
+  </nav>
+
+  <main>
+    <section id="panel-graph" class="panel" hidden>
+      <p class="placeholder">Graph explorer will load here</p>
+    </section>
+
+    <section id="panel-metrics" class="panel" hidden>
+      <p class="placeholder">No ContextPacket metrics recorded yet</p>
+    </section>
+
+    <section id="panel-status" class="panel">
+      <dl class="facts">
+        <div class="fact">
+          <dt>Project id</dt>
+          <dd id="fact-project-id">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Workspace id</dt>
+          <dd id="fact-workspace-id">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>CBM availability</dt>
+          <dd id="fact-availability">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Index state</dt>
+          <dd id="fact-state">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Current revision</dt>
+          <dd id="fact-current-revision">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Indexed revision</dt>
+          <dd id="fact-indexed-revision">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Committed drift</dt>
+          <dd id="fact-committed-drift">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Worktree drift</dt>
+          <dd id="fact-worktree-drift">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Nodes</dt>
+          <dd id="fact-nodes">unavailable</dd>
+        </div>
+        <div class="fact">
+          <dt>Edges</dt>
+          <dd id="fact-edges">unavailable</dd>
+        </div>
+      </dl>
+      <p class="action" id="status-action">Loading status&hellip;</p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

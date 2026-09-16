@@ -31,6 +31,8 @@ from relinkra import product_cli
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 GITIGNORE = REPO_ROOT / ".gitignore"
+VIEWER_DIR = REPO_ROOT / "relinkra" / "viewer"
+VIEWER_ASSETS = ("index.html", "app.js", "styles.css")
 
 # Project version policy: final releases are X.Y.Z; release candidates
 # are X.Y.ZrcN with N >= 1 (rc0 is deliberately not a valid candidate).
@@ -141,6 +143,35 @@ class PyprojectTests(unittest.TestCase):
         packages = self.data["tool"]["setuptools"]["packages"]
         self.assertEqual(packages, ["relinkra"])
         self.assertNotIn("tests", packages)
+
+    def test_package_data_ships_the_viewer_assets(self):
+        # The viewer shell is package DATA (no subpackage): exactly the
+        # three plain-file globs, under the one declared package.
+        package_data = self.data["tool"]["setuptools"]["package-data"]
+        self.assertEqual(
+            package_data,
+            {"relinkra": ["viewer/*.html", "viewer/*.css", "viewer/*.js"]},
+        )
+
+    def test_package_list_stays_relinkra_only_with_the_viewer(self):
+        self.assertEqual(self.data["tool"]["setuptools"]["packages"], ["relinkra"])
+
+
+class ViewerAssetTests(unittest.TestCase):
+    """The viewer assets exist on disk where package-data points."""
+
+    def test_viewer_assets_exist_and_are_not_empty(self):
+        self.assertTrue(VIEWER_DIR.is_dir(), "relinkra/viewer/ is missing")
+        for name in VIEWER_ASSETS:
+            with self.subTest(asset=name):
+                path = VIEWER_DIR / name
+                self.assertTrue(path.is_file(), f"missing viewer asset: {name}")
+                self.assertTrue(path.read_bytes(), f"empty viewer asset: {name}")
+
+    def test_viewer_directory_is_not_a_subpackage(self):
+        # Package data, not a package: an __init__.py here would change
+        # the wheel's import surface and the packages contract.
+        self.assertFalse((VIEWER_DIR / "__init__.py").exists())
 
 
 class GitignoreTests(unittest.TestCase):

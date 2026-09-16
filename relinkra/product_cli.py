@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import platform
@@ -46,7 +47,14 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, backend_policy, cbm_acquire, cbm_indexing, cbm_support
+from . import (
+    __version__,
+    backend_policy,
+    cbm_acquire,
+    cbm_indexing,
+    cbm_support,
+    viewer,
+)
 from .app_service import (
     CONTRACT_VERSION,
     RelinkraServices,
@@ -55,6 +63,7 @@ from .app_service import (
     sanitize_wire_text,
 )
 from .backend_detection import assess_workspace
+from .cbm import cbm_db_path
 from .cbm_adapter import CBMAdapterError, CBMCLIAdapter
 from .connect_verification import (
     STATUS_EXPIRED,
@@ -71,6 +80,7 @@ from .identity import (
     discover_repository_identity,
     git_branch,
     git_head_sha,
+    normalize_os_family,
 )
 from .registry import Registry, RegistryError
 from .workspace_resolution import discover_git_root
@@ -2952,6 +2962,241 @@ def cmd_cbm_refresh(args) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# Read-only local viewer (VIS-1): cbm open
+# ---------------------------------------------------------------------------
+
+
+def _viewer_port(value: str) -> int:
+    """Argparse type for ``--port``: an integer in 0..65535.
+
+    Explicit ``0`` is meaningful: it asks the OS to choose a free port.
+    """
+    try:
+        port = int(str(value).strip(), 10)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "port must be an integer between 0 and 65535"
+        )
+    if port < 0 or port > 65535:
+        raise argparse.ArgumentTypeError(
+            "port must be an integer between 0 and 65535"
+        )
+    return port
+
+
+def _viewer_stored_adapter(
+    root: str, record: Optional[dict], binary: Optional[str]
+) -> Optional[CBMCLIAdapter]:
+    """An adapter bound to the STORED managed graph, or None.
+
+    Mirrors the provenance/record gates of
+    ``cbm_indexing.freshness_state``: the record must carry a usable
+    project name and cache dir, the cache must resolve inside the
+    workspace-managed subtree, and the project ``.db`` must exist before
+    anything is ever executed. Construction alone executes nothing.
+    """
+    if not binary or not record:
+        return None
+    project_name = str(record.get("project_name") or "").strip()
+    raw_cache = str(record.get("cache_dir") or "").strip()
+    if not project_name or not raw_cache:
+        return None
+    try:
+        cache_dir = cbm_support.absolutize_against_root(str(root), raw_cache)
+        if not os.path.isfile(cbm_db_path(cache_dir, project_name)):
+            return None
+        expected = (
+            cbm_support.CERTIFIED_CBM_BINARIES.get(cbm_support.platform_tag())
+            or {}
+        )
+        expected_sha = str(expected.get("sha256") or "").lower()
+        return CBMCLIAdapter(
+            cbm_bin=str(binary),
+            cache_dir=cache_dir,
+            cbm_project_name=project_name,
+            workspace_root=str(root),
+            expected_sha256=expected_sha,
+        )
+    except (CBMAdapterError, OSError, ValueError):
+        return None
+
+
+def _cbm_graph_counts(
+    root: str, record: Optional[dict], binary: Optional[str]
+) -> Tuple[Optional[int], Optional[int]]:
+    """``(nodes, edges)`` from the STORED graph, or ``(None, None)``.
+
+    Only aggregate counts cross this boundary; every adapter failure
+    (outage, not indexed, malformed payload) degrades honestly to
+    unavailable instead of escaping.
+    """
+    adapter = _viewer_stored_adapter(root, record, binary)
+    if adapter is None:
+        return None, None
+    try:
+        orientation = adapter.architecture_orientation(limit=1)
+        nodes = orientation.get("total_nodes")
+        edges = orientation.get("total_edges")
+    except Exception:
+        # Any probe failure (outage, not indexed, malformed payload)
+        # degrades honestly to unavailable: a viewer status request must
+        # never surface an exception or a traceback.
+        return None, None
+    return nodes, edges
+
+
+def _viewer_workspace_id(root: str, config: Optional[WorkspaceConfig]) -> Optional[str]:
+    """The pinned workspace id, else the registry lookup, else None.
+
+    A pinned id in the workspace config wins; otherwise the registry is
+    scanned for the workspace whose canonical path is this root. Any
+    registry failure means "unknown", never a crash.
+    """
+    if config is not None and config.workspace_id:
+        return config.workspace_id
+    try:
+        registry = Registry(str(registry_path(Path(root))))
+        canonical = canonicalize_path(root)
+        for workspace in registry.workspaces.values():
+            if workspace.canonical_path == canonical:
+                return workspace.workspace_id or None
+    except (RegistryError, OSError, ValueError):
+        return None
+    return None
+
+
+def _viewer_git_value(probe, root: str) -> Optional[str]:
+    """A git fact for the status payload, or None when unreadable."""
+    try:
+        value = probe(str(root))
+    except (GitError, ValueError, OSError):
+        return None
+    return value or None
+
+
+def _viewer_status_payload(root: str, project_id: str) -> Dict[str, Any]:
+    """The viewer's status payload for one workspace.
+
+    Deterministic and path-free by construction: only ids, shas, branch,
+    OS family, states, counts, and booleans cross this boundary. The
+    indexed revision always comes from the STORED Branch probe
+    (``graph_index_head``); ``index_status`` is deliberately never
+    consulted because its head is live-derived.
+    """
+    config = WorkspaceConfig.load(Path(root))
+    try:
+        record = _cbm_record_for_root(Path(root), config)
+    except (RegistryError, OSError, ValueError):
+        record = None
+    availability, binary, freshness = _cbm_freshness_snapshot(root, record)
+    display = _cbm_display_state(freshness["state"])
+    next_action = _cbm_next_action(display, freshness)
+    if availability in (
+        cbm_indexing.UNAVAILABLE,
+        cbm_indexing.UNSUPPORTED,
+        cbm_indexing.UNTRUSTED,
+    ):
+        next_action = "relinkra cbm setup"
+    elif display == "READY":
+        next_action = None
+
+    indexed: Optional[str] = None
+    nodes: Optional[int] = None
+    edges: Optional[int] = None
+    if availability == "AVAILABLE":
+        adapter = _viewer_stored_adapter(root, record, binary)
+        if adapter is not None:
+            try:
+                indexed = adapter.graph_index_head()
+            except (CBMAdapterError, OSError):
+                indexed = None
+        nodes, edges = _cbm_graph_counts(root, record, binary)
+
+    return {
+        "cbm": {
+            "availability": availability,
+            "committed_drift": freshness["committed_drift"],
+            "edges": edges,
+            "next_action": next_action,
+            "nodes": nodes,
+            "state": display,
+            "worktree_drift": freshness["worktree_drift"],
+        },
+        "project": {"project_id": project_id},
+        "revision": {
+            "current": _viewer_git_value(git_head_sha, root),
+            "indexed": indexed,
+            "indexed_source": "stored_branch",
+        },
+        "viewer": {
+            "contract": viewer.VIEWER_CONTRACT,
+            "host": viewer.VIEWER_HOST,
+            "read_only": True,
+        },
+        "workspace": {
+            "branch": _viewer_git_value(git_branch, root),
+            "initialized": bool(config is not None and config.workspace_id),
+            "os_family": normalize_os_family(sys.platform),
+            "workspace_id": _viewer_workspace_id(root, config),
+        },
+    }
+
+
+def cmd_cbm_open(args) -> int:
+    """Serve the read-only local viewer for this workspace until Ctrl+C.
+
+    Exit 2 when the workspace itself is unusable; exit 1 when the server
+    cannot start; exit 0 for a clean Ctrl+C shutdown. The browser opens
+    strictly after the socket is listening, and a failed browser launch
+    never terminates the server.
+    """
+    resolved = _cbm_resolve_or_report(args.path, "open")
+    if resolved is None:
+        return EXIT_ACTION_REQUIRED
+    root, project_id = resolved
+
+    def status_provider() -> Dict[str, Any]:
+        return _viewer_status_payload(root, project_id)
+
+    try:
+        server = viewer.create_server(status_provider, port=args.port)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+            _fail(
+                f"port {args.port} is already in use",
+                "Choose another port or omit --port to let the OS pick one.",
+            )
+        else:
+            _fail(
+                f"could not start the local viewer: "
+                f"{sanitize_wire_text(str(exc))}",
+                "Check that the loopback interface is available.",
+            )
+        return EXIT_ERROR
+    try:
+        port = int(server.server_address[1])
+        url = f"http://127.0.0.1:{port}"
+        _emit(
+            {"host": "127.0.0.1", "port": port, "url": url},
+            args.json,
+            f"Relinkra Viewer\n{url}\nRead-only local viewer. Press Ctrl+C to stop.",
+        )
+        # Flush BEFORE blocking: a piped stdout must see the startup
+        # object now, not whenever the server eventually exits.
+        sys.stdout.flush()
+        if not args.no_open and not viewer.open_browser(url):
+            print(
+                f"Could not open a browser automatically; open {url} manually.",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+        viewer.run_forever(server)
+    finally:
+        server.server_close()
+    return EXIT_OK
+
+
 def cmd_version(args) -> int:
     """Show the Relinkra version and basic compatibility information.
 
@@ -3049,16 +3294,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     # The cbm family (R5E.2B): one nested subcommand set so the
     # optional-backend lifecycle verbs read as one workflow. R5H.1 adds
-    # `setup`: managed acquisition of the certified binary.
+    # `setup`: managed acquisition of the certified binary. VIS-1 adds
+    # `open`: the read-only local viewer (loopback only, no --host).
     cbm_cmd = sub.add_parser(
         "cbm",
-        help="manage the optional CBM code index (setup/status/index/refresh)",
+        help="manage the optional CBM code index "
+        "(setup/status/index/refresh/open)",
     )
     cbm_sub = cbm_cmd.add_subparsers(dest="cbm_command", required=True)
     for name, handler, help_text in (
         ("status", cmd_cbm_status, "show managed CBM index freshness"),
         ("index", cmd_cbm_index, "build the managed CBM index and register it"),
         ("refresh", cmd_cbm_refresh, "refresh a stale managed CBM index"),
+        ("open", cmd_cbm_open, "open a local read-only viewer for this workspace"),
     ):
         cbm_command = cbm_sub.add_parser(name, help=help_text)
         cbm_command.add_argument(
@@ -3077,6 +3325,21 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=["fast"],
                 default="fast",
                 help="indexing mode (only 'fast' is supported)",
+            )
+        if name == "open":
+            # Loopback only by design: there is no --host option.
+            cbm_command.add_argument(
+                "--port",
+                type=_viewer_port,
+                default=0,
+                metavar="PORT",
+                help="loopback port to bind (0, the default, lets the OS choose)",
+            )
+            cbm_command.add_argument(
+                "--no-open",
+                dest="no_open",
+                action="store_true",
+                help="do not open the default browser automatically",
             )
         cbm_command.set_defaults(func=handler)
 
