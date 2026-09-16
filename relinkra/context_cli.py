@@ -64,6 +64,25 @@ def _emit(obj: object, fh=None) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True), file=fh or sys.stdout)
 
 
+def _write_stdout(text: str, *, end: str = "\n") -> None:
+    """Emit *text* to stdout as deterministic UTF-8.
+
+    A redirected Windows stdout uses the locale codec (cp1252), which
+    raises UnicodeEncodeError on valid packet Unicode such as "\\u2192".
+    Writing bytes through the binary buffer bypasses that codec; when a
+    caller replaced stdout with a text-only stream (StringIO in tests),
+    the text path keeps working unchanged.
+    """
+    payload = text + end
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(payload.encode("utf-8"))
+        buffer.flush()
+        return
+    sys.stdout.write(payload)
+    sys.stdout.flush()
+
+
 def _fail(message: str, code: int = 1) -> int:
     _emit({"error": sanitize_error(message)}, fh=sys.stderr)
     return code
@@ -368,9 +387,9 @@ def main(
     record_context_observation(args.workspace_root, packet)
 
     if args.explain and args.format == "markdown":
-        print(human_summary(packet), end="")
+        _write_stdout(human_summary(packet), end="")
     elif args.explain:
-        print(
+        _write_stdout(
             json.dumps(
                 explanation_document(packet),
                 indent=2 if args.pretty else None,
@@ -380,9 +399,9 @@ def main(
             )
         )
     elif args.format == "markdown":
-        print(packet.to_markdown())
+        _write_stdout(packet.to_markdown())
     else:
-        print(packet.to_portable_json(pretty=args.pretty))
+        _write_stdout(packet.to_portable_json(pretty=args.pretty))
     return 0
 
 
