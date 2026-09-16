@@ -93,9 +93,19 @@ relinkra connect codex
 
 The normal front door inspects and plans first, asks for confirmation
 before a write, and then uses the existing backup, validation, rollback,
-and restart guidance. If the registration is already valid for the
-workspace it is a verified no-op. Configuration presence is never proof
-that the host launched Relinkra.
+and restart guidance. If a write is required, Relinkra:
+
+- shows the planned change;
+- asks for confirmation;
+- creates a backup;
+- preserves unrelated configuration;
+- validates the result;
+- keeps rollback available;
+- tells you when the host must be restarted or reloaded.
+
+If the registration is already valid for the workspace it is a verified
+no-op. Configuration presence is never proof that the host launched
+Relinkra.
 
 After connecting, just use your agent. It can call the Relinkra MCP tools
 (`project_resolve`, `context_get`, `memory_save`, `memory_search`,
@@ -390,6 +400,9 @@ relinkra cbm status
 relinkra cbm index
 relinkra cbm refresh
 ```
+
+`setup` also accepts `--from-file PATH` and `--json`; `index` and `refresh`
+accept `--path`, `--json`, and `--mode fast`.
 
 `status` distinguishes missing, ready, stale, unavailable, unsupported, and
 unknown states, reporting index freshness as drift against the registered
