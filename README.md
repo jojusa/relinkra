@@ -44,10 +44,9 @@ overhead (see [Performance and scope](#performance-and-scope)).
 
 ## Release status
 
-Relinkra **0.1.4** is the release-preparation candidate documented here.
-It is not yet published; **0.1.2** remains the last public PyPI package.
-Maintainers and testers can exercise this candidate from a source checkout
-(see [Contributing](CONTRIBUTING.md)).
+Relinkra **0.1.4** is the current stable release. Install it with
+`pip install relinkra`; maintainers and testers can also exercise it from
+a source checkout (see [Contributing](CONTRIBUTING.md)).
 
 Requirements: Python 3.9 or newer and Git. Zero runtime dependencies.
 Released under the [MIT License](LICENSE). The project is hosted at
@@ -421,9 +420,7 @@ validation step is Kisouma dogfood.
 
 ## Platform and release truth
 
-- Version **0.1.4** is the release-preparation candidate; it is not yet
-  published and **0.1.2** remains the last public PyPI release until
-  publication.
+- Version **0.1.4** is the current stable release.
 - Windows is certified for the product. Linux and macOS have CI coverage, but
   exact-SHA/product certification language remains limited to the evidence
   available for each platform.

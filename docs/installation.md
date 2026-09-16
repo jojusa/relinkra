@@ -1,9 +1,7 @@
 # Install Relinkra
 
 Relinkra gives coding agents an orchestration and context layer without
-replacing their native tools. The current release-preparation candidate is
-**0.1.4**; it is not yet published, and **0.1.2** remains the last public
-package until publication.
+replacing their native tools. The current stable release is **0.1.4**.
 
 ## Quick path
 

@@ -30,7 +30,7 @@ Entry point: the installed `relinkra` console script — see
 [Installation](installation.md). From a source checkout,
 `python -m relinkra.product_cli` is equivalent.
 
-The public product CLI does not expose a `relinkra register` command. For CBM workspace registration, use `relinkra cbm index`; this is the supported route in the current release-preparation candidate.
+The public product CLI does not expose a `relinkra register` command. For CBM workspace registration, use `relinkra cbm index`; this is the supported route in the current release.
 
 For evidence-level questions such as “why was this selected?” or “is it
 current?”, use `python -m relinkra.context_cli --explain`. It has compact

@@ -3,11 +3,7 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased — 0.1.4 fresh-user recertification
-
-Not yet published; no version bump. This section records the 0.1.4 core
-surfaces (R6B–R6D) and the documentation finalization (R6G). The R6E and
-R6F sections below are part of the same unreleased 0.1.4 pool.
+## 0.1.4 — 2026-09-15
 
 ### Added
 
@@ -54,6 +50,29 @@ R6F sections below are part of the same unreleased 0.1.4 pool.
 - Doctor `PENDING` state: "not yet proven" is reported distinctly from
   `WARN` ("a real condition worth attention"); neither changes the exit
   code — only `FAIL` does.
+- `relinkra connect all`: a multiagent front door that runs every default
+  target (`codex`, `opencode`, `claude`, `devin-desktop`, `zcode`) through
+  its own per-agent inspect/check/plan/preflight/confirmation/apply
+  pipeline, with a per-host summary table, per-host confirmation, and
+  fail-closed behavior for refused or malformed hosts.
+- `connect check --verbose` for the full report; the default check output
+  is now compact and host-local (config, workspace, generated state,
+  runtime evidence, one next action).
+- `connect inspect` now exposes `workspace_matches` directly.
+- Relinkra-first routing order and Engram coexistence guidance, surfaced
+  in `connect list` and `connect all` output and the agent-instruction
+  contract.
+- Legacy direct-CBM bypass disclosure: a host configuration that registers
+  the CBM backend directly routes an agent around Relinkra's identity,
+  relevance, budget, and trust layer — and an entry in a scope the host
+  still imports (such as Devin Desktop's legacy config) is a live bypass.
+  Relinkra classifies such entries structurally (what an entry launches,
+  per the declared marker table): `inspect` discloses the bypass,
+  `check` reports it as a finding so the host is never valid,
+  `connect all` classifies the host as `legacy_bypass` and refuses it,
+  and `apply` refuses until the entry is removed by hand — legacy/import
+  files are never rewritten, and an unreadable legacy scope fails closed
+  the same way.
 
 ### Changed
 
@@ -71,44 +90,10 @@ R6F sections below are part of the same unreleased 0.1.4 pool.
   safe-control commands), and the memory/context surface guide. Relinkra
   remains Relinkra-first, source-authoritative, and expand-on-demand;
   token optimization removes redundancy, never evidence.
-
-### Fixed
-
-- Final-packet token accounting: the `packet_status` cpt1 totals now
-  measure the exact delivered packet — the block is settled onto the
-  packet before measurement instead of being appended afterwards, so
-  unbudgeted packets no longer under-count the bytes they ship. The
-  same re-settlement runs after post-ladder metadata attach on budgeted
-  packets. At an exact digit boundary no self-consistent state exists;
-  the settle then ships the deterministic conservative state (at most
-  one token over, never under). These are cpt1 approximations over the
-  serialized packet, not exact provider tokenizer counts.
-
-## Unreleased — R6E multiagent UX and routing
-
-Not yet published; no version bump.
-
-### Added
-
-- `relinkra connect all`: a multiagent front door that runs every default
-  target (`codex`, `opencode`, `claude`, `devin-desktop`, `zcode`) through
-  its own per-agent inspect/check/plan/preflight/confirmation/apply
-  pipeline, with a per-host summary table, per-host confirmation, and
-  fail-closed behavior for refused or malformed hosts.
-- `connect check --verbose` for the full report; the default check output
-  is now compact and host-local (config, workspace, generated state,
-  runtime evidence, one next action).
-- `connect inspect` now exposes `workspace_matches` directly.
-- Relinkra-first routing order and Engram coexistence guidance, surfaced
-  in `connect list` and `connect all` output and the agent-instruction
-  contract.
-
-### Changed
-
 - Runtime evidence moved to one bounded file per host
   (`.relinkra/runtime-evidence/<host>.json`): concurrent hosts can no
   longer lose each other's evidence through a shared-file
-  read-modify-write. The pre-R6E single-file store remains readable; no
+  read-modify-write. The previous single-file store remains readable; no
   migration is required.
 - An unreadable current Git revision now reports runtime evidence as
   `unknown`, never `stale`, and proves no current-revision stages.
@@ -116,7 +101,8 @@ Not yet published; no version bump.
   the repository-local exclude into the Git common directory, keeping
   worktree status clean.
 - The self-observed handoff claim is worded truthfully as "handoff write
-  and read served" — no handoff-id correlation is persisted.
+  and read served" — a served write/read is never inflated into a
+  stronger correlated round-trip claim.
 - ZCode generated state (`.zcode/config.json`, `.zcode/config.json.lock`)
   is classified: git-ignored and Git-clean is healthy (no warning);
   generated state showing in Git warns precisely. Relinkra still never
@@ -124,13 +110,6 @@ Not yet published; no version bump.
 - A missing host executable is reported together with the fact that
   workspace configuration can still be prepared, instead of a bare
   not-installed state.
-
-## Unreleased — R6F residual trust and local-state hardening
-
-Not yet published; no version bump.
-
-### Changed
-
 - Runtime-evidence recording takes a bounded per-host interprocess lock
   around the read-modify-write critical section: two concurrent processes
   of the same host can no longer overwrite each other's evidence. A
@@ -147,6 +126,54 @@ Not yet published; no version bump.
   workspace `revision`, `freshness` drift flags, and measured
   `elapsed_seconds` (additive JSON fields; a files-indexed figure is not
   reported by the backend and is not invented).
+
+### Fixed
+
+- Final-packet token accounting: the `packet_status` cpt1 totals now
+  measure the exact delivered packet — the block is settled onto the
+  packet before measurement instead of being appended afterwards, so
+  unbudgeted packets no longer under-count the bytes they ship. The
+  same re-settlement runs after post-ladder metadata attach on budgeted
+  packets. At an exact digit boundary no self-consistent state exists;
+  the settle then ships the deterministic conservative state (at most
+  one token over, never under). These are cpt1 approximations over the
+  serialized packet, not exact provider tokenizer counts.
+- Complete and honest Engram retrieval: real-Engram searches hit a
+  backend boundary — the HTTP/loopback search caps results at 20 records
+  with no total, cursor, or page metadata — so larger result sets were
+  silently a partial page. Relinkra now detects the cap and recovers the
+  complete result set through Engram's export primitive, applying the
+  same project/type/token filtering and deterministic ordering as
+  ordinary searches, with token matching aligned to Engram FTS
+  semantics. When complete recovery is unavailable, the result reports
+  it explicitly (`retrieval_scope`, `retrieval_complete: false`, bounded
+  `retrieval_diagnostics`) instead of presenting a partial page as the
+  whole truth or a false "no match". `memory_get(id)` remains an exact
+  targeted lookup independent of the search window, and current-mode
+  text searches validate each candidate against a complete, bounded
+  logical-topic head view — an incomplete head view fails closed with an
+  incomplete-retrieval report rather than presenting a possibly
+  superseded record as current.
+- Immutable memory history across supersede: every new Relinkra write
+  uses a unique physical Engram topic key, so Engram's topic-key upsert
+  can never overwrite an earlier observation — history is physically
+  preserved and supersession is computed from envelopes at query time.
+  Legacy records already overwritten by Engram before this change cannot
+  be reconstructed; Relinkra discloses that honestly instead of
+  pretending to recover them. An exact retry of an explicit supersede is
+  idempotent, while a different explicit target or replacement still
+  writes a new memory.
+- Identity-bound runtime evidence and correlated handoff trust: runtime
+  evidence is bound to the persisted project and workspace ids on every
+  event. Foreign project/workspace evidence is retained for diagnostics
+  but ignored for current trust; legacy/unbound evidence is never
+  promoted. Handoff trust requires a correlated create/read of the same
+  handoff id under the current project, workspace, and revision —
+  runtime state stores only a bounded one-way fingerprint of the id,
+  never the handoff body or raw id — and that provenance persists across
+  identity transitions, so a handoff round trip can no longer be
+  attributed across different projects or workspaces. Doctor's agent
+  table reports the new `foreign` and `unbound` observation states.
 
 ### Documentation
 

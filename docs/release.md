@@ -6,7 +6,7 @@ evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.4 release-preparation candidate; not yet published.** Windows
+> **Status: 0.1.4 is the current release.** Windows
 > is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
@@ -47,16 +47,16 @@ source commit:
 `8afd3245347dea9cda93176384421d33fdfd69b3`
 
 The 0.1.2 artifact record is historical and is not the package-build source
-for the current candidate. Do not rebuild or republish 0.1.2. For the
-release-preparation candidate, after release authorization, maintainers build
+for the current release. Do not rebuild or republish 0.1.2. For the
+current release, after release authorization, maintainers build
 and inspect artifacts, then retain the exact release-HEAD report and its
 digests as external evidence:
 
 ```bash
 python -m build
 python tools/artifact_checks.py \
-  dist/relinkra-0.1.3-py3-none-any.whl dist/relinkra-0.1.3.tar.gz
-cd dist && sha256sum relinkra-0.1.3-py3-none-any.whl relinkra-0.1.3.tar.gz
+  dist/relinkra-0.1.4-py3-none-any.whl dist/relinkra-0.1.4.tar.gz
+cd dist && sha256sum relinkra-0.1.4-py3-none-any.whl relinkra-0.1.4.tar.gz
 ```
 
 The provenance boundary is the artifact SHA-256 plus the exact release Git
@@ -342,7 +342,7 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 python -m build
 python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
 # explicit paths — PowerShell does not expand the glob:
-# python tools/artifact_checks.py dist/relinkra-0.1.3-py3-none-any.whl dist/relinkra-0.1.3.tar.gz
+# python tools/artifact_checks.py dist/relinkra-0.1.4-py3-none-any.whl dist/relinkra-0.1.4.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -358,14 +358,14 @@ python tools/release_check.py --evidence external.json --require rc
 # retain and supply their CLI/MCP results under the external `installed` key.
 # release_check does not collect installed CLI/MCP evidence.
 # bash:
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.3-py3-none-any.whl \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.4-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.3.tar.gz \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.4.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 # PowerShell equivalents:
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.3-py3-none-any.whl"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.4-py3-none-any.whl"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.3.tar.gz"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.4.tar.gz"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
@@ -409,8 +409,7 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- The source version is still `0.1.3` until the release bump; the candidate
-  under preparation is **0.1.4**. The version is single-sourced in
+- The source version is **0.1.4**. The version is single-sourced in
   `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by
