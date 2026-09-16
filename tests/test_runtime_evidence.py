@@ -54,6 +54,8 @@ from relinkra.runtime_evidence import (
     EVENT_TOOLS_LIST_OBSERVED,
     EVENT_TOOL_INVOKED,
     HOST_UNKNOWN,
+    HANDOFF_FINGERPRINT_PROVENANCE_KEY,
+    MAX_HANDOFF_FINGERPRINTS,
     EvidenceRecorder,
     build_evidence_recorder,
     evidence_path,
@@ -523,6 +525,13 @@ class DoctorDogfoodTests(DogfoodCase):
         return sum(1 for stage in stages if stage["state"] == STAGE_PROVEN)
 
     def test_handoff_round_trip_needs_both_halves(self):
+        # Handoff trust is identity-bound; exercise the route with an
+        # eligible workspace pin rather than relying on pre-init unbound
+        # diagnostics.
+        product_cli.WorkspaceConfig(
+            project_id="rlk_" + "3" * 32,
+            workspace_id="ws_" + "3" * 32,
+        ).save(self.root)
         half = [
             (EVENT_MCP_SERVER_STARTED, None),
             (EVENT_TOOL_INVOKED, {"tool": "handoff_create"}),
@@ -1028,6 +1037,31 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
     def _recorder(self):
         return EvidenceRecorder(str(self.ws), "codex", revision="a" * 40)
 
+    def _record_handoff(
+        self,
+        project_id,
+        workspace_id,
+        revision,
+        event,
+        handoff_id,
+        host_id="codex",
+    ):
+        product_cli.WorkspaceConfig(
+            project_id=project_id, workspace_id=workspace_id
+        ).save(self.ws)
+        recorder = EvidenceRecorder(
+            str(self.ws), host_id, revision=revision * 40
+        )
+        self.assertTrue(
+            recorder.record(event, {"handoff_id": "hof_" + handoff_id * 32})
+        )
+        return recorder
+
+    def _claims(self, revision="a"):
+        return runtime_stage_claims(
+            summarize_runtime_evidence(str(self.ws), revision * 12)
+        )
+
     def test_foreign_project_and_workspace_cannot_advance_runtime_trust(self):
         recorder = self._recorder()
         recorder.record(EVENT_CONTEXT_GET_CALLED)
@@ -1097,6 +1131,241 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
         self.assertIn("handoff_round_trip", runtime_stage_claims(summary))
         raw = Path(host_evidence_path(str(self.ws), "codex")).read_text()
         self.assertNotIn("hof_", raw)
+
+    def test_exact_cross_identity_repro_cannot_relabel_create_as_current(self):
+        """R6I.1: replacing an event's binding cannot retain old fingerprints."""
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        before = json.loads(
+            Path(host_evidence_path(str(self.ws), "codex")).read_text()
+        )
+        self.assertEqual(
+            before["events"][EVENT_HANDOFF_CREATE_CALLED]["project_id"], self.p1
+        )
+
+        self._record_handoff(
+            self.p2, self.w2, "b", EVENT_HANDOFF_CREATE_CALLED, "b"
+        )
+        self._record_handoff(
+            self.p2, self.w2, "b", EVENT_HANDOFF_GET_CALLED, "a"
+        )
+        after = json.loads(
+            Path(host_evidence_path(str(self.ws), "codex")).read_text()
+        )
+        self.assertNotEqual(before, after)
+        create = after["events"][EVENT_HANDOFF_CREATE_CALLED]
+        get = after["events"][EVENT_HANDOFF_GET_CALLED]
+        self.assertEqual(create["project_id"], self.p2)
+        self.assertEqual(get["project_id"], self.p2)
+        expected_binding = {
+            "project_id": self.p2,
+            "workspace_id": self.w2,
+            "revision": "b" * 12,
+        }
+        self.assertEqual(
+            create["detail"][HANDOFF_FINGERPRINT_PROVENANCE_KEY], expected_binding
+        )
+        self.assertEqual(
+            get["detail"][HANDOFF_FINGERPRINT_PROVENANCE_KEY], expected_binding
+        )
+        self.assertNotIn("handoff_round_trip", self._claims("b"))
+
+    def test_same_recorder_refreshes_workspace_identity_after_reregistration(self):
+        """A long-lived recorder must observe a workspace re-registration."""
+        recorder = self._recorder()
+        self.assertTrue(
+            recorder.record(
+                EVENT_HANDOFF_CREATE_CALLED,
+                {"handoff_id": "hof_" + "a" * 32},
+            )
+        )
+
+        product_cli.WorkspaceConfig(
+            project_id=self.p2, workspace_id=self.w2
+        ).save(self.ws)
+        self.assertTrue(
+            recorder.record(
+                EVENT_HANDOFF_CREATE_CALLED,
+                {"handoff_id": "hof_" + "b" * 32},
+            )
+        )
+        self.assertTrue(
+            recorder.record(
+                EVENT_HANDOFF_GET_CALLED,
+                {"handoff_id": "hof_" + "a" * 32},
+            )
+        )
+
+        raw = json.loads(
+            Path(host_evidence_path(str(self.ws), "codex")).read_text()
+        )
+        self.assertEqual(
+            raw["binding"],
+            {
+                "project_id": self.p2,
+                "workspace_id": self.w2,
+                "revision": "a" * 12,
+            },
+        )
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+
+    def test_cross_project_get_without_new_create_cannot_correlate(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(self.p2, self.w2, "b", EVENT_HANDOFF_GET_CALLED, "a")
+        self.assertNotIn("handoff_round_trip", self._claims("b"))
+
+    def test_cross_workspace_handoff_evidence_is_not_current(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(self.p1, self.w2, "a", EVENT_HANDOFF_GET_CALLED, "a")
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+
+    def test_revision_transition_clears_handoff_correlation(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(
+            self.p1, self.w1, "b", EVENT_HANDOFF_CREATE_CALLED, "b"
+        )
+        self._record_handoff(
+            self.p1, self.w1, "b", EVENT_HANDOFF_GET_CALLED, "a"
+        )
+        self.assertNotIn("handoff_round_trip", self._claims("b"))
+
+    def test_same_identity_multiple_handoffs_still_correlate(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "b"
+        )
+        self._record_handoff(self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "b")
+        self.assertIn("handoff_round_trip", self._claims("a"))
+        self._record_handoff(self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "a")
+        self.assertIn("handoff_round_trip", self._claims("a"))
+
+    def test_same_identity_get_order_requires_matching_read(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "b")
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+        self._record_handoff(self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "a")
+        self.assertIn("handoff_round_trip", self._claims("a"))
+
+    def test_cross_host_same_identity_correlation_remains_product_level(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a", "codex"
+        )
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "a", "opencode"
+        )
+        self.assertIn("handoff_round_trip", self._claims("a"))
+
+    def test_cross_host_foreign_identity_cannot_bypass_provenance(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a", "codex"
+        )
+        self._record_handoff(
+            self.p2, self.w2, "a", EVENT_HANDOFF_GET_CALLED, "a", "opencode"
+        )
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+
+    def test_legacy_aggregate_fingerprints_are_conservative(self):
+        evidence_dir = self.ws / ".relinkra" / "runtime-evidence"
+        evidence_dir.mkdir(parents=True)
+        legacy = {
+            "schema_version": "relinkra.runtime-evidence/v1",
+            "host_id": "codex",
+            "events": {
+                EVENT_HANDOFF_CREATE_CALLED: {
+                    "observed_at": "2026-01-01T00:00:00Z",
+                    "revision": "a" * 12,
+                    "project_id": self.p1,
+                    "workspace_id": self.w1,
+                    "detail": {"handoff_id_fingerprint": ["a" * 16]},
+                },
+                EVENT_HANDOFF_GET_CALLED: {
+                    "observed_at": "2026-01-01T01:00:00Z",
+                    "revision": "a" * 12,
+                    "project_id": self.p1,
+                    "workspace_id": self.w1,
+                    "detail": {"handoff_id_fingerprint": ["a" * 16]},
+                },
+            },
+        }
+        (evidence_dir / "codex.json").write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+        parsed = load_store(str(self.ws))
+        self.assertEqual(
+            parsed["hosts"]["codex"]["events"][EVENT_HANDOFF_CREATE_CALLED]
+            ["detail"]["handoff_id_fingerprint"],
+            ["a" * 16],
+        )
+        self.assertNotIn(
+            HANDOFF_FINGERPRINT_PROVENANCE_KEY,
+            parsed["hosts"]["codex"]["events"][EVENT_HANDOFF_CREATE_CALLED]
+            ["detail"],
+        )
+
+    def test_unbound_handoff_correlation_never_advances_trust(self):
+        """Handoff trust requires an eligible project/workspace binding."""
+        binding = {"project_id": "", "workspace_id": "", "revision": "a" * 12}
+        summary = {
+            "current_revision": "a" * 12,
+            "hosts": {
+                "codex": {
+                    "events": {
+                        EVENT_HANDOFF_CREATE_CALLED: {
+                            "revision": "a" * 12,
+                            "detail": {
+                                "handoff_id_fingerprint": ["a" * 16],
+                                HANDOFF_FINGERPRINT_PROVENANCE_KEY: binding,
+                            },
+                        },
+                        EVENT_HANDOFF_GET_CALLED: {
+                            "revision": "a" * 12,
+                            "detail": {
+                                "handoff_id_fingerprint": ["a" * 16],
+                                HANDOFF_FINGERPRINT_PROVENANCE_KEY: binding,
+                            },
+                        },
+                    }
+                }
+            },
+        }
+        self.assertNotIn("handoff_round_trip", runtime_stage_claims(summary))
+
+    def test_returning_to_old_identity_does_not_resurrect_handoff(self):
+        self._record_handoff(
+            self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, "a"
+        )
+        self._record_handoff(
+            self.p2, self.w2, "b", EVENT_HANDOFF_CREATE_CALLED, "b"
+        )
+        self._record_handoff(self.p1, self.w1, "a", EVENT_HANDOFF_GET_CALLED, "a")
+        self.assertNotIn("handoff_round_trip", self._claims("a"))
+
+    def test_handoff_fingerprints_are_bounded_and_private(self):
+        for index in range(MAX_HANDOFF_FINGERPRINTS + 40):
+            token = format(index, "x")
+            self._record_handoff(
+                self.p1, self.w1, "a", EVENT_HANDOFF_CREATE_CALLED, token
+            )
+        raw = Path(host_evidence_path(str(self.ws), "codex")).read_text()
+        data = json.loads(raw)
+        fingerprints = data["events"][EVENT_HANDOFF_CREATE_CALLED]["detail"]
+        self.assertLessEqual(
+            len(fingerprints["handoff_id_fingerprint"]), MAX_HANDOFF_FINGERPRINTS
+        )
+        self.assertNotIn("hof_", raw)
+        self.assertLess(len(raw.encode("utf-8")), 256 * 1024)
 
 
 class UnknownRevisionTests(unittest.TestCase):

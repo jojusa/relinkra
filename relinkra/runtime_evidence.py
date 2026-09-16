@@ -143,7 +143,18 @@ EVIDENCE_LOCK_TIMEOUT_SECONDS = 5.0
 # be matched.
 HANDOFF_FINGERPRINT_LENGTH = 16
 HANDOFF_FINGERPRINT_KEY = "handoff_id_fingerprint"
+# A fingerprint list is an intentionally compact aggregate.  This marker
+# records the binding that made the aggregate safe to correlate.  Older files
+# do not contain it and therefore remain readable, but their fingerprints are
+# never promoted to a current round-trip claim.
+HANDOFF_FINGERPRINT_PROVENANCE_KEY = "handoff_fingerprint_provenance"
 MAX_HANDOFF_FINGERPRINTS = 32
+
+# The host file keeps the latest binding separately from each event.  It is
+# used to detect a transition before an event can merge with an older event's
+# fingerprints.  This is additive, so pre-R6I files still parse unchanged.
+EVIDENCE_BINDING_KEY = "binding"
+_BINDING_KEYS = ("project_id", "workspace_id", "revision")
 
 
 def handoff_id_fingerprint(handoff_id: Optional[str]) -> str:
@@ -168,6 +179,38 @@ def short_revision(revision: Optional[str]) -> str:
     if not isinstance(revision, str):
         return ""
     return revision.strip().lower()[:REVISION_LENGTH]
+
+
+def _normalize_binding(binding: Any) -> Dict[str, str]:
+    """Return the bounded identity/revision binding, or an empty binding.
+
+    A binding deliberately contains no handoff body or source content.  Empty
+    fields are retained for a serialized binding so an unpinned observation
+    cannot accidentally compare equal to a legacy object that had no binding
+    metadata at all.
+    """
+    if not isinstance(binding, Mapping):
+        return {}
+    normalized = {
+        "project_id": "",
+        "workspace_id": "",
+        "revision": short_revision(binding.get("revision")),
+    }
+    for key in ("project_id", "workspace_id"):
+        value = binding.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized[key] = value.strip()[:MAX_DETAIL_CHARS]
+    return normalized
+
+
+def _observation_binding(observation: Mapping[str, Any]) -> Dict[str, str]:
+    """Build the binding carried by one normalized event observation."""
+    return _normalize_binding(observation)
+
+
+def _binding_is_eligible(binding: Mapping[str, Any]) -> bool:
+    """Whether a binding has all identity material needed for trust claims."""
+    return all(str(binding.get(key) or "").strip() for key in _BINDING_KEYS)
 
 
 def revision_relation(evidence_revision: str, current_revision: str) -> str:
@@ -322,6 +365,9 @@ def _normalize_bucket(bucket: Any) -> dict:
             value = bucket.get(key)
             if isinstance(value, str) and value:
                 normalized[key] = value[:MAX_DETAIL_CHARS]
+        binding = _normalize_binding(bucket.get(EVIDENCE_BINDING_KEY))
+        if binding:
+            normalized[EVIDENCE_BINDING_KEY] = binding
     return normalized
 
 
@@ -357,6 +403,11 @@ def _normalize_entry(entry: Any) -> dict:
                         for item in value
                         if isinstance(item, str) and item
                     ][:MAX_HANDOFF_FINGERPRINTS]
+                continue
+            if key == HANDOFF_FINGERPRINT_PROVENANCE_KEY:
+                provenance = _normalize_binding(value)
+                if provenance:
+                    clean[key] = provenance
                 continue
             if isinstance(value, bool):
                 clean[key[:MAX_DETAIL_CHARS]] = value
@@ -494,6 +545,10 @@ def _sanitize_detail(
     for key, value in detail.items():
         if not isinstance(key, str) or not key:
             continue
+        # Provenance is assigned from the recorder's effective binding below;
+        # callers cannot smuggle in a marker for a different identity.
+        if key == HANDOFF_FINGERPRINT_PROVENANCE_KEY:
+            continue
         # Never persist the handoff id itself.  It is only accepted on the
         # two handoff route events and reduced to a non-reversible token.
         if event in (EVENT_HANDOFF_CREATE_CALLED, EVENT_HANDOFF_GET_CALLED):
@@ -524,6 +579,28 @@ def _sanitize_detail(
         elif isinstance(value, str):
             clean[key[:MAX_DETAIL_CHARS]] = value[:MAX_DETAIL_CHARS]
     return clean
+
+
+def _clear_handoff_fingerprints(events: Mapping[str, Any]) -> None:
+    """Remove accumulated handoff correlation at an identity transition.
+
+    Event counters and ordinary route evidence remain useful diagnostics.  The
+    correlation material alone is cleared, so an old handoff can never be
+    re-attributed to the new project/workspace/revision binding.
+    """
+    for event in (EVENT_HANDOFF_CREATE_CALLED, EVENT_HANDOFF_GET_CALLED):
+        entry = events.get(event)
+        if not isinstance(entry, dict):
+            continue
+        detail = entry.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        detail.pop(HANDOFF_FINGERPRINT_KEY, None)
+        detail.pop(HANDOFF_FINGERPRINT_PROVENANCE_KEY, None)
+        if detail:
+            entry["detail"] = detail
+        else:
+            entry.pop("detail", None)
 
 
 def load_store(workspace_root: Optional[str]) -> Optional[dict]:
@@ -623,8 +700,6 @@ class EvidenceRecorder:
             )
             if isinstance(value, str) and value.strip()
         }
-        self._pin: Optional[Dict[str, str]] = None
-        self._pin_loaded = False
         self._exclude_checked = False
 
     @property
@@ -634,17 +709,14 @@ class EvidenceRecorder:
     def _workspace_pin(self) -> Dict[str, str]:
         """Best-effort project/workspace ids from the workspace pin.
 
-        Read once per process. The pin is advisory context attached to
-        each entry so doctor can notice evidence written under a
-        different registration; a missing pin omits the ids rather than
-        inventing them.
+        Explicit constructor pins are fixed for this recorder. Otherwise,
+        reload the workspace pin for every observation so re-registration or
+        moving a workspace takes effect without requiring a new recorder.
+        The pin is advisory context attached to each entry; a missing pin
+        omits the ids rather than inventing them.
         """
-        if self._pin_loaded:
-            return self._pin or {}
-        self._pin_loaded = True
         if self._explicit_pin:
-            self._pin = dict(self._explicit_pin)
-            return self._pin
+            return dict(self._explicit_pin)
         if not self.workspace_root:
             return {}
         try:
@@ -655,12 +727,12 @@ class EvidenceRecorder:
             return {}
         if config is None:
             return {}
-        self._pin = {}
+        pin: Dict[str, str] = {}
         if isinstance(config.project_id, str) and config.project_id:
-            self._pin["project_id"] = config.project_id[:MAX_DETAIL_CHARS]
+            pin["project_id"] = config.project_id[:MAX_DETAIL_CHARS]
         if isinstance(config.workspace_id, str) and config.workspace_id:
-            self._pin["workspace_id"] = config.workspace_id[:MAX_DETAIL_CHARS]
-        return self._pin
+            pin["workspace_id"] = config.workspace_id[:MAX_DETAIL_CHARS]
+        return pin
 
     def record(self, event: str, detail: Optional[Mapping[str, Any]] = None) -> bool:
         """Record one observation. Returns False when nothing was stored."""
@@ -704,7 +776,27 @@ class EvidenceRecorder:
         if data is None:
             data = _empty_host_file(self.bucket_id)
 
+        pin = self._workspace_pin()
+        binding = {
+            "project_id": str(pin.get("project_id") or "").strip()[:MAX_DETAIL_CHARS],
+            "workspace_id": str(pin.get("workspace_id") or "").strip()[:MAX_DETAIL_CHARS],
+            "revision": self._revision,
+        }
         events = data["events"]
+        previous_binding = _normalize_binding(data.get(EVIDENCE_BINDING_KEY))
+        if previous_binding and previous_binding != binding:
+            # The event-level project/workspace fields are not sufficient to
+            # protect an aggregate: they are overwritten as each event is
+            # observed.  Compare the immutable host-file binding first and
+            # discard all handoff correlation on a transition.
+            _clear_handoff_fingerprints(events)
+        elif not previous_binding:
+            # A pre-R6I file may contain aggregate fingerprints but cannot
+            # establish their provenance.  Do not carry that ambiguity into a
+            # newly written file, even when the new observation happens to use
+            # the same apparent identity.
+            _clear_handoff_fingerprints(events)
+
         entry = events.get(event) if isinstance(events.get(event), dict) else {}
         entry["observed_at"] = self._clock()
         entry["revision"] = self._revision
@@ -716,6 +808,15 @@ class EvidenceRecorder:
         clean_detail = _sanitize_detail(detail, event)
         if event in (EVENT_HANDOFF_CREATE_CALLED, EVENT_HANDOFF_GET_CALLED):
             previous = (entry.get("detail") or {}).get(HANDOFF_FINGERPRINT_KEY, [])
+            previous_provenance = _normalize_binding(
+                (entry.get("detail") or {}).get(
+                    HANDOFF_FINGERPRINT_PROVENANCE_KEY
+                )
+            )
+            # A markerless/foreign aggregate is legacy or ambiguous evidence;
+            # it must never be merged into a new provenance-bound aggregate.
+            if previous_provenance != binding:
+                previous = []
             if isinstance(previous, str):
                 previous = [previous]
             current = clean_detail.get(HANDOFF_FINGERPRINT_KEY, [])
@@ -733,6 +834,7 @@ class EvidenceRecorder:
                 clean_detail[HANDOFF_FINGERPRINT_KEY] = merged[
                     -MAX_HANDOFF_FINGERPRINTS:
                 ]
+                clean_detail[HANDOFF_FINGERPRINT_PROVENANCE_KEY] = dict(binding)
         if clean_detail:
             entry["detail"] = clean_detail
         else:
@@ -742,15 +844,19 @@ class EvidenceRecorder:
         # Bind the observation itself, not merely its containing host file.
         # A file can outlive a workspace re-registration and different events
         # can have been written before/after that change.
-        for key, value in self._workspace_pin().items():
+        for key, value in pin.items():
             entry[key] = value
         for key in ("project_id", "workspace_id"):
-            if key not in self._workspace_pin():
+            if key not in pin:
                 entry.pop(key, None)
 
         data["updated_at"] = self._clock()
-        for key, value in self._workspace_pin().items():
-            data[key] = value
+        data[EVIDENCE_BINDING_KEY] = dict(binding)
+        for key in ("project_id", "workspace_id"):
+            if key in pin:
+                data[key] = pin[key]
+            else:
+                data.pop(key, None)
 
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=1)
         atomic_write_text(path, payload)
@@ -906,6 +1012,9 @@ def _normalize_host_file(data: Any, host_id: str) -> Optional[dict]:
     updated = data.get("updated_at")
     if isinstance(updated, str):
         normalized["updated_at"] = updated[:MAX_DETAIL_CHARS]
+    binding = _normalize_binding(data.get(EVIDENCE_BINDING_KEY))
+    if binding:
+        normalized[EVIDENCE_BINDING_KEY] = binding
     for key in ("project_id", "workspace_id"):
         value = data.get(key)
         if isinstance(value, str) and value:
@@ -1255,10 +1364,35 @@ def runtime_stage_claims(
     creates = entries_for(EVENT_HANDOFF_CREATE_CALLED)
     gets = entries_for(EVENT_HANDOFF_GET_CALLED)
     def fingerprints(entry: Mapping[str, Any]):
-        raw = ((entry.get("detail") or {}).get(HANDOFF_FINGERPRINT_KEY) or [])
+        detail = entry.get("detail") or {}
+        if not isinstance(detail, Mapping):
+            return []
+        provenance = _normalize_binding(
+            detail.get(HANDOFF_FINGERPRINT_PROVENANCE_KEY)
+        )
+        # Fingerprints from pre-R6I aggregate entries have no per-aggregate
+        # provenance.  They remain diagnostic data but cannot establish a
+        # current trust correlation.  A marker is valid only when it agrees
+        # with the event's own project/workspace/revision binding; entry-level
+        # identity alone is insufficient because old entries may have had
+        # their aggregate binding overwritten later.
+        if not provenance or provenance != _observation_binding(entry):
+            return []
+        # Handoff correlation is stricter than ordinary pre-init diagnostics:
+        # an unbound marker is never an eligible project/workspace identity,
+        # even when no current pins are available for the surrounding route.
+        if not _binding_is_eligible(provenance):
+            return []
+        raw = detail.get(HANDOFF_FINGERPRINT_KEY) or []
         if isinstance(raw, str):
             raw = [raw]
-        return raw if isinstance(raw, (list, tuple)) else []
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [
+            fingerprint[:HANDOFF_FINGERPRINT_LENGTH]
+            for fingerprint in raw
+            if isinstance(fingerprint, str) and fingerprint
+        ][:MAX_HANDOFF_FINGERPRINTS]
 
     created_ids = {
         fingerprint
