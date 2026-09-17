@@ -59,7 +59,9 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from .safe_write import SafeWriteError, atomic_write_text, read_bounded_text
@@ -124,9 +126,17 @@ EVENTS: tuple = (
     EVENT_CBM_ACTIVITY,
 )
 
-#: Revision shorthand length, matching the operator-proof store so the
-#: two evidence classes can be compared like for like.
+#: Legacy revision shorthand length. This is retained for reading old
+#: evidence, but it is never sufficient for a CURRENT claim.
 REVISION_LENGTH = 12
+
+#: Git currently emits SHA-1 object ids. Keep the complete value in evidence
+#: (rather than a prefix) so two revisions sharing the historical 12-char
+#: shorthand cannot be confused. A short value remains readable diagnostic
+#: data for backwards compatibility only.
+FULL_REVISION_LENGTH = 40
+MAX_REVISION_LENGTH = 64
+_FULL_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 #: Bound on waiting for another same-host process's evidence critical
 #: section (per-host lock around the read-modify-write, and the
@@ -175,10 +185,33 @@ def _utc_now() -> str:
 
 
 def short_revision(revision: Optional[str]) -> str:
-    """Normalize a revision to the bounded shorthand used in evidence."""
+    """Return the historical bounded display form of a revision.
+
+    This helper remains a 12-character compatibility view. Runtime evidence
+    storage and trust decisions use ``_normalized_revision``/``_full_revision``
+    instead, so shortening can never establish CURRENT evidence.
+    """
     if not isinstance(revision, str):
         return ""
     return revision.strip().lower()[:REVISION_LENGTH]
+
+
+def _normalized_revision(revision: Optional[str]) -> str:
+    """Normalize a stored revision while retaining a complete object id."""
+    if not isinstance(revision, str):
+        return ""
+    return revision.strip().lower()[:MAX_REVISION_LENGTH]
+
+
+def _full_revision(revision: Optional[str]) -> str:
+    """Return a validated complete Git revision, or ``""``.
+
+    A 12-character legacy row is intentionally not completed or promoted.
+    Rejecting non-SHA values also prevents caller-controlled labels from
+    becoming a currentness proof when this module is used directly.
+    """
+    normalized = _normalized_revision(revision)
+    return normalized if _FULL_REVISION_RE.fullmatch(normalized) else ""
 
 
 def _normalize_binding(binding: Any) -> Dict[str, str]:
@@ -194,7 +227,7 @@ def _normalize_binding(binding: Any) -> Dict[str, str]:
     normalized = {
         "project_id": "",
         "workspace_id": "",
-        "revision": short_revision(binding.get("revision")),
+        "revision": _normalized_revision(binding.get("revision")),
     }
     for key in ("project_id", "workspace_id"):
         value = binding.get(key)
@@ -210,7 +243,11 @@ def _observation_binding(observation: Mapping[str, Any]) -> Dict[str, str]:
 
 def _binding_is_eligible(binding: Mapping[str, Any]) -> bool:
     """Whether a binding has all identity material needed for trust claims."""
-    return all(str(binding.get(key) or "").strip() for key in _BINDING_KEYS)
+    return (
+        bool(str(binding.get("project_id") or "").strip())
+        and bool(str(binding.get("workspace_id") or "").strip())
+        and bool(_full_revision(binding.get("revision")))
+    )
 
 
 def revision_relation(evidence_revision: str, current_revision: str) -> str:
@@ -227,11 +264,15 @@ def revision_relation(evidence_revision: str, current_revision: str) -> str:
                    evidence is historical, which is exactly the fact
                    nobody was able to establish (R6E).
     """
-    evidence_revision = short_revision(evidence_revision)
-    current_revision = short_revision(current_revision)
-    if not evidence_revision:
+    evidence_raw = _normalized_revision(evidence_revision)
+    current_raw = _normalized_revision(current_revision)
+    evidence_revision = _full_revision(evidence_raw)
+    current_revision = _full_revision(current_raw)
+    if not evidence_raw or not current_raw:
         return "unknown"
-    if not current_revision:
+    if not evidence_revision or not current_revision:
+        # Complete current revision is unavailable, or this is an old
+        # abbreviated row. Both are diagnostic-only and cannot be current.
         return "unknown"
     if evidence_revision == current_revision:
         return "current"
@@ -378,7 +419,7 @@ def _normalize_entry(entry: Any) -> dict:
     observed_at = entry.get("observed_at")
     if isinstance(observed_at, str):
         normalized["observed_at"] = observed_at[:MAX_DETAIL_CHARS]
-    normalized["revision"] = short_revision(entry.get("revision"))
+    normalized["revision"] = _normalized_revision(entry.get("revision"))
     try:
         count = int(entry.get("count", 1))
     except (TypeError, ValueError):
@@ -690,7 +731,7 @@ class EvidenceRecorder:
         self.workspace_root = str(workspace_root) if workspace_root else None
         self.host_id = resolve_host_id(host_id)
         self._clock = clock or _utc_now
-        self._revision = short_revision(revision)
+        self._revision = _normalized_revision(revision)
         self._lock_timeout = lock_timeout
         self._explicit_pin = {
             key: value[:MAX_DETAIL_CHARS]
@@ -707,32 +748,13 @@ class EvidenceRecorder:
         return self.host_id or HOST_UNKNOWN
 
     def _workspace_pin(self) -> Dict[str, str]:
-        """Best-effort project/workspace ids from the workspace pin.
+        """Return validated effective identity for this workspace.
 
-        Explicit constructor pins are fixed for this recorder. Otherwise,
-        reload the workspace pin for every observation so re-registration or
-        moving a workspace takes effect without requiring a new recorder.
-        The pin is advisory context attached to each entry; a missing pin
-        omits the ids rather than inventing them.
+        Re-resolving for every observation intentionally tracks explicit
+        re-registration and transition-back events while ensuring raw config
+        or constructor pins never become trust material by themselves.
         """
-        if self._explicit_pin:
-            return dict(self._explicit_pin)
-        if not self.workspace_root:
-            return {}
-        try:
-            from .product_cli import WorkspaceConfig
-
-            config = WorkspaceConfig.load(self.workspace_root)
-        except Exception:
-            return {}
-        if config is None:
-            return {}
-        pin: Dict[str, str] = {}
-        if isinstance(config.project_id, str) and config.project_id:
-            pin["project_id"] = config.project_id[:MAX_DETAIL_CHARS]
-        if isinstance(config.workspace_id, str) and config.workspace_id:
-            pin["workspace_id"] = config.workspace_id[:MAX_DETAIL_CHARS]
-        return pin
+        return _effective_workspace_pin(self.workspace_root, self._explicit_pin)
 
     def record(self, event: str, detail: Optional[Mapping[str, Any]] = None) -> bool:
         """Record one observation. Returns False when nothing was stored."""
@@ -1055,6 +1077,74 @@ def build_evidence_recorder(
     )
 
 
+def _effective_workspace_pin(
+    workspace_root: Optional[str], explicit_pin: Mapping[str, str]
+) -> Dict[str, str]:
+    """Resolve the only identity that may bind runtime evidence.
+
+    ``WorkspaceConfig`` and launcher arguments are hints, not attestations.
+    The shared effective-identity resolver validates them against the current
+    workspace registry and canonical path. In particular, a copied config or
+    registry record cannot make an unrelated checkout inherit CURRENT
+    evidence. A malformed config is distinct from an absent config and fails
+    closed rather than falling back to a path lookup.
+    """
+    if not workspace_root:
+        return {}
+    try:
+        from .effective_identity import (
+            IDENTITY_STATE_MIGRATION_AVAILABLE,
+            IDENTITY_STATE_REGISTERED,
+            resolve_effective_identity,
+        )
+        from .product_cli import WorkspaceConfig, config_path, registry_path
+
+        root = Path(workspace_root)
+        config = WorkspaceConfig.load(root)
+        config_file = config_path(root)
+        if config is None and config_file.exists():
+            # ``load`` deliberately treats malformed config as absent for
+            # ordinary diagnostics. Runtime trust must not turn that
+            # ambiguity into an effective identity.
+            return {}
+        hint = config
+        if hint is None and explicit_pin:
+            project_id = explicit_pin.get("project_id")
+            workspace_id = explicit_pin.get("workspace_id")
+        else:
+            project_id = getattr(hint, "project_id", None)
+            workspace_id = getattr(hint, "workspace_id", None)
+        identity = resolve_effective_identity(
+            str(root),
+            registry_path=str(registry_path(root)),
+            registered_project_id=project_id or None,
+            registered_workspace_id=workspace_id or None,
+        )
+        # A present pin is an integrity input, not a replacement identity.
+        # Path lookup may legitimately recover an absent config, but it must
+        # not silently repair a malformed/copied config into CURRENT.
+        if (project_id or workspace_id) and (
+            identity.registered_project_id != project_id
+            or identity.registered_workspace_id != workspace_id
+        ):
+            return {}
+        if identity.identity_state not in (
+            IDENTITY_STATE_REGISTERED,
+            IDENTITY_STATE_MIGRATION_AVAILABLE,
+        ):
+            return {}
+        if not identity.effective_project_id or not identity.effective_workspace_id:
+            return {}
+        return {
+            "project_id": str(identity.effective_project_id)[:MAX_DETAIL_CHARS],
+            "workspace_id": str(identity.effective_workspace_id)[:MAX_DETAIL_CHARS],
+        }
+    except Exception:
+        # Evidence is best effort and identity failures are deliberately
+        # conservative: an unbound observation is diagnostic only.
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Doctor-facing summary
 # ---------------------------------------------------------------------------
@@ -1090,6 +1180,8 @@ def _host_state(
     current_revision: str,
     current_project_id: str = "",
     current_workspace_id: str = "",
+    *,
+    identity_resolution_attempted: bool = False,
 ) -> HostRuntime:
     """Classify one bucket.
 
@@ -1115,19 +1207,28 @@ def _host_state(
     seen_identity_unknown = False
     seen_current_identity = False
     identity_required = bool(current_project_id or current_workspace_id)
+    # A generated summary always attempts certified identity resolution. If
+    # that resolver fails, an unbound legacy row remains diagnostic only;
+    # absence of ids must never be treated as proof for that workspace.
+    allow_unbound_compat = not identity_required and not identity_resolution_attempted
     for entry in entries.values():
         observed_at = str(entry.get("observed_at") or "")
         if observed_at > latest_at:
             latest_at = observed_at
-            latest_revision = short_revision(entry.get("revision"))
+            latest_revision = _normalized_revision(entry.get("revision"))
         relation = revision_relation(entry.get("revision"), current_revision)
         binding = identity_relation(entry, current_project_id, current_workspace_id)
-        if binding == "unbound" and not identity_required:
+        if binding == "unbound" and allow_unbound_compat:
             # Compatibility for pre-init diagnostics: without any current
             # project/workspace pin there is no identity to compare. This
             # mode never applies once a workspace pin is available.
             binding = "current"
-        if binding == "current":
+        if binding == "unbound" and identity_resolution_attempted:
+            # A workspace-scoped summary attempted certified resolution but
+            # could not establish an effective identity. Keep legacy evidence
+            # diagnostic only; it is not an attributable current identity.
+            seen_identity_unknown = True
+        elif binding == "current":
             seen_current_identity = True
         elif binding == "foreign":
             seen_foreign = True
@@ -1179,16 +1280,21 @@ def summarize_runtime_evidence(
     The result is plain data (dicts of primitives) so it can ride inside
     the routing assessment payload unchanged.
     """
-    if workspace_root and not (current_project_id and current_workspace_id):
+    if workspace_root and not current_revision:
         try:
-            from .product_cli import WorkspaceConfig
+            from .identity import git_head_sha
 
-            config = WorkspaceConfig.load(workspace_root)
-            if config is not None:
-                current_project_id = str(config.project_id or "")
-                current_workspace_id = str(config.workspace_id or "")
+            current_revision = git_head_sha(str(workspace_root)) or ""
         except Exception:
-            pass
+            current_revision = ""
+    # The keyword ids are retained for API compatibility, but are NEVER
+    # accepted as authority. Resolve through the same certified resolver used
+    # by doctor/viewer/metrics so callers cannot relabel a copied evidence
+    # store by supplying config-shaped ids.
+    effective_pin = _effective_workspace_pin(workspace_root, {})
+    current_project_id = effective_pin.get("project_id", "")
+    current_workspace_id = effective_pin.get("workspace_id", "")
+    identity_resolution_attempted = bool(workspace_root)
     invalid = _store_invalid(workspace_root)
     loaded = load_store(workspace_root)
     if loaded is None:
@@ -1197,8 +1303,11 @@ def summarize_runtime_evidence(
         return {
             "present": False,
             "invalid": invalid,
+            "current_revision": _normalized_revision(current_revision),
             "current_project_id": current_project_id,
             "current_workspace_id": current_workspace_id,
+            "identity_state": "effective" if effective_pin else "unknown",
+            "identity_resolution_attempted": identity_resolution_attempted,
             "hosts": {},
         }
     hosts: Dict[str, dict] = {}
@@ -1209,6 +1318,7 @@ def summarize_runtime_evidence(
             current_revision,
             current_project_id,
             current_workspace_id,
+            identity_resolution_attempted=identity_resolution_attempted,
         )
         summary = runtime.to_dict()
         summary["host_id"] = host_id
@@ -1220,9 +1330,11 @@ def summarize_runtime_evidence(
     return {
         "present": bool(hosts),
         "invalid": invalid,
-        "current_revision": short_revision(current_revision),
+        "current_revision": _normalized_revision(current_revision),
         "current_project_id": current_project_id,
         "current_workspace_id": current_workspace_id,
+        "identity_state": "effective" if effective_pin else "unknown",
+        "identity_resolution_attempted": identity_resolution_attempted,
         "hosts": hosts,
     }
 
@@ -1267,13 +1379,15 @@ def runtime_stage_claims(
     summary = summary or {}
     if not current_revision:
         current_revision = str(summary.get("current_revision") or "")
-    current_project_id = str(
-        current_project_id or summary.get("current_project_id") or ""
-    )
-    current_workspace_id = str(
-        current_workspace_id or summary.get("current_workspace_id") or ""
-    )
+    # Summary identity was resolved by ``summarize_runtime_evidence``. Never
+    # let a caller-supplied raw id override (or fill) that certified result.
+    current_project_id = str(summary.get("current_project_id") or "")
+    current_workspace_id = str(summary.get("current_workspace_id") or "")
     identity_required = bool(current_project_id or current_workspace_id)
+    identity_resolution_attempted = bool(
+        summary.get("identity_resolution_attempted")
+    )
+    allow_unbound_compat = not identity_required and not identity_resolution_attempted
     hosts = summary.get("hosts") or {}
     claims: Dict[str, Any] = {}
 
@@ -1286,7 +1400,7 @@ def runtime_stage_claims(
             binding = identity_relation(
                 entry, current_project_id, current_workspace_id
             )
-            if binding == "unbound" and not identity_required:
+            if binding == "unbound" and allow_unbound_compat:
                 binding = "current"
             relation = revision_relation(entry.get("revision"), current_revision)
             if current_only and (binding != "current" or relation != "current"):
@@ -1298,15 +1412,21 @@ def runtime_stage_claims(
         return host_id if host_id != HOST_UNKNOWN else "host identity unknown"
 
     started = []
+    started_historical = []
     for host_id, bucket in sorted(hosts.items()):
         entry = ((bucket or {}).get("events") or {}).get(EVENT_MCP_SERVER_STARTED) or {}
         if isinstance(entry, dict) and entry:
             binding = identity_relation(entry, current_project_id, current_workspace_id)
-            if binding == "unbound" and not identity_required:
+            if binding == "unbound" and allow_unbound_compat:
                 binding = "current"
             relation = revision_relation(entry.get("revision"), current_revision)
-            if binding == "current":
+            if binding == "current" and relation == "current":
                 started.append((host_id, entry, relation))
+            elif binding != "foreign" and relation in ("older", "unknown"):
+                # Keep historical launch observation separate from the
+                # current-revision trust claim. Legacy/unknown revisions may
+                # explain host history, but can never become CURRENT.
+                started_historical.append((host_id, entry, relation))
     if started:
         host_id, entry, relation = sorted(
             started, key=lambda item: (str(item[1].get("observed_at") or ""), item[0])
@@ -1315,6 +1435,17 @@ def runtime_stage_claims(
         claims["server_started"] = (
             True,
             f"self-observed Relinkra server start ({label(host_id)}, {relation_note}, "
+            f"{entry.get('observed_at') or 'time unknown'})",
+        )
+    elif started_historical:
+        host_id, entry, relation = sorted(
+            started_historical,
+            key=lambda item: (str(item[1].get("observed_at") or ""), item[0]),
+        )[-1]
+        claims["server_started_historical"] = (
+            True,
+            f"self-observed historical Relinkra server start ({label(host_id)}, "
+            f"revision {entry.get('revision') or 'unknown'}, "
             f"{entry.get('observed_at') or 'time unknown'})",
         )
 

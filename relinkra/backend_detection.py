@@ -899,6 +899,12 @@ def build_trust_ladder(
         ),
         "handoff_round_trip",
     )
+    # A stale/unknown runtime start is an explicit historical diagnostic,
+    # not a CURRENT claim, but it may still prove that a host launched this
+    # server at some point.
+    launch_claim = "server_started"
+    if "server_started" not in runtime_claims:
+        launch_claim = "server_started_historical"
     launch_value, launch_evidence = _with_runtime(
         *_host_stage(
             HOST_LAUNCHED,
@@ -907,7 +913,7 @@ def build_trust_ladder(
             if real_host_launch_proven
             else "no real host has been observed launching this server",
         ),
-        "server_started",
+        launch_claim,
     )
     protocol_value, protocol_evidence = _with_runtime(
         *_host_stage(

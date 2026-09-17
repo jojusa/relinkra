@@ -40,7 +40,11 @@ from relinkra.host_discovery import (
     SYSTEM_WINDOWS,
     DiscoveryEnvironment,
 )
-from relinkra.identity import explicit_identity
+from relinkra.identity import (
+    discover_repository_identity,
+    explicit_identity,
+    git_head_sha,
+)
 from relinkra.mcp_server import MCPServer
 from relinkra.product_cli import FAIL, PASS, PENDING, WARN, main
 from relinkra.registry import Registry, interprocess_lock
@@ -169,7 +173,7 @@ class EvidenceStoreTests(unittest.TestCase):
         self.assertEqual(data["host_id"], "codex")
         self.assertIn(EVENT_MCP_SERVER_STARTED, codex)
         self.assertEqual(codex[EVENT_MCP_SERVER_STARTED]["count"], 1)
-        self.assertEqual(codex[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 12)
+        self.assertEqual(codex[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 40)
         self.assertTrue(codex[EVENT_INITIALIZE_OBSERVED]["detail"]["protocol_agreed"])
 
         # Latest-evidence, not a log: a second observation updates the
@@ -387,6 +391,17 @@ class DogfoodCase(unittest.TestCase):
         self.home.mkdir()
         self.repo = _real_git_repo(base)
         self.root = self.repo.resolve()
+        # Runtime evidence now requires the same certified effective identity
+        # as doctor/viewer/metrics. Register this dogfood repository so its
+        # self-observed evidence is eligible for current trust.
+        self.registry_file = product_cli.registry_path(self.root)
+        self.workspace = Registry(str(self.registry_file)).register_workspace(
+            str(self.root), discover_repository_identity(str(self.root))
+        )
+        product_cli.WorkspaceConfig(
+            project_id=self.workspace.project_id,
+            workspace_id=self.workspace.workspace_id,
+        ).save(self.root)
 
         outer = self
 
@@ -528,10 +543,6 @@ class DoctorDogfoodTests(DogfoodCase):
         # Handoff trust is identity-bound; exercise the route with an
         # eligible workspace pin rather than relying on pre-init unbound
         # diagnostics.
-        product_cli.WorkspaceConfig(
-            project_id="rlk_" + "3" * 32,
-            workspace_id="ws_" + "3" * 32,
-        ).save(self.root)
         half = [
             (EVENT_MCP_SERVER_STARTED, None),
             (EVENT_TOOL_INVOKED, {"tool": "handoff_create"}),
@@ -894,7 +905,7 @@ class MultiHostEvidenceFileTests(unittest.TestCase):
                 bucket[EVENT_MCP_SERVER_STARTED]["count"], 15
             )
             self.assertEqual(
-                bucket[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 12
+                bucket[EVENT_MCP_SERVER_STARTED]["revision"], "a" * 40
             )
 
     def test_legacy_single_file_evidence_remains_readable(self):
@@ -932,7 +943,7 @@ class MultiHostEvidenceFileTests(unittest.TestCase):
         )
         recorder = EvidenceRecorder(str(ws), "zcode", revision="a" * 40)
         self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
-        summary = summarize_runtime_evidence(str(ws), "a" * 12)
+        summary = summarize_runtime_evidence(str(ws), "a" * 40)
         self.assertTrue(summary["present"])
         self.assertFalse(summary["invalid"])
         self.assertEqual(
@@ -978,7 +989,7 @@ class MultiHostEvidenceFileTests(unittest.TestCase):
         recorder.record(EVENT_MCP_SERVER_STARTED)
         summary = summarize_runtime_evidence(str(ws), "a" * 12)
         entry = summary["hosts"]["codex"]["events"][EVENT_MCP_SERVER_STARTED]
-        self.assertEqual(entry["revision"], "a" * 12)
+        self.assertEqual(entry["revision"], "a" * 40)
         self.assertEqual(entry["count"], 1)
 
     def test_one_hosts_corrupt_file_does_not_block_the_other(self):
@@ -1023,13 +1034,18 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory(prefix="relinkra-r6i-runtime-")
         self.addCleanup(self._temp.cleanup)
-        self.ws = Path(self._temp.name) / "ws"
-        self.ws.mkdir()
-        (self.ws / ".git").mkdir()
-        self.p1 = "rlk_" + "1" * 32
-        self.w1 = "ws_" + "1" * 32
-        self.p2 = "rlk_" + "2" * 32
-        self.w2 = "ws_" + "2" * 32
+        self.ws = _real_git_repo(Path(self._temp.name))
+        registry = Registry(str(product_cli.registry_path(self.ws)))
+        workspace1 = registry.register_workspace(
+            str(self.ws), explicit_identity("r6i-project-one")
+        )
+        workspace2 = registry.register_workspace(
+            str(self.ws), explicit_identity("r6i-project-two")
+        )
+        self.p1 = workspace1.project_id
+        self.w1 = workspace1.workspace_id
+        self.p2 = workspace2.project_id
+        self.w2 = workspace2.workspace_id
         product_cli.WorkspaceConfig(
             project_id=self.p1, workspace_id=self.w1
         ).save(self.ws)
@@ -1059,7 +1075,7 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
 
     def _claims(self, revision="a"):
         return runtime_stage_claims(
-            summarize_runtime_evidence(str(self.ws), revision * 12)
+            summarize_runtime_evidence(str(self.ws), revision * 40)
         )
 
     def test_foreign_project_and_workspace_cannot_advance_runtime_trust(self):
@@ -1068,7 +1084,7 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
         product_cli.WorkspaceConfig(
             project_id=self.p2, workspace_id=self.w2
         ).save(self.ws)
-        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 40)
         self.assertEqual(summary["hosts"]["codex"]["state"], "foreign")
         self.assertNotIn("context_get", runtime_stage_claims(summary))
 
@@ -1077,20 +1093,20 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
         # Simulate a legacy writer that had no workspace pin.
         recorder._workspace_pin = lambda: {}  # type: ignore[method-assign]
         recorder.record(EVENT_CONTEXT_GET_CALLED)
-        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
-        self.assertEqual(summary["hosts"]["codex"]["state"], "unbound")
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 40)
+        self.assertEqual(summary["hosts"]["codex"]["state"], "unknown")
         self.assertNotIn("context_get", runtime_stage_claims(summary))
 
     def test_current_event_from_any_host_wins_over_stale_first_host(self):
         summary = {
-            "current_revision": "a" * 12,
+            "current_revision": "a" * 40,
             "current_project_id": self.p1,
             "current_workspace_id": self.w1,
             "hosts": {
                 "codex": {
                     "events": {
                         EVENT_CONTEXT_GET_CALLED: {
-                            "revision": "b" * 12,
+                            "revision": "b" * 40,
                             "project_id": self.p1,
                             "workspace_id": self.w1,
                             "observed_at": "2026-01-01T00:00:00Z",
@@ -1100,7 +1116,7 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
                 "zcode": {
                     "events": {
                         EVENT_CONTEXT_GET_CALLED: {
-                            "revision": "a" * 12,
+                            "revision": "a" * 40,
                             "project_id": self.p1,
                             "workspace_id": self.w1,
                             "observed_at": "2026-01-01T01:00:00Z",
@@ -1121,13 +1137,13 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
             EVENT_HANDOFF_GET_CALLED,
             {"handoff_id": "hof_" + "b" * 32},
         )
-        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 40)
         self.assertNotIn("handoff_round_trip", runtime_stage_claims(summary))
         recorder.record(
             EVENT_HANDOFF_GET_CALLED,
             {"handoff_id": "hof_" + "a" * 32},
         )
-        summary = summarize_runtime_evidence(str(self.ws), "a" * 12)
+        summary = summarize_runtime_evidence(str(self.ws), "a" * 40)
         self.assertIn("handoff_round_trip", runtime_stage_claims(summary))
         raw = Path(host_evidence_path(str(self.ws), "codex")).read_text()
         self.assertNotIn("hof_", raw)
@@ -1161,7 +1177,7 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
         expected_binding = {
             "project_id": self.p2,
             "workspace_id": self.w2,
-            "revision": "b" * 12,
+            "revision": "b" * 40,
         }
         self.assertEqual(
             create["detail"][HANDOFF_FINGERPRINT_PROVENANCE_KEY], expected_binding
@@ -1205,7 +1221,7 @@ class R6IIdentityAndHandoffTests(unittest.TestCase):
             {
                 "project_id": self.p2,
                 "workspace_id": self.w2,
-                "revision": "a" * 12,
+                "revision": "a" * 40,
             },
         )
         self.assertNotIn("handoff_round_trip", self._claims("a"))
@@ -1398,7 +1414,7 @@ class UnknownRevisionTests(unittest.TestCase):
         summary = summarize_runtime_evidence(str(self.ws), "")
         claims = runtime_stage_claims(summary, "")
         # A launch is a fact about the host's history and survives.
-        self.assertIn("server_started", claims)
+        self.assertIn("server_started_historical", claims)
         for stage in ("handshake", "protocol_agreed", "tools_visible"):
             self.assertNotIn(stage, claims)
 
