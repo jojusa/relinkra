@@ -6,10 +6,12 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 
 from relinkra.cbm import workspace_cbm_record
 from relinkra import identity as identity_module
+from relinkra import registry as registry_module
 from relinkra.identity import (
     AmbiguousIdentityError,
     RepositoryIdentity,
@@ -784,6 +786,103 @@ class StaleRegistryInstanceTests(unittest.TestCase):
             reloaded = Registry(registry_path)
             self.assertEqual(len(reloaded.projects), 1)
             self.assertEqual(len(reloaded.workspaces), 1)
+
+
+class RegistryConcurrentAccessTests(unittest.TestCase):
+    """Base locking semantics stay in force under concurrent access.
+
+    The rejected alternative removed the interprocess lock from
+    ``Registry.load()``; that produced real Windows write failures
+    (``os.replace`` losing the race against a reader holding the registry
+    open). These guards keep the behavior honest:
+
+    - ``load()`` still takes the interprocess lock;
+    - concurrent readers never make a concurrent writer fail, and no
+      registration is silently clobbered.
+    """
+
+    def test_load_still_takes_the_interprocess_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            identity = normalize_remote_url("https://github.com/org/repo.git")
+            Registry(registry_path).register_workspace(
+                os.path.join(tmp, "ws"), identity
+            )
+            acquired = []
+            original = registry_module._interprocess_lock
+
+            def recording(path, *, timeout=None):
+                acquired.append(path)
+                return original(path, timeout=timeout)
+
+            with mock.patch.object(
+                registry_module, "_interprocess_lock", recording
+            ):
+                reloaded = Registry(registry_path)
+            self.assertEqual(acquired, [registry_path])
+            self.assertEqual(len(reloaded.workspaces), 1)
+
+    def test_concurrent_readers_never_break_concurrent_writers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            seed_path = os.path.join(tmp, "seed")
+            Registry(registry_path).register_workspace(
+                seed_path, normalize_remote_url("https://github.com/org/seed.git")
+            )
+
+            writer_rounds = 3
+            writer_count = 4
+            reader_count = 4
+            reader_rounds = 25
+            writer_errors = []
+            reader_errors = []
+            barrier = threading.Barrier(writer_count + reader_count)
+
+            def writer(index):
+                try:
+                    barrier.wait(timeout=30)
+                    for round_index in range(writer_rounds):
+                        identity = normalize_remote_url(
+                            f"https://github.com/org/repo-{index}-{round_index}.git"
+                        )
+                        Registry(registry_path).register_workspace(
+                            os.path.join(tmp, f"ws-{index}-{round_index}"), identity
+                        )
+                except Exception as exc:  # noqa: BLE001 - reported below
+                    writer_errors.append(exc)
+
+            def reader():
+                try:
+                    barrier.wait(timeout=30)
+                    for _ in range(reader_rounds):
+                        loaded = Registry(registry_path)
+                        loaded.find_workspaces_by_canonical_path(seed_path)
+                except Exception as exc:  # noqa: BLE001 - reported below
+                    reader_errors.append(exc)
+
+            threads = [
+                threading.Thread(target=writer, args=(index,))
+                for index in range(writer_count)
+            ] + [threading.Thread(target=reader) for _ in range(reader_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=180)
+            self.assertFalse(
+                any(thread.is_alive() for thread in threads),
+                "concurrent registry access deadlocked",
+            )
+            self.assertEqual(
+                [], reader_errors, f"reader failures: {reader_errors}"
+            )
+            self.assertEqual(
+                [], writer_errors, f"writer failures: {writer_errors}"
+            )
+            reloaded = Registry(registry_path)
+            self.assertEqual(
+                len(reloaded.workspaces), writer_count * writer_rounds + 1
+            )
+            self.assertEqual(len(reloaded.projects), writer_count * writer_rounds + 1)
 
 
 if __name__ == "__main__":

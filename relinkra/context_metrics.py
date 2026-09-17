@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, List, Mapping, Optional, Tuple
 
 from .registry import interprocess_lock
-from .runtime_evidence import HOST_UNKNOWN, resolve_host_id, short_revision
+from .runtime_evidence import HOST_UNKNOWN, resolve_host_id
 from .safe_write import atomic_write_text, read_bounded_text
 
 SCHEMA_VERSION = 1
@@ -105,7 +105,10 @@ def _safe_id(value: Any) -> Optional[str]:
 def _safe_revision(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
-    normalized = short_revision(value)
+    # Revisions are kept COMPLETE (never truncated to a prefix): the
+    # currentness comparison below must be exact, and a stored abbreviation
+    # from an older version cannot be completed after the fact.
+    normalized = value.strip().lower()
     return normalized if _REVISION_RE.fullmatch(normalized) else None
 
 
@@ -473,6 +476,15 @@ def classify_currentness(
     observation: Mapping[str, Any], *, project_id: Optional[str] = None,
     workspace_id: Optional[str] = None, revision: Optional[str] = None
 ) -> str:
+    """Classify one observation against the effective identity. Read-only.
+
+    CURRENT requires EXACT full revision equality
+    (``observation.revision == current_git_HEAD``): sharing a leading
+    12-hex-character prefix is never enough. Historical rows persisted by
+    older versions with abbreviated revisions therefore classify
+    conservatively as ``stale`` — they are never rewritten or relabeled,
+    and no migration of old rows is attempted.
+    """
     identity = _mapping(observation.get("identity"))
     if not identity.get("project_id") or not identity.get("workspace_id"):
         return "unknown"

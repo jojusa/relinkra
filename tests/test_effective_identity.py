@@ -657,5 +657,227 @@ class ContextCliValidationTests(IdentityCase):
         self.assertIn("not registered", err)
 
 
+class RegistrationIntegrityTests(IdentityCase):
+    """A persisted registration is re-derived, never trusted from its shape.
+
+    Copied, malformed, and half-pinned records fail closed: they can never
+    become the effective identity, and a workspace_id pin alone is never
+    continuity proof.
+    """
+
+    def tamper_workspace(self, repo: str, mutate) -> None:
+        """Mutate the registry record for ``repo`` and persist the tamper."""
+        registry = Registry(str(self.registry_path(repo)))
+        (workspace_id, workspace), = registry.workspaces.items()
+        mutate(workspace)
+        if workspace.workspace_id != workspace_id:
+            del registry.workspaces[workspace_id]
+            registry.workspaces[workspace.workspace_id] = workspace
+        registry.save()
+
+    def assert_failed_closed(self, resolved) -> None:
+        self.assertIsNone(resolved.registered_project_id)
+        self.assertIsNone(resolved.registered_workspace_id)
+        self.assertIsNone(resolved.effective_project_id)
+        self.assertIsNone(resolved.effective_workspace_id)
+        self.assertEqual(
+            resolved.identity_state, effective_identity.IDENTITY_STATE_UNKNOWN
+        )
+        self.assertFalse(resolved.migration_available)
+
+    def test_workspace_id_must_re_derive_from_project_path_and_os(self):
+        repo, _workspace = self.legacy_repo("rederive")
+        self.tamper_workspace(
+            repo, lambda ws: setattr(ws, "workspace_id", "ws_" + "d" * 32)
+        )
+        self.assert_failed_closed(self.resolve(repo))
+
+    def test_workspace_id_re_derivation_fails_closed_without_a_pin(self):
+        repo, _workspace = self.legacy_repo("rederive-nopin")
+        self.tamper_workspace(
+            repo, lambda ws: setattr(ws, "workspace_id", "ws_" + "e" * 32)
+        )
+        (self.registry_path(repo).parent / "config.json").unlink()
+        self.assert_failed_closed(self.resolve(repo))
+
+    def test_absolute_path_inconsistent_with_canonical_path_fails_closed(self):
+        repo, _workspace = self.legacy_repo("bad-absolute")
+        self.tamper_workspace(
+            repo,
+            lambda ws: setattr(
+                ws, "absolute_path", os.path.join(self.tmp, "somewhere-else")
+            ),
+        )
+        self.assert_failed_closed(self.resolve(repo))
+
+    def test_canonical_path_of_another_directory_fails_closed(self):
+        repo, _workspace = self.legacy_repo("bad-canonical")
+        elsewhere = os.path.join(self.tmp, "other-directory")
+        os.makedirs(elsewhere, exist_ok=True)
+        self.tamper_workspace(
+            repo,
+            lambda ws: setattr(ws, "canonical_path", canonicalize_path(elsewhere)),
+        )
+        resolved = self.resolve(repo)
+        self.assertIsNone(resolved.registered_project_id)
+        self.assertIsNone(resolved.registered_workspace_id)
+        self.assertIsNone(resolved.effective_workspace_id)
+        self.assertEqual(
+            resolved.identity_state, effective_identity.IDENTITY_STATE_UNREGISTERED
+        )
+
+    def test_os_family_mismatch_fails_closed(self):
+        repo, _workspace = self.legacy_repo("os-mismatch")
+        current = normalize_os_family(sys.platform)
+        foreign = "linux" if current != "linux" else "windows"
+        self.tamper_workspace(repo, lambda ws: setattr(ws, "os", foreign))
+        self.assert_failed_closed(self.resolve(repo))
+
+    def test_half_pinned_config_fails_closed(self):
+        repo, workspace = self.legacy_repo("half-pin")
+        self.write_config(repo, workspace.project_id, "")
+        self.assert_failed_closed(self.resolve(repo))
+
+    def test_copied_state_is_never_effective(self):
+        repo1, workspace1 = self.legacy_repo("integrity-copy-source")
+        repo2 = self.make_repo("integrity-copy-target", remote=REMOTE_OTHER)
+        shutil.copytree(
+            str(self.registry_path(repo1).parent),
+            str(self.registry_path(repo2).parent),
+        )
+        resolved = self.resolve(repo2)
+        self.assertIsNone(resolved.registered_project_id)
+        self.assertNotEqual(resolved.effective_project_id, workspace1.project_id)
+        self.assertNotEqual(resolved.effective_workspace_id, workspace1.workspace_id)
+        self.assertEqual(resolved.effective_project_id, live_project_id(repo2))
+
+    def test_valid_registration_still_resolves_after_integrity_checks(self):
+        repo = self.make_repo("integrity-modern", remote=REMOTE)
+        workspace = self.register(repo)
+        resolved = self.resolve(repo)
+        self.assertEqual(resolved.registered_project_id, workspace.project_id)
+        self.assertEqual(resolved.registered_workspace_id, workspace.workspace_id)
+        self.assertEqual(resolved.effective_project_id, workspace.project_id)
+        self.assertEqual(resolved.effective_workspace_id, workspace.workspace_id)
+        self.assertEqual(
+            resolved.identity_state, effective_identity.IDENTITY_STATE_REGISTERED
+        )
+
+
+class PrivacyCanaryTests(IdentityCase):
+    """A credential-bearing input never leaks into user-facing payloads.
+
+    Canary: a real credentialed remote URL on the workspace, plus its raw
+    components. Viewer status/metrics payloads and doctor JSON must not
+    carry credentials, the raw remote URL, local-root canonical identity,
+    absolute paths, or registry internals. Project IDs remain allowed.
+    """
+
+    CANARY_USER = "secret-canary"
+    CANARY_TOKEN = "ghp_canary_token_do_not_leak"
+    CREDENTIAL_REMOTE = (
+        f"https://{CANARY_USER}:{CANARY_TOKEN}@github.com/org/private-repo.git"
+    )
+    #: Registry internals that must never cross a user-facing boundary.
+    INTERNAL_KEYS = (
+        "canonical_path",
+        "absolute_path",
+        "repository_identity",
+        "last_seen_at",
+        "registered_at",
+    )
+    IDENTITY_VALUES = ("remote://", "local-root://", "explicit://")
+
+    def assert_no_credential(self, text: str) -> None:
+        for canary in (self.CANARY_USER, self.CANARY_TOKEN, self.CREDENTIAL_REMOTE):
+            self.assertNotIn(canary, text)
+
+    def assert_no_private_leak(self, text: str, repo: str) -> None:
+        self.assert_no_credential(text)
+        self.assertNotIn(str(Path(repo)), text)
+        self.assertNotIn(str(Path(repo).resolve()), text)
+        self.assertNotIn(os.path.expanduser("~"), text)
+        for value in self.IDENTITY_VALUES:
+            self.assertNotIn(value, text)
+        for key in self.INTERNAL_KEYS:
+            self.assertNotIn(key, text)
+
+    def doctor_payload(self, repo: str) -> dict:
+        with self.fake_services(engram=False, cbm=False, project=True):
+            code, out, err = self.run_cli("doctor", "--path", repo, "--json")
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
+    def test_credentialed_remote_never_reaches_viewer_or_doctor(self):
+        repo = self.make_repo("canary-remote", remote=self.CREDENTIAL_REMOTE)
+        workspace = self.register(repo)
+        head = git_head_sha(repo)
+        context_metrics.append_observation(
+            repo,
+            self.observation(workspace.project_id, workspace.workspace_id, head),
+        )
+
+        # Storage hygiene: the credential never lands in Relinkra state.
+        # (The registry legitimately stores canonical paths; credentials
+        # never, under any field.)
+        registry_text = self.registry_path(repo).read_text(encoding="utf-8")
+        config_text = (
+            self.registry_path(repo).parent / "config.json"
+        ).read_text(encoding="utf-8")
+        for text in (registry_text, config_text):
+            self.assert_no_credential(text)
+
+        resolved = self.resolve(repo)
+        self.assertEqual(resolved.identity_state, "registered")
+        self.assert_no_private_leak(
+            json.dumps(resolved.to_dict(), sort_keys=True), repo
+        )
+
+        status_text = json.dumps(self.viewer_status(repo), sort_keys=True)
+        self.assert_no_private_leak(status_text, repo)
+        self.assertIn(workspace.project_id, status_text)
+
+        self.assert_no_private_leak(
+            json.dumps(self.doctor_payload(repo), sort_keys=True), repo
+        )
+        self.assert_no_private_leak(
+            json.dumps(
+                product_cli._viewer_metrics_current_payload(repo), sort_keys=True
+            ),
+            repo,
+        )
+        self.assert_no_private_leak(
+            json.dumps(
+                product_cli._viewer_metrics_history_payload(repo), sort_keys=True
+            ),
+            repo,
+        )
+
+    def test_credential_input_is_sanitized_at_the_source(self):
+        repo = self.make_repo("canary-input")
+        discovered = discover_repository_identity(repo, self.CREDENTIAL_REMOTE)
+        self.assertEqual(discovered.kind, "remote")
+        self.assertTrue(discovered.credentials_removed)
+        self.assertNotIn(self.CANARY_USER, discovered.value)
+        self.assertNotIn(self.CANARY_TOKEN, discovered.value)
+
+    def test_local_root_identity_is_not_disclosed(self):
+        repo = self.make_repo("canary-weak")
+        workspace = self.register(repo)
+        identity = discover_repository_identity(repo)
+        self.assertTrue(identity.value.startswith("local-root://"))
+        context_metrics.append_observation(
+            repo, self.observation(workspace.project_id, workspace.workspace_id, git_head_sha(repo))
+        )
+        for text in (
+            json.dumps(self.viewer_status(repo), sort_keys=True),
+            json.dumps(self.doctor_payload(repo), sort_keys=True),
+            json.dumps(
+                product_cli._viewer_metrics_current_payload(repo), sort_keys=True
+            ),
+        ):
+            self.assert_no_private_leak(text, repo)
+
+
 if __name__ == "__main__":
     unittest.main()

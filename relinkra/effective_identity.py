@@ -24,6 +24,13 @@ exists AND its canonical path is the workspace's own canonical path. A
 pinned config pointing at a record that belongs to another path (a copied
 ``.relinkra``, a repurposed checkout) is a caller assertion, not an
 attestation: it can never become effective.
+
+Registration validity is re-derived, not trusted from the stored shape:
+the record's project must exist, both stored paths must canonicalize to
+the workspace's own canonical path, the stored OS family must be this
+host's, and the stored ``workspace_id`` must equal the id re-derived from
+``(project_id, canonical path, OS family)`` with the existing canonical
+derivation. A copied, hand-edited, or half-pinned record fails closed.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from typing import Optional
 from .identity import (
     GitError,
     RepositoryIdentity,
+    Workspace,
     canonicalize_path,
     derive_project_id,
     derive_workspace_id,
@@ -55,8 +63,9 @@ IDENTITY_STATE_MIGRATION_AVAILABLE = "migration_available"
 #: best available identity but nothing is registered for it.
 IDENTITY_STATE_UNREGISTERED = "unregistered"
 
-#: Neither a valid registration nor a live derivation resolved (or the
-#: registration lookup is ambiguous). Fail closed.
+#: Neither a valid registration nor a live derivation resolved (the
+#: registration lookup is ambiguous or the record fails integrity
+#: re-derivation). Fail closed.
 IDENTITY_STATE_UNKNOWN = "unknown"
 
 #: The explicit transition. Path-free on purpose: advice is portable, and
@@ -66,6 +75,7 @@ MIGRATION_ACTION = "relinkra init"
 _REGISTRATION_NONE = "none"
 _REGISTRATION_REGISTERED = "registered"
 _REGISTRATION_AMBIGUOUS = "ambiguous"
+_REGISTRATION_INVALID = "invalid"
 
 
 @dataclass(frozen=True)
@@ -110,34 +120,78 @@ def _load_registry(
         return None
 
 
+def _registration_is_intact(
+    registry: Registry, workspace: Workspace, canonical: str, os_family: str
+) -> bool:
+    """Re-derive a record's identity from authoritative current facts.
+
+    A persisted record is trustworthy only when every part of its identity
+    is reproducible right here, right now: the project must exist, both
+    stored paths must canonicalize to this workspace's own canonical path,
+    the stored OS family (part of workspace identity) must be this host's,
+    and the stored ``workspace_id`` must equal the id re-derived from
+    ``(project_id, canonical path, OS family)`` with the existing
+    derivation. Copied, malformed, or half-pinned records fail closed.
+
+    Returns a boolean only: no path or record value is ever returned, so
+    nothing here can surface an absolute path.
+
+    The caller's ``workspace_id`` pin is never continuity proof on its own;
+    it is only ever compared against a record this function has accepted.
+    """
+    if registry.projects.get(workspace.project_id) is None:
+        return False
+    try:
+        if canonicalize_path(workspace.canonical_path) != canonical:
+            return False
+        if canonicalize_path(workspace.absolute_path) != canonical:
+            return False
+    except (OSError, ValueError):
+        return False
+    if normalize_os_family(workspace.os) != os_family:
+        return False
+    try:
+        expected_workspace_id = derive_workspace_id(
+            workspace.project_id, canonical, os_family
+        )
+    except (TypeError, ValueError):
+        return False
+    return workspace.workspace_id == expected_workspace_id
+
+
 def _registration_for_workspace(
     registry: Optional[Registry],
     canonical: str,
+    os_family: str,
     pinned_project_id: Optional[str],
     pinned_workspace_id: Optional[str],
 ) -> tuple[Optional[str], Optional[str], str]:
     """Resolve ``(project_id, workspace_id, status)`` for one canonical path.
 
     A pinned config pair is honored only when the registry actually holds
-    that workspace for this exact canonical path. Otherwise the registry's
-    own path lookup decides; more than one match is ambiguous and fails
-    closed rather than guessing.
+    that workspace for this exact canonical path AND the record passes
+    integrity re-derivation. Otherwise the registry's own path lookup
+    decides; more than one match is ambiguous and fails closed rather than
+    guessing. A half-pinned pair (exactly one id) is an inconsistent
+    caller state and fails closed without ever falling back to path trust.
     """
     if registry is None:
         return None, None, _REGISTRATION_NONE
-    if pinned_project_id and pinned_workspace_id:
-        project = registry.projects.get(pinned_project_id)
+    if pinned_project_id or pinned_workspace_id:
+        if not (pinned_project_id and pinned_workspace_id):
+            return None, None, _REGISTRATION_INVALID
         workspace = registry.workspaces.get(pinned_workspace_id)
         if (
-            project is not None
-            and workspace is not None
+            workspace is not None
             and workspace.project_id == pinned_project_id
-            and canonicalize_path(workspace.canonical_path) == canonical
+            and _registration_is_intact(registry, workspace, canonical, os_family)
         ):
             return pinned_project_id, pinned_workspace_id, _REGISTRATION_REGISTERED
     matches = registry.find_workspaces_by_canonical_path(canonical)
     if len(matches) == 1:
         workspace = matches[0]
+        if not _registration_is_intact(registry, workspace, canonical, os_family):
+            return None, None, _REGISTRATION_INVALID
         return workspace.project_id, workspace.workspace_id, _REGISTRATION_REGISTERED
     if len(matches) > 1:
         return None, None, _REGISTRATION_AMBIGUOUS
@@ -166,14 +220,19 @@ def resolve_effective_identity(
     they are validated against the registry, never trusted on their own.
     """
     canonical = canonicalize_path(workspace_root)
+    os_family = normalize_os_family(sys.platform)
     loaded = _load_registry(registry, registry_path)
     reg_pid, reg_wid, reg_status = _registration_for_workspace(
-        loaded, canonical, registered_project_id, registered_workspace_id
+        loaded,
+        canonical,
+        os_family,
+        registered_project_id,
+        registered_workspace_id,
     )
     live = _live_identity(workspace_root)
     live_pid = derive_project_id(live.value) if live is not None else None
     live_wid = (
-        derive_workspace_id(live_pid, canonical, normalize_os_family(sys.platform))
+        derive_workspace_id(live_pid, canonical, os_family)
         if live_pid
         else None
     )
@@ -201,7 +260,7 @@ def resolve_effective_identity(
             identity_state=IDENTITY_STATE_REGISTERED,
         )
 
-    if reg_status == _REGISTRATION_AMBIGUOUS:
+    if reg_status in (_REGISTRATION_AMBIGUOUS, _REGISTRATION_INVALID):
         return EffectiveIdentity(
             live_project_id=live_pid,
             live_workspace_id=live_wid,

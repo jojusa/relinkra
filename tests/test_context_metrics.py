@@ -226,5 +226,77 @@ class MetricsRouteTests(unittest.TestCase):
             server.server_close()
 
 
+class ExactRevisionCurrentnessTests(unittest.TestCase):
+    """CURRENT requires exact full revision equality (no 12-char prefixes).
+
+    A stored abbreviation (legacy rows) or a same-prefix/different-tail
+    revision is never CURRENT; legacy rows are left untouched and classify
+    conservatively as STALE.
+    """
+
+    HEAD = "0123456789abcdef0123456789abcdef01234567"
+    SHORT = HEAD[:12]
+
+    def observation(self, revision):
+        return context_metrics.extract_context_observation(
+            {
+                "packet_id": "pkt_revision",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "project_id": "rlk_revision",
+                "workspace_id": "ws_revision",
+                "project_facts": {"workspace": {"current_revision": revision}},
+                "packet_status": {
+                    "token_accounting": {
+                        "total_estimated_tokens": 5,
+                        "useful_payload_tokens": 4,
+                        "metadata_tokens": 1,
+                        "estimation_version": "cpt1.v1",
+                        "accounting_basis": "utf8_envelope",
+                    }
+                },
+            }
+        )
+
+    def classify(self, observed_revision, current_revision=HEAD):
+        return context_metrics.classify_currentness(
+            self.observation(observed_revision),
+            project_id="rlk_revision",
+            workspace_id="ws_revision",
+            revision=current_revision,
+        )
+
+    def test_exact_full_revision_equality_is_current(self):
+        self.assertEqual(self.classify(self.HEAD), "current")
+
+    def test_twelve_char_prefix_collision_is_not_current(self):
+        collision = self.SHORT + "0" * (len(self.HEAD) - len(self.SHORT))
+        self.assertEqual(collision[:12], self.HEAD[:12])
+        self.assertNotEqual(collision, self.HEAD)
+        self.assertEqual(self.classify(collision), "stale")
+
+    def test_legacy_short_revision_is_conservatively_stale(self):
+        self.assertEqual(self.classify(self.SHORT), "stale")
+
+    def test_legacy_short_row_is_never_rewritten(self):
+        root = Path.cwd() / (".vis3-exact-revision-" + uuid.uuid4().hex)
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        observation = self.observation(self.SHORT)
+        self.assertEqual(observation["identity"]["revision"], self.SHORT)
+        self.assertTrue(context_metrics.append_observation(str(root), observation))
+        loaded = context_metrics.load_observations(str(root))
+        self.assertEqual(loaded[-1]["identity"]["revision"], self.SHORT)
+        payload = context_metrics.metrics_payload(
+            str(root),
+            project_id="rlk_revision",
+            workspace_id="ws_revision",
+            revision=self.HEAD,
+        )
+        self.assertEqual(payload["currentness"], "stale")
+
+    def test_full_snapshot_revision_is_not_truncated_on_store(self):
+        observation = self.observation(self.HEAD)
+        self.assertEqual(observation["identity"]["revision"], self.HEAD)
+
+
 if __name__ == "__main__":
     unittest.main()

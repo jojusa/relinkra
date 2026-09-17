@@ -134,7 +134,15 @@ registration and the live remote. The contract is:
   record must exist AND its canonical path must be the workspace's own
   canonical path. A copied `.relinkra/`, a repurposed checkout, a fork, or
   a changed remote is a mismatch, not an inheritance: project A never
-  inherits project B's trust.
+  inherits project B's trust. Validity is re-derived, never trusted from
+  the stored shape: the project must exist, the stored `absolute_path`
+  and `canonical_path` must both canonicalize to the workspace's own
+  canonical path, the stored OS family must match this host's, and the
+  stored `workspace_id` must equal the id re-derived from
+  `(project_id, canonical path, OS family)`. A record that fails any of
+  these checks (copied, hand-edited, or half-pinned) fails closed and is
+  never treated as valid trust; a half-pinned config (only one of the two
+  ids) also fails closed instead of falling back to path trust.
 - **The identity state is explicit.** `identity_state` is one of
   `registered` (no mismatch), `migration_available` (registered ≠ live,
   `migration_available: true`, `recommended_action: "relinkra init"`),
@@ -150,9 +158,14 @@ registration and the live remote. The contract is:
   runtime evidence, metrics observations, and CBM records remain bound to
   the identity they were recorded under (`relinkra init` shares no
   memory with the previous project). Metrics classify each observation
-  against the effective identity: equal project+workspace+revision is
-  CURRENT, a different project/workspace is FOREIGN, a different revision
-  is STALE, and an unresolved identity is UNKNOWN.
+  against the effective identity: equal project+workspace+FULL revision
+  is CURRENT, a different project/workspace is FOREIGN, a different
+  revision is STALE, and an unresolved identity is UNKNOWN. CURRENT
+  requires exact full revision equality (`observation.revision == current
+  Git HEAD`); sharing a leading 12-character prefix is never enough.
+  Observations persisted by older versions with abbreviated revisions are
+  left untouched and classify conservatively as STALE — there is no
+  migration of old rows.
 
 Identity surfaces, all read-only:
 
