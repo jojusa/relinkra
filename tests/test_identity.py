@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 from relinkra.cbm import workspace_cbm_record
@@ -25,7 +28,7 @@ from relinkra.identity import (
     normalize_remote_url,
     redact_url,
 )
-from relinkra.registry import Registry, RegistryError
+from relinkra.registry import Registry, RegistryError, RegistryLockError
 from unittest import mock
 
 
@@ -747,6 +750,189 @@ class RegistryLockTests(unittest.TestCase):
             with open(registry_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             self.assertEqual(data["schema_version"], 1)
+
+
+@contextlib.contextmanager
+def _platform_lock_failure(*, only_thread=None):
+    """Make the OS-level lock call raise a non-contention ``OSError``.
+
+    Patches the real platform primitive (``msvcrt.locking`` on Windows,
+    ``fcntl.flock`` elsewhere) so the failure travels the same code path
+    as an OS-level lock error. ``only_thread`` scopes the injection to a
+    single thread when another thread must keep real locking.
+    """
+    try:
+        import msvcrt
+
+        module, attr = msvcrt, "locking"
+    except ImportError:
+        import fcntl
+
+        module, attr = fcntl, "flock"
+    real = getattr(module, attr)
+
+    def failing(*args, **kwargs):
+        if only_thread is None or threading.current_thread() is only_thread:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        return real(*args, **kwargs)
+
+    with mock.patch.object(module, attr, failing):
+        yield
+
+
+class RegistryMutationLockFailClosedTests(unittest.TestCase):
+    """RIC-02 — a failed lock acquisition must never run a mutation.
+
+    The finding: on the default ``timeout=None`` path an ``OSError``
+    during inter-process lock acquisition mapped to "no lock", yet the
+    caller still ran the whole-document read-modify-write — a mutation
+    could overwrite a newer registry while holding no lock. Mutations now
+    fail closed with ``RegistryLockError``; ``load()`` keeps its
+    best-effort read behavior.
+    """
+
+    @staticmethod
+    def _identity():
+        return normalize_remote_url("https://github.com/org/repo.git")
+
+    def test_lock_os_error_refuses_register_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            with _platform_lock_failure():
+                with self.assertRaises(RegistryLockError):
+                    Registry(registry_path).register_workspace(
+                        os.path.join(tmp, "ws"), self._identity()
+                    )
+            self.assertFalse(
+                os.path.exists(registry_path),
+                "a failed lock must not write the registry unlocked",
+            )
+
+    def test_lock_os_error_refuses_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            registry = Registry(registry_path)
+            registry.register_workspace(os.path.join(tmp, "ws"), self._identity())
+            with open(registry_path, "rb") as fh:
+                before = fh.read()
+            with _platform_lock_failure():
+                with self.assertRaises(RegistryLockError):
+                    registry.save()
+            with open(registry_path, "rb") as fh:
+                after = fh.read()
+            self.assertEqual(before, after, "a refused save must not touch the file")
+
+    def test_lock_os_error_keeps_registry_load_best_effort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            workspace = Registry(registry_path).register_workspace(
+                os.path.join(tmp, "ws"), self._identity()
+            )
+            with _platform_lock_failure():
+                reloaded = Registry(registry_path)
+            self.assertIn(workspace.workspace_id, reloaded.workspaces)
+
+    def test_failed_lock_never_sequences_a_stale_overwrite(self):
+        """read old -> another writer saves -> the failed-lock mutation
+        must NOT overwrite the newer registry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            Registry(registry_path).register_workspace(
+                os.path.join(tmp, "seed"),
+                normalize_remote_url("https://github.com/org/seed.git"),
+            )
+            stale = Registry(registry_path)
+            loaded = threading.Event()
+            release = threading.Event()
+            outcome = []
+
+            original_load = registry_module.Registry._load_unlocked
+
+            def load_then_pause():
+                original_load(stale)
+                loaded.set()
+                release.wait(timeout=10)
+
+            stale._load_unlocked = load_then_pause
+
+            def mutate_with_failing_lock():
+                try:
+                    stale.register_workspace(
+                        os.path.join(tmp, "lost"),
+                        normalize_remote_url("https://github.com/org/lost.git"),
+                    )
+                    outcome.append("returned")
+                except Exception as exc:  # noqa: BLE001 - asserted below
+                    outcome.append(exc)
+
+            worker = threading.Thread(target=mutate_with_failing_lock, daemon=True)
+            with _platform_lock_failure(only_thread=worker):
+                worker.start()
+                # On vulnerable code the failed lock still enters the
+                # critical section: it reloads the old registry and parks
+                # in ``load_then_pause``. On fixed code the mutation raises
+                # before ever reading.
+                deadline = time.monotonic() + 10
+                while (
+                    not loaded.is_set()
+                    and worker.is_alive()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                newer = Registry(registry_path).register_workspace(
+                    os.path.join(tmp, "newer"),
+                    normalize_remote_url("https://github.com/org/newer.git"),
+                )
+                release.set()
+                worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "the mutation never returned")
+            self.assertTrue(
+                any(isinstance(item, RegistryLockError) for item in outcome),
+                f"expected a fail-closed lock error, got: {outcome!r}",
+            )
+            reloaded = Registry(registry_path)
+            self.assertEqual(
+                reloaded.find_workspaces_by_canonical_path(os.path.join(tmp, "lost")),
+                [],
+                "the failed-lock mutation must not have written its record",
+            )
+            self.assertIn(
+                newer.workspace_id,
+                reloaded.workspaces,
+                "the newer registration was overwritten by the unlocked writer",
+            )
+
+    @unittest.skipUnless(
+        os.name == "nt", "msvcrt retry exhaustion is Windows-specific"
+    )
+    def test_windows_contention_exhaustion_fails_closed(self):
+        """A real second holder drives msvcrt past its ~10s retry window
+        (errno 36, EDEADLOCK); the mutation must refuse, never write."""
+        import msvcrt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = os.path.join(tmp, "registry.json")
+            holder = open(registry_path + ".lock", "a+b")
+            try:
+                holder.seek(0)
+                msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    with self.assertRaises(RegistryLockError):
+                        Registry(registry_path).register_workspace(
+                            os.path.join(tmp, "ws"), self._identity()
+                        )
+                finally:
+                    try:
+                        holder.seek(0)
+                        msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+            finally:
+                holder.close()
+            self.assertFalse(
+                os.path.exists(registry_path),
+                "contention must never be answered with an unlocked write",
+            )
 
 
 class StaleRegistryInstanceTests(unittest.TestCase):

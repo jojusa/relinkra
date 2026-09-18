@@ -45,6 +45,17 @@ class RegistryError(Exception):
     """Raised when the registry file is malformed or fails validation."""
 
 
+class RegistryLockError(RegistryError):
+    """Raised when a registry mutation cannot take the inter-process lock.
+
+    Registry mutations fail closed: when the platform lock primitive
+    reports an OS error, or no locking primitive is available, the
+    read-modify-write is refused instead of running unlocked and racing
+    other writers. ``Registry.load()`` is read-only and keeps its
+    historical best-effort behavior.
+    """
+
+
 #: Poll interval for a bounded (``timeout``) lock wait. Short enough
 #: that a writer waits at most this long past the moment the holder
 #: releases; long enough to stay invisible next to any real critical
@@ -52,9 +63,10 @@ class RegistryError(Exception):
 _LOCK_POLL_SECONDS = 0.05
 
 #: Errnos that mean "someone else holds the lock" — retryable under a
-#: bounded wait. Anything else means the platform cannot lock this file
-#: at all, which is the historical proceed-unlocked case. Built
-#: defensively: not every platform defines every errno name.
+#: bounded wait. Anything else means no lock could be taken at all (the
+#: OS errored, or no primitive exists): a non-acquisition that
+#: lock-requiring callers must treat as fatal. Built defensively: not
+#: every platform defines every errno name.
 _LOCK_BUSY_ERRNOS = frozenset(
     value
     for value in (
@@ -72,44 +84,69 @@ _LOCK_BUSY_ERRNOS = frozenset(
 _LOCK_BUSY = "busy"
 
 
-def _try_lock_once(fh) -> Optional[str]:
+def _lock_error_detail(primitive: str, exc: OSError) -> str:
+    """Compact, path-free cause for a failed lock attempt.
+
+    Rendered from ``errno``/``strerror`` only: ``str(exc)`` and the
+    filename attribute are deliberately ignored so diagnostics can reach
+    users and logs without leaking registry locations.
+    """
+    detail = f"{primitive} lock failed"
+    if exc.errno is not None:
+        detail += f" (errno {exc.errno}"
+        if exc.strerror:
+            detail += f": {exc.strerror}"
+        detail += ")"
+    return detail
+
+
+def _try_lock_once(fh) -> Tuple[Optional[str], Optional[str]]:
     """One non-blocking acquisition attempt.
 
-    Returns the platform primitive name whose lock is HELD, ``None``
-    when the platform cannot lock this file at all, or the
+    Returns ``(outcome, failure)``. ``outcome`` is the platform primitive
+    name whose lock is HELD, ``None`` when no lock could be taken, or the
     :data:`_LOCK_BUSY` sentinel when another holder keeps the lock.
+    ``failure`` describes why no lock could be taken when ``outcome`` is
+    ``None``; it is None on success and on the retryable busy outcome.
     """
     try:
         import msvcrt
 
         fh.seek(0)
         msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        return "msvcrt"
+        return "msvcrt", None
     except ImportError:
         pass
     except OSError as exc:
-        return _LOCK_BUSY if exc.errno in _LOCK_BUSY_ERRNOS else None
+        if exc.errno in _LOCK_BUSY_ERRNOS:
+            return _LOCK_BUSY, None
+        return None, _lock_error_detail("msvcrt", exc)
     try:
         import fcntl
 
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return "fcntl"
+        return "fcntl", None
     except ImportError:
-        return None
+        return None, "no inter-process locking primitive is available"
     except OSError as exc:
-        return _LOCK_BUSY if exc.errno in _LOCK_BUSY_ERRNOS else None
+        if exc.errno in _LOCK_BUSY_ERRNOS:
+            return _LOCK_BUSY, None
+        return None, _lock_error_detail("fcntl", exc)
 
 
-def _acquire_lock_handle(fh, timeout: Optional[float]) -> Tuple[Optional[str], bool]:
+def _acquire_lock_handle(
+    fh, timeout: Optional[float]
+) -> Tuple[Optional[str], bool, Optional[str]]:
     """Take the advisory lock on an open lock-file handle.
 
-    Returns ``(locker, timed_out)``. ``locker`` names the platform
-    primitive whose lock is HELD (``"msvcrt"``/``"fcntl"``), or None
-    when locking is unavailable or failed — the historical best-effort
-    case, in which the critical section proceeds unlocked. ``timed_out``
-    is True ONLY when a bounded wait (``timeout``) expired with the lock
-    still held elsewhere: the one outcome a bounded caller must treat as
-    "skip the critical section" rather than proceed unlocked.
+    Returns ``(locker, timed_out, failure)``. ``locker`` names the
+    platform primitive whose lock is HELD (``"msvcrt"``/``"fcntl"``), or
+    None when no lock could be taken — the historical best-effort case,
+    in which a caller must decide whether proceeding is safe. ``failure``
+    then carries a path-free reason. ``timed_out`` is True ONLY when a
+    bounded wait (``timeout``) expired with the lock still held
+    elsewhere. Lock-requiring callers treat any ``locker is None``
+    outcome as fatal.
     """
     if timeout is None:
         try:
@@ -117,46 +154,64 @@ def _acquire_lock_handle(fh, timeout: Optional[float]) -> Tuple[Optional[str], b
 
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-            return "msvcrt", False
+            return "msvcrt", False, None
         except ImportError:
             try:
                 import fcntl
 
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                return "fcntl", False
-            except (ImportError, OSError):
-                return None, False
-        except OSError:
-            return None, False
+                return "fcntl", False, None
+            except ImportError:
+                return (
+                    None,
+                    False,
+                    "no inter-process locking primitive is available",
+                )
+            except OSError as exc:
+                return None, False, _lock_error_detail("fcntl", exc)
+        except OSError as exc:
+            return None, False, _lock_error_detail("msvcrt", exc)
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
-        outcome = _try_lock_once(fh)
+        outcome, failure = _try_lock_once(fh)
         if outcome is not _LOCK_BUSY:
-            return outcome, False
+            return outcome, False, failure
         if time.monotonic() >= deadline:
-            return None, True
+            return (
+                None,
+                True,
+                "the lock is held elsewhere and the bounded wait expired",
+            )
         time.sleep(_LOCK_POLL_SECONDS)
 
 
 @contextlib.contextmanager
-def _interprocess_lock(registry_path: str, *, timeout: Optional[float] = None):
-    """Best-effort cross-platform advisory lock for registry mutation.
+def _interprocess_lock(
+    registry_path: str,
+    *,
+    timeout: Optional[float] = None,
+    fail_closed: bool = False,
+):
+    """Cross-platform advisory lock for registry-adjacent writes.
 
     Uses a lock file (``<registry>.lock``) alongside the registry:
-    ``msvcrt.locking`` on Windows, ``fcntl.flock`` on POSIX. Best-effort:
-    if the platform locking primitive is unavailable or fails, the
-    critical section proceeds unlocked rather than failing the operation.
-    A lock held by a process that dies is released by the OS, and an
-    abandoned lock FILE is inert, so nothing here can wedge permanently.
+    ``msvcrt.locking`` on Windows, ``fcntl.flock`` on POSIX. A lock held
+    by a process that dies is released by the OS, and an abandoned lock
+    FILE is inert, so nothing here can wedge permanently.
 
-    With ``timeout=None`` (the default) acquisition blocks; the context
-    manager yields True. With a ``timeout``, acquisition is a bounded
-    non-blocking wait: the manager yields True when the critical section
-    may proceed — the lock is held, or the platform cannot lock at all
-    (proceed unlocked, as always) — and False only when the bounded wait
-    expired with the lock still held elsewhere. A caller that requires
-    mutual exclusion must then SKIP its critical section (conservative
+    With ``timeout=None`` (the default) acquisition blocks. With a
+    ``timeout``, acquisition is a bounded non-blocking wait: when it
+    expires with the lock still held elsewhere the manager yields False
+    so the caller can SKIP its critical section (conservative
     degradation) instead of racing unlocked.
+
+    ``fail_closed`` is the mutation invariant: when True, a lock that
+    could not be acquired — an OS error, a missing primitive, or an
+    expired bounded wait — raises :class:`RegistryLockError` and the
+    critical section NEVER runs unlocked. Registry ``save()`` and
+    ``register_workspace()`` pass True; read-only and other best-effort
+    callers (``Registry.load()``, connector writes) keep the historical
+    opt-in semantics with the default False.
     """
     registry_path = os.fspath(registry_path)
     lock_path = registry_path + ".lock"
@@ -165,7 +220,13 @@ def _interprocess_lock(registry_path: str, *, timeout: Optional[float] = None):
     fh = open(lock_path, "a+b")
     locker = None
     try:
-        locker, timed_out = _acquire_lock_handle(fh, timeout)
+        locker, timed_out, failure = _acquire_lock_handle(fh, timeout)
+        if fail_closed and locker is None:
+            raise RegistryLockError(
+                "the inter-process lock was not acquired; refusing to "
+                "mutate the registry without it"
+                + (f" ({failure})" if failure else "")
+            )
         try:
             yield not timed_out
         finally:
@@ -313,7 +374,7 @@ class Registry:
         }
 
     def save(self) -> None:
-        with _interprocess_lock(self.path):
+        with _interprocess_lock(self.path, fail_closed=True):
             self._save_unlocked()
 
     def _save_unlocked(self) -> None:
@@ -386,7 +447,7 @@ class Registry:
         if project_id is not None and not _PROJECT_ID_RE.match(project_id):
             raise RegistryError("malformed project_id override")
 
-        with _interprocess_lock(self.path):
+        with _interprocess_lock(self.path, fail_closed=True):
             if os.path.exists(self.path):
                 self._load_unlocked()
             return self._register_workspace_unlocked(
