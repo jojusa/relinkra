@@ -1,4 +1,4 @@
-"""RIC-01 runtime evidence trust-boundary regressions."""
+"""RIC-01/RIC-01B runtime evidence trust-boundary regressions."""
 
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from relinkra.backend_detection import build_trust_ladder
+from relinkra.backend_policy import (
+    ROUTE_MANAGED,
+    STAGE_PROVEN,
+    STAGE_REAL_HOST_LAUNCH,
+    TRUST_UNVERIFIED,
+)
 from relinkra.identity import discover_repository_identity, git_head_sha
 from relinkra.product_cli import WorkspaceConfig, registry_path
 from relinkra.registry import Registry
@@ -22,8 +29,13 @@ from relinkra.runtime_evidence import (
 )
 
 
-class RIC01RuntimeEvidenceTests(unittest.TestCase):
-    """Evidence is current only when identity and complete HEAD both agree."""
+class _RIC01Fixture(unittest.TestCase):
+    """Real git repositories, real registration, real evidence files.
+
+    No trust decision is mocked: the tests exercise the shipped
+    ``summarize_runtime_evidence``/``runtime_stage_claims`` pair and the
+    real ``build_trust_ladder`` against disposable local projects.
+    """
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="relinkra-ric01-")
@@ -66,6 +78,10 @@ class RIC01RuntimeEvidenceTests(unittest.TestCase):
             workspace_id=workspace.workspace_id,
         ).save(repo)
         return workspace
+
+
+class RIC01RuntimeEvidenceTests(_RIC01Fixture):
+    """Evidence is current only when identity and complete HEAD both agree."""
 
     def test_exact_full_head_is_current_and_stamped_without_truncation(self):
         recorder = EvidenceRecorder(str(self.repo), "codex", revision=self.revision)
@@ -136,6 +152,166 @@ class RIC01RuntimeEvidenceTests(unittest.TestCase):
         summary = summarize_runtime_evidence(str(self.repo), self.revision)
         self.assertEqual(summary["identity_state"], "unknown")
         self.assertNotIn("server_started", runtime_stage_claims(summary))
+
+
+class RIC01BBackendDetectionTests(_RIC01Fixture):
+    """RIC-01B: historical evidence attests only the certified identity.
+
+    The exact Daybreak BACKEND_DETECTION reproduction lives here: copied
+    runtime evidence must not prove ``STAGE_REAL_HOST_LAUNCH`` in the
+    destination workspace, while the same-identity historical diagnostic
+    keeps working. Observation is not attestation.
+    """
+
+    def _record_launch(self, repo: Path, revision: str) -> Path:
+        recorder = EvidenceRecorder(str(repo), "codex", revision=revision)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        return Path(host_evidence_path(str(repo), "codex"))
+
+    @staticmethod
+    def _copy_evidence(source: Path, dest: Path) -> Path:
+        target = Path(host_evidence_path(str(dest), "codex"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        return target
+
+    @staticmethod
+    def _tamper_identity(evidence: Path, **fields: str) -> None:
+        data = json.loads(evidence.read_text(encoding="utf-8"))
+        event = data["events"][EVENT_MCP_SERVER_STARTED]
+        event.update({key: value for key, value in fields.items() if value})
+        evidence.write_text(json.dumps(data), encoding="utf-8")
+
+    def _summary(self, repo: Path) -> dict:
+        return summarize_runtime_evidence(str(repo), git_head_sha(str(repo)))
+
+    def _launch_stage(self, repo: Path, summary: dict):
+        ladder = build_trust_ladder(
+            [],
+            launch_resolved=True,
+            relinkra_registered=True,
+            route=ROUTE_MANAGED,
+            metrics_trust=TRUST_UNVERIFIED,
+            bypass_detected=False,
+            handoffs_available=None,
+            tools_declared=0,
+            real_host_launch_proven=False,
+            workspace_root=str(repo),
+            current_revision=git_head_sha(str(repo)),
+            runtime_evidence=summary,
+        )
+        return ladder.by_stage()[STAGE_REAL_HOST_LAUNCH]
+
+    def _assert_not_attested(self, repo: Path, summary: dict) -> None:
+        claims = runtime_stage_claims(summary)
+        self.assertNotIn("server_started", claims)
+        self.assertNotIn("server_started_historical", claims)
+        stage = self._launch_stage(repo, summary)
+        self.assertNotEqual(
+            stage.state,
+            STAGE_PROVEN,
+            "copied/unresolved evidence must not prove the launch rung",
+        )
+
+    def test_copied_runtime_evidence_does_not_attest(self):
+        evidence = self._record_launch(self.repo, self.revision)
+        unrelated = self._repo("unrelated-evidence")
+        self._copy_evidence(evidence, unrelated)
+        summary = self._summary(unrelated)
+        self.assertNotEqual(summary["identity_state"], "effective")
+        self.assertTrue(summary["identity_resolution_attempted"])
+        self._assert_not_attested(unrelated, summary)
+
+    def test_copied_config_and_evidence_does_not_attest(self):
+        evidence = self._record_launch(self.repo, self.revision)
+        unrelated = self._repo("unrelated-config")
+        (unrelated / ".relinkra").mkdir()
+        shutil.copy2(
+            self.repo / ".relinkra" / "config.json",
+            unrelated / ".relinkra" / "config.json",
+        )
+        self._copy_evidence(evidence, unrelated)
+        summary = self._summary(unrelated)
+        self._assert_not_attested(unrelated, summary)
+
+    def test_copied_full_state_does_not_attest(self):
+        # The exact Daybreak BACKEND_DETECTION reproduction: a complete
+        # ``.relinkra`` copy into an unrelated workspace. It fails on the
+        # RIC-01B base revision (3ad912fd) and passes once historical
+        # evidence is gated on the certified effective identity.
+        evidence = self._record_launch(self.repo, self.revision)
+        unrelated = self._repo("unrelated-full")
+        shutil.copytree(self.repo / ".relinkra", unrelated / ".relinkra")
+        summary = self._summary(unrelated)
+        self.assertNotEqual(summary["identity_state"], "effective")
+        self.assertEqual(summary["hosts"]["codex"]["state"], "unknown")
+        self.assertTrue(summary["hosts"]["codex"]["events"], "evidence stays readable")
+        self._assert_not_attested(unrelated, summary)
+
+    def test_unresolved_identity_historical_evidence_is_diagnostic_only(self):
+        unrelated = self._repo("unregistered")
+        recorder = EvidenceRecorder(str(unrelated), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = self._summary(unrelated)
+        self.assertTrue(summary["identity_resolution_attempted"])
+        self.assertEqual(summary["current_project_id"], "")
+        self.assertEqual(summary["current_workspace_id"], "")
+        self.assertEqual(summary["hosts"]["codex"]["state"], "unknown")
+        self._assert_not_attested(unrelated, summary)
+
+    def test_foreign_project_evidence_does_not_attest(self):
+        registered = self._repo("registered-foreign-project")
+        self._register(registered)
+        evidence = self._record_launch(self.repo, self.revision)
+        target = self._copy_evidence(evidence, registered)
+        self._tamper_identity(target, project_id="rlk_" + "f" * 32)
+        summary = self._summary(registered)
+        self.assertEqual(summary["hosts"]["codex"]["state"], "foreign")
+        self._assert_not_attested(registered, summary)
+
+    def test_foreign_workspace_evidence_does_not_attest(self):
+        registered = self._repo("registered-foreign-workspace")
+        self._register(registered)
+        evidence = self._record_launch(self.repo, self.revision)
+        target = self._copy_evidence(evidence, registered)
+        self._tamper_identity(target, workspace_id="ws_" + "f" * 32)
+        summary = self._summary(registered)
+        self.assertEqual(summary["hosts"]["codex"]["state"], "foreign")
+        self._assert_not_attested(registered, summary)
+
+    def test_same_identity_older_revision_stays_historical(self):
+        recorder = EvidenceRecorder(str(self.repo), "codex", revision="a" * 40)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(self.repo), self.revision)
+        claims = runtime_stage_claims(summary)
+        self.assertNotIn("server_started", claims)
+        self.assertIn("server_started_historical", claims)
+        # The certified identity keeps its historical launch diagnostic.
+        stage = self._launch_stage(self.repo, summary)
+        self.assertEqual(stage.state, STAGE_PROVEN)
+        self.assertIn("historical", stage.evidence)
+
+    def test_legacy_short_revision_stays_historical_not_current(self):
+        recorder = EvidenceRecorder(
+            str(self.repo), "codex", revision=self.revision[:12]
+        )
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(self.repo), self.revision)
+        self.assertEqual(summary["hosts"]["codex"]["revision"], self.revision[:12])
+        claims = runtime_stage_claims(summary)
+        self.assertNotIn("server_started", claims)
+        self.assertIn("server_started_historical", claims)
+
+    def test_exact_current_identity_and_revision_still_prove_launch(self):
+        recorder = EvidenceRecorder(str(self.repo), "codex", revision=self.revision)
+        self.assertTrue(recorder.record(EVENT_MCP_SERVER_STARTED))
+        summary = summarize_runtime_evidence(str(self.repo), self.revision)
+        claims = runtime_stage_claims(summary)
+        self.assertIn("server_started", claims)
+        self.assertNotIn("server_started_historical", claims)
+        stage = self._launch_stage(self.repo, summary)
+        self.assertEqual(stage.state, STAGE_PROVEN)
+        self.assertIn("current revision", stage.evidence)
 
 
 if __name__ == "__main__":

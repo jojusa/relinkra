@@ -1375,7 +1375,15 @@ def runtime_stage_claims(
     current_project_id: str = "",
     current_workspace_id: str = "",
 ) -> dict:
-    """Map only correctly-bound current runtime evidence onto trust stages."""
+    """Map only correctly-bound current runtime evidence onto trust stages.
+
+    An older start observation, or one whose revision cannot be read, may
+    still attest the launch rung as HISTORICAL, but only while its immutable
+    project/workspace binding equals the resolver-certified effective tuple.
+    Copies, foreign rows, live-candidate identities, and evidence recorded
+    while resolution was unresolved stay diagnostic in the per-host summary
+    and never become a trust claim (RIC-01B).
+    """
     summary = summary or {}
     if not current_revision:
         current_revision = str(summary.get("current_revision") or "")
@@ -1422,10 +1430,15 @@ def runtime_stage_claims(
             relation = revision_relation(entry.get("revision"), current_revision)
             if binding == "current" and relation == "current":
                 started.append((host_id, entry, relation))
-            elif binding != "foreign" and relation in ("older", "unknown"):
-                # Keep historical launch observation separate from the
-                # current-revision trust claim. Legacy/unknown revisions may
-                # explain host history, but can never become CURRENT.
+            elif binding == "current" and relation in ("older", "unknown"):
+                # Historical launch observation: the event's project/workspace
+                # binding equals the resolver-certified effective tuple, so it
+                # may attest THIS workspace's launch rung. It stays separate
+                # from the current-revision claim and can never become
+                # CURRENT. Copies, foreign rows, unresolved identity, or
+                # legacy unbound rows are not eligible (RIC-01B): the summary
+                # keeps them as diagnostics, but they must not cross-bind a
+                # launch attestation into an unrelated workspace.
                 started_historical.append((host_id, entry, relation))
     if started:
         host_id, entry, relation = sorted(

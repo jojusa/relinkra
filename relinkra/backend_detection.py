@@ -761,9 +761,12 @@ def build_trust_ladder(
     successful tool call — is direct observation of the weakest kind,
     and only for stages it could literally see. Current-revision evidence
     advances the rung; historical evidence advances only the launch rung,
-    with the revision relation named. A rung an operator proof reports as
-    NOT achieved stays not-achieved: conflicting evidence resolves
-    conservatively, never in favour of the newer signal.
+    with the revision relation named, and only when its binding equals the
+    certified effective project/workspace tuple (RIC-01B) — an unresolved,
+    copied or foreign store stays diagnostic and advances nothing. A rung
+    an operator proof reports as NOT achieved stays not-achieved:
+    conflicting evidence resolves conservatively, never in favour of the
+    newer signal.
     """
     configured = any(host.config_readable for host in hosts)
 
@@ -901,7 +904,9 @@ def build_trust_ladder(
     )
     # A stale/unknown runtime start is an explicit historical diagnostic,
     # not a CURRENT claim, but it may still prove that a host launched this
-    # server at some point.
+    # server at some point. Runtime evidence only yields this claim when its
+    # binding equals the certified effective project/workspace tuple, so a
+    # copied or unresolved store can never attest another workspace's launch.
     launch_claim = "server_started"
     if "server_started" not in runtime_claims:
         launch_claim = "server_started_historical"

@@ -1413,8 +1413,14 @@ class UnknownRevisionTests(unittest.TestCase):
     def test_unknown_revision_proves_no_current_revision_stages(self):
         summary = summarize_runtime_evidence(str(self.ws), "")
         claims = runtime_stage_claims(summary, "")
-        # A launch is a fact about the host's history and survives.
-        self.assertIn("server_started_historical", claims)
+        # RIC-01B: the launch observation stays readable in the per-host
+        # summary (state ``unknown``, events kept), but an unresolved
+        # effective identity may not attest — not even as a historical
+        # launch claim.
+        self.assertEqual(summary["hosts"]["codex"]["state"], "unknown")
+        self.assertTrue(summary["hosts"]["codex"]["events"])
+        self.assertNotIn("server_started", claims)
+        self.assertNotIn("server_started_historical", claims)
         for stage in ("handshake", "protocol_agreed", "tools_visible"):
             self.assertNotIn(stage, claims)
 
