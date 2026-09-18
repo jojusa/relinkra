@@ -33,7 +33,7 @@ from pathlib import Path
 from relinkra import backend_policy, connect_cli, product_cli
 from relinkra.backend_policy import STAGE_HANDOFF_ROUND_TRIP, STAGE_PROVEN
 from relinkra.connector_apply import launch_fingerprint
-from relinkra.connectors import resolve_launch
+from relinkra.connectors import claude_project_key, resolve_launch
 from relinkra.connect_verification import build_proof_from_payload, record_verification
 from relinkra.host_discovery import (
     SYSTEM_LINUX,
@@ -688,7 +688,38 @@ class MultiHostIsolationTests(DogfoodCase):
 class DoctorDisplayTests(DogfoodCase):
     """PENDING vs WARN, compact default, verbose flag, one next action."""
 
+    def register_direct_engram(self):
+        """Build the degraded Engram state explicitly: a direct registration
+        with no ownership marker.
+
+        Which Engram ownership the doctor reports must not depend on what
+        the runner happens to have installed. The backend health probe uses
+        the real ``PATH``, so on a machine without an Engram executable the
+        backend is simply unavailable — a healthy PASS ("no memory backend
+        detected") — while an unowned direct registration is the WARN state
+        this display test needs. Writing the host config constructs that
+        state on every runner.
+        """
+        (self.home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "projects": {
+                        claude_project_key(self.root): {
+                            "mcpServers": {
+                                "engram": {
+                                    "command": "/usr/local/bin/engram",
+                                    "args": ["mcp", "--tools=agent"],
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_pending_is_distinct_from_warn(self):
+        self.register_direct_engram()
         _, checks = self.doctor_checks()
         # Not yet exercised: PENDING.
         self.assertEqual(checks["Context routing"]["status"], PENDING)

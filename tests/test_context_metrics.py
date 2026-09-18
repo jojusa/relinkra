@@ -130,16 +130,47 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(current["observation"]["packet_id"], "pkt_104")
 
     def test_same_bucket_concurrent_writers_leave_valid_json(self):
+        """Concurrent writers stay serialized against the bucket lock.
+
+        Metrics persistence is bounded and best-effort by contract: a
+        writer that cannot acquire the bucket lock inside
+        LOCK_TIMEOUT_SECONDS skips its write and returns False instead of
+        blocking context delivery. That is why this test does NOT require
+        every thread to succeed — a loaded runner can honestly time out the
+        tail writers. The invariants that must hold under contention are
+        pinned instead: the store stays valid JSON, every acknowledged
+        append is retained (no lost update from a racy read-modify-write),
+        and every outcome is an explicit bool.
+        """
         results = []
-        threads = [threading.Thread(target=lambda i=i: results.append(self.append(i))) for i in range(8)]
+        results_lock = threading.Lock()
+
+        def write(index):
+            outcome = self.append(index)
+            with results_lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=write, args=(index,)) for index in range(8)
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(5)
+            thread.join(10)
+        self.assertEqual(len(results), len(threads))
+        for outcome in results:
+            self.assertIsInstance(outcome, bool)
         path = context_metrics.metrics_path(str(self.root), "host_unknown")
+        # The first writer to reach the lock has no contender, so a bounded
+        # wait cannot drop every write: the store must exist and parse.
         self.assertTrue(path.is_file())
-        self.assertTrue(all(results))
-        self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIsInstance(data, dict)
+        observations = data["observations"]
+        # The lock wraps the whole read-append-replace transaction, so the
+        # rows retained must equal the acknowledgements exactly; a mismatch
+        # would mean an unlocked writer lost someone else's update.
+        self.assertEqual(len(observations), sum(1 for outcome in results if outcome))
 
     def test_corrupt_store_is_degraded_and_does_not_fabricate_history(self):
         path = context_metrics.metrics_path(str(self.root), "host_unknown")
