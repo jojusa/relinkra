@@ -285,6 +285,36 @@ def sanitize_error(message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Title normalization (RIC-03: title structural-injection defense)
+# ---------------------------------------------------------------------------
+
+
+def normalize_title(title: Any) -> str:
+    """Flatten an untrusted memory title to a single logical line.
+
+    RIC-03: a memory title is DATA, never packet structure. A title that
+    contains a line break would start a new Markdown line inside a
+    rendered ContextPacket and counterfeit packet-level headings, fences,
+    list items, or metadata lines. Unicode ``\\s`` matches every
+    separator ``str.splitlines`` treats as a break (LF, CRLF, CR, NEL,
+    LINE/PARAGRAPH SEPARATOR, and the C0 file/ group/record/unit
+    separators), so collapsing whitespace runs to one space makes a title
+    physically unable to leave its own line while preserving ordinary
+    wording and punctuation.
+
+    Renderers must still apply this defensively at render time: memories
+    saved before this policy may hold legacy multiline titles and stored
+    memory history is never rewritten.
+
+    Deliberately NOT a length cap: existing save validation rejects
+    invalid titles rather than truncating them, and a single-line title
+    cannot create packet structure at any length.
+    """
+    text = title if isinstance(title, str) else str(title)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
 # Dedup
 # ---------------------------------------------------------------------------
 
@@ -591,7 +621,9 @@ class MemoryService:
             if not 0.0 <= confidence <= 1.0:
                 raise MemoryValidationError("confidence must be in [0.0, 1.0]")
 
-        title = redact_text(title.strip())
+        # RIC-03: a title is single-line data. Normalize before redaction
+        # so multi-line secret patterns still match as continuous text.
+        title = redact_text(normalize_title(title))
         body = redact_text(body or "")
         channel = scope_channel_for(scope, workspace_id, agent_type)
         dedup_key = compute_dedup_key(

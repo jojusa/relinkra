@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
 
+from .memory import normalize_title
+
 
 def _strip_local_diagnostics(value: Any) -> Any:
     """Recursively remove machine-local diagnostics channels from a value.
@@ -431,9 +433,13 @@ class ContextPacket:
         if other:
             lines.append("- other active memories:")
             for item in other:
+                # Memory titles are untrusted data (RIC-03): always render
+                # them flattened to one line so a stored legacy title can
+                # never start a new packet-level Markdown line.
                 lines.append(
                     f"  - [{item.data.get('memory_type')}] "
-                    f"{item.data.get('title')} ({item.data.get('memory_id')})"
+                    f"{normalize_title(item.data.get('title'))} "
+                    f"({item.data.get('memory_id')})"
                 )
         lines.append("")
 
@@ -460,7 +466,8 @@ class ContextPacket:
             for item in decisions:
                 lines.append(
                     f"- [{item.data.get('memory_type')}] "
-                    f"{item.data.get('title')} ({item.data.get('memory_id')})"
+                    f"{normalize_title(item.data.get('title'))} "
+                    f"({item.data.get('memory_id')})"
                 )
         else:
             lines.append("- (none)")
@@ -476,7 +483,8 @@ class ContextPacket:
         if constraints:
             for item in constraints:
                 lines.append(
-                    f"- {item.data.get('title')} ({item.data.get('memory_id')})"
+                    f"- {normalize_title(item.data.get('title'))} "
+                    f"({item.data.get('memory_id')})"
                 )
         else:
             lines.append("- (none)")
@@ -516,13 +524,13 @@ class ContextPacket:
         if self.pending:
             for item in self.pending:
                 lines.append(
-                    f"- [pending] {item.data.get('title')} "
+                    f"- [pending] {normalize_title(item.data.get('title'))} "
                     f"({item.data.get('memory_id')})"
                 )
         if self.handoffs:
             for item in self.handoffs:
                 lines.append(
-                    f"- [handoff] {item.data.get('title')} "
+                    f"- [handoff] {normalize_title(item.data.get('title'))} "
                     f"({item.data.get('memory_id')})"
                 )
         if not self.pending and not self.handoffs:
