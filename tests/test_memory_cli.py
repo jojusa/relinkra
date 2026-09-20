@@ -431,9 +431,13 @@ class TestEngramCLIAdapter(unittest.TestCase):
 class FakeHTTPResponse:
     def __init__(self, payload):
         self._body = json.dumps(payload).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self._body))}
 
-    def read(self):
-        return self._body
+    def read(self, amt=None):
+        # Mimic http.client.HTTPResponse.read(amt): never more than amt.
+        if amt is None:
+            return self._body
+        return self._body[:amt]
 
     def __enter__(self):
         return self
@@ -473,9 +477,9 @@ class TestEngramHTTPReadPath(unittest.TestCase):
         )
         payload = http_payload(content=envelope)
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             return_value=FakeHTTPResponse(payload),
-        ) as urlopen, mock.patch(
+        ) as open_http, mock.patch(
             "relinkra.engram_adapter.subprocess.run"
         ) as run:
             records = self.adapter().search_records(query="rlkmem1", project=PID)
@@ -487,7 +491,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
         self.assertFalse(record.content.endswith("..."))
         self.assertEqual(json.loads(record.content)["body"], long_body)
         run.assert_not_called()
-        url = urlopen.call_args[0][0]
+        url = open_http.call_args[0][0]
         self.assertIn("/search?", url)
         self.assertIn("q=rlkmem1", url)
         self.assertIn(f"project={PID}", url)
@@ -497,7 +501,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
             id=43, type="manual", title="Other"
         )
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             return_value=FakeHTTPResponse(payload),
         ):
             records = self.adapter().search_records(
@@ -508,7 +512,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
     def test_http_applies_limit_client_side(self):
         payload = [http_payload(id=i, title=f"T{i}")[0] for i in range(5)]
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             return_value=FakeHTTPResponse(payload),
         ):
             records = self.adapter().search_records(query="x", limit=2)
@@ -516,7 +520,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
 
     def test_http_down_falls_back_to_cli(self):
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             side_effect=urllib.error.URLError("connection refused"),
         ), mock.patch(
             "relinkra.engram_adapter.subprocess.run",
@@ -528,11 +532,11 @@ class TestEngramHTTPReadPath(unittest.TestCase):
 
     def test_http_bad_payload_falls_back_to_cli(self):
         class BadResponse(FakeHTTPResponse):
-            def read(self):
+            def read(self, amt=None):
                 return b"not json{"
 
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             return_value=BadResponse(None),
         ), mock.patch(
             "relinkra.engram_adapter.subprocess.run",
@@ -544,7 +548,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
 
     def test_http_non_list_payload_falls_back_to_cli(self):
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen",
+            "relinkra.engram_adapter._engram_http_open",
             return_value=FakeHTTPResponse({"error": "nope"}),
         ), mock.patch(
             "relinkra.engram_adapter.subprocess.run",
@@ -556,8 +560,8 @@ class TestEngramHTTPReadPath(unittest.TestCase):
 
     def test_http_disabled_goes_straight_to_cli(self):
         with mock.patch(
-            "relinkra.engram_adapter.urllib.request.urlopen"
-        ) as urlopen, mock.patch(
+            "relinkra.engram_adapter._engram_http_open"
+        ) as open_http, mock.patch(
             "relinkra.engram_adapter.subprocess.run",
             return_value=FakeCompleted(stdout=SAMPLE_SEARCH),
         ):
@@ -565,7 +569,7 @@ class TestEngramHTTPReadPath(unittest.TestCase):
                 query="rlkmem1", project=PID
             )
         self.assertEqual(len(records), 2)
-        urlopen.assert_not_called()
+        open_http.assert_not_called()
 
     def test_http_url_resolution(self):
         self.assertEqual(

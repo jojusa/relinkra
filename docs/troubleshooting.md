@@ -159,6 +159,13 @@ read/write and handoffs report UNAVAILABLE.
 the HTTP read path, but it cannot replace the CLI required for memory
 writes and handoffs.
 
+**Note:** the HTTP read path is loopback-only. `ENGRAM_URL` must be an
+`http://` URL whose host is `127.0.0.1`, `::1`, or `localhost`; any
+other value (remote host, credentials in the URL, another scheme) is
+refused without sending a request, and the search degrades to the
+loopback/CLI tiers with an `engram_endpoint_rejected` diagnostic in
+`memory_search` results.
+
 **Fix:** optional — Relinkra degrades honestly and commands still exit 0.
 To enable memory, install Engram and ensure `engram` is on `PATH`.
 

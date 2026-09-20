@@ -216,7 +216,13 @@ UNSUPPORTED** (roadmap).
 **Engram** is optional: a third-party project (Gentleman Programming,
 MIT), external and never bundled with Relinkra. Relinkra talks to it via
 CLI subprocess plus loopback HTTP (127.0.0.1:7437, 2s timeout), with
-graceful degradation when absent.
+graceful degradation when absent. The HTTP transport is loopback-only
+(accepted hosts: `127.0.0.1`, `::1`, `localhost`; non-loopback
+`ENGRAM_URL` values are refused before any request is sent), responses
+are size-bounded (8 MiB per response), and redirects are never followed.
+Transport reachability is not provenance: no cryptographic
+authentication exists between Relinkra and Engram, and memories are
+trusted only after envelope-level policy validation.
 
 ## Release gates
 

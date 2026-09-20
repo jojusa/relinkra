@@ -486,6 +486,18 @@ class Memory:
                 raise MemoryValidationError(
                     f"envelope missing required field: {required}"
                 )
+        # TSC-02: an accepted envelope must carry a KNOWN logical memory
+        # type and status. Only Relinkra writes ``rlkmem1`` envelopes, so
+        # these narrow a forged/unknown record out without any legacy-data
+        # compatibility cost. ``memory_id`` is deliberately NOT shape-
+        # checked here: legacy observations with non-canonical ids stay
+        # readable (pinned by the non-canonical-id compatibility test),
+        # and ``get()`` already validates the REQUESTED id shape.
+        memory_type = str(data["memory_type"])
+        storage_type_for(memory_type)
+        status = str(data.get("status") or "active")
+        if status not in STATUSES:
+            raise MemoryValidationError(f"unsupported memory status: {status!r}")
         confidence = data.get("confidence")
         return Memory(
             memory_id=str(data["memory_id"]),
@@ -495,7 +507,7 @@ class Memory:
             ),
             agent_id=str(data.get("agent_id") or ""),
             agent_type=str(data.get("agent_type") or ""),
-            memory_type=str(data["memory_type"]),
+            memory_type=memory_type,
             title=str(data["title"]),
             body=str(data.get("body") or ""),
             timestamp=str(data["timestamp"]),
@@ -503,7 +515,7 @@ class Memory:
                 data["repository_identity"]
             ),
             scope=normalize_scope(str(data["scope"])),
-            status=str(data.get("status") or "active"),
+            status=status,
             branch=data.get("branch"),
             commit_sha=data.get("commit_sha"),
             confidence=float(confidence) if confidence is not None else None,

@@ -218,6 +218,45 @@ fail-safe. A truncated counter above zero means "the transport lost
 bytes", not "the data was corrupt"; memories affected are simply absent
 from results rather than mis-parsed.
 
+### Transport hardening (TSC-02)
+
+The Engram HTTP tiers are **local-only**, and the transport never
+pretends to be more than it is:
+
+- **Endpoint policy.** The configured `ENGRAM_URL` (or explicit
+  `http_url`) must be an accepted loopback form: scheme `http`, no
+  userinfo, no query/fragment, and a host of exactly `127.0.0.1`, `::1`,
+  or `localhost`. Anything else — a public or arbitrary remote host,
+  lookalike names such as `127.0.0.1.example.com`, credential-bearing
+  URLs, unsupported schemes, malformed URLs — is **refused before any
+  request is sent**; the search degrades to the loopback/CLI tiers and
+  records an `engram_endpoint_rejected` retrieval diagnostic. The
+  configured value is never echoed (no credential leak). No remote
+  Engram mode is documented, so none is preserved.
+- **Response bound.** One HTTP response body is capped at 8 MiB
+  (`ENGRAM_HTTP_MAX_RESPONSE_BYTES`). A `Content-Length` larger than the
+  bound is refused before the body is read; the read itself is capped at
+  `MAX + 1` bytes so a missing, chunked, or lying header cannot smuggle
+  an oversized body through. An oversized response degrades to the next
+  tier with an `engram_response_rejected` diagnostic; partial JSON is
+  never accepted, raw response content never reaches logs or
+  diagnostics, and there is no fallback to an unbounded read. The bound
+  applies per response — legitimate multi-page retrieval (cap recovery
+  via the complete export) is unaffected.
+- **Redirects.** Every redirect is refused: Engram never legitimately
+  redirects, and following one would let a response move the transport
+  to a destination that bypassed the endpoint policy.
+- **Provenance.** `read_path` / `read_mode` reports the **observed
+  transport** (`http` / `loopback` / `cli`), never an authenticated
+  source. There is no cryptographic authentication between Relinkra and
+  Engram: a reachable endpoint proves only that something answered on
+  the configured local socket. Content is trusted exclusively after the
+  R1C policy layer re-validates each envelope (version, project id,
+  memory type, status, scope channel, repository identity, code refs);
+  forged, foreign, malformed, or channel-invisible records deliver
+  nothing even from a reachable endpoint. Real transport authentication
+  would require coordinated Engram changes and is explicitly deferred.
+
 **Writes always go through the `engram save` CLI**; loopback failures
 never affect saves. Query paging asks the store for 200 candidates and
 applies channel/type/lifecycle filtering plus the user `--limit` afterwards.

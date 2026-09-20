@@ -17,6 +17,17 @@ binary exists; when HTTP is explicitly disabled the CLI fallback still
 works, and records it could not read whole are flagged ``truncated``
 so the policy layer can account for them honestly.
 
+Transport hardening (TSC-02): the HTTP tiers are LOCAL-ONLY. Every
+request goes through a redirect-refusing opener, the configured endpoint
+must be an accepted loopback form (:func:`validate_engram_endpoint`),
+and one response body is size-bounded
+(``ENGRAM_HTTP_MAX_RESPONSE_BYTES``) so no endpoint can make Relinkra
+allocate unbounded memory. Reachability is a transport observation,
+never content provenance: a memory is trusted only after the R1C policy
+layer re-validates its envelope (version, memory type, status, project
+id, scope channel, repository identity, code refs). No cryptographic
+authentication exists between Relinkra and Engram, and none is claimed.
+
 ``InMemoryStore`` is a deterministic offline store for tests.
 """
 
@@ -52,6 +63,29 @@ ENGRAM_DATA_DIR_ENV = "ENGRAM_DATA_DIR"
 # complete `engram export` primitive instead of pretending the capped page is
 # complete.
 ENGRAM_SEARCH_CAP = 20
+
+#: Hard byte bound on ONE Engram HTTP response body (TSC-02). Engram's HTTP
+#: API answers with a JSON array capped at 20 rows (see ENGRAM_SEARCH_CAP),
+#: so legitimate pages sit orders of magnitude below this bound, while an
+#: unbounded ``resp.read()`` lets a broken or hostile endpoint make Relinkra
+#: allocate arbitrarily much memory. ``Content-Length`` is checked first when
+#: present, and the body read itself is capped at ``MAX + 1`` bytes so a
+#: missing or lying header cannot smuggle an oversized body past the bound.
+#: The bound applies per RESPONSE, never to the logical total across
+#: legitimate pagination.
+ENGRAM_HTTP_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+#: Hosts the Engram HTTP transport accepts. Engram is a LOCAL shared
+#: backend (docs/release.md, docs/memory-policy.md): the only documented
+#: network forms are the loopback default and Relinkra's own ephemeral
+#: loopback server. Public hosts, arbitrary remote hosts, and names that
+#: could resolve off-box are refused before any request is sent; the
+#: adapter then degrades to its loopback/CLI tiers.
+_ENGRAM_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: Schemes the Engram HTTP transport supports. Engram serves plain HTTP;
+#: everything else (https, ftp, file, ...) is refused as unsupported.
+_ENGRAM_ALLOWED_SCHEMES = frozenset({"http"})
 
 
 @dataclass
@@ -307,9 +341,12 @@ class _LoopbackServer:
             if process.poll() is not None:
                 return False
             try:
-                with urllib.request.urlopen(url, timeout=1.0) as response:
+                with _engram_http_open(url, timeout=1.0) as response:
                     if response.status == 200:
                         return True
+            except urllib.error.HTTPError as exc:
+                _close_http_error(exc)
+                time.sleep(0.1)
             except (OSError, urllib.error.URLError):
                 time.sleep(0.1)
         return False
@@ -486,6 +523,166 @@ def _export_query_matches(
 
 
 # ---------------------------------------------------------------------------
+# Engram HTTP transport policy (TSC-02)
+# ---------------------------------------------------------------------------
+
+
+class EngramResponseTooLargeError(Exception):
+    """One Engram HTTP response exceeded the transport byte bound.
+
+    Raised instead of returning a sentinel so the caller can record an
+    explicit, content-free diagnostic while every other transport failure
+    keeps its existing silent-fallback semantics.
+    """
+
+
+def validate_engram_endpoint(url: str) -> Optional[str]:
+    """Return a rejection reason for an Engram HTTP base URL, else ``None``.
+
+    Engram is a local shared backend: Relinkra talks to it over loopback
+    (``127.0.0.1``, ``::1``, ``localhost``) or its own ephemeral loopback
+    server, and nothing in the product documents a remote endpoint. This
+    validator therefore accepts ONLY the supported local forms and refuses
+    everything a configured ``ENGRAM_URL`` could smuggle in:
+
+    - non-loopback hosts (public or arbitrary remote, including lookalike
+      names such as ``127.0.0.1.example.com``),
+    - credential-bearing URLs (``user[:password]@`` userinfo),
+    - unsupported or malformed schemes, missing hosts, malformed ports,
+      whitespace/control characters, and query/fragment suffixes.
+
+    Validation is by literal host identity, never by DNS resolution: a
+    name that is not one of the loopback literals is refused outright, so
+    there is no validate-then-resolve window a hostile resolver could win.
+    The rejection reason is a fixed, credential-free phrase; the URL
+    itself is never echoed.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        return "empty endpoint"
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate):
+        return "malformed endpoint"
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+        host = parts.hostname
+        parts.port  # raises ValueError on a malformed/out-of-range port
+    except ValueError:
+        return "malformed endpoint"
+    if parts.scheme.lower() not in _ENGRAM_ALLOWED_SCHEMES:
+        return "unsupported scheme"
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        return "credential-bearing endpoint"
+    if parts.query or parts.fragment:
+        return "endpoint carries query or fragment"
+    if not host:
+        return "missing host"
+    if host.lower() not in _ENGRAM_LOOPBACK_HOSTS:
+        return "non-loopback host"
+    return None
+
+
+def _read_bounded_response_body(
+    response, max_bytes: int = ENGRAM_HTTP_MAX_RESPONSE_BYTES
+) -> bytes:
+    """Read one HTTP response body without materializing more than
+    ``max_bytes`` bytes.
+
+    Two independent guards, because neither alone is sufficient:
+
+    1. A ``Content-Length`` header that parses to an integer larger than
+       ``max_bytes`` refuses the response BEFORE any body byte is read —
+       no allocation and no wait for a body already known to be
+       oversized.
+    2. The body read itself is capped at ``max_bytes + 1`` bytes. A
+       missing header, a chunked body, or a header that lies small cannot
+       exceed the bound: the extra sentinel byte proves overflow and the
+       whole response is refused. Partial JSON is never handed to the
+       parser, and there is no fallback to an unbounded read.
+
+    Raises :class:`EngramResponseTooLargeError` for an oversized response;
+    a body that is not bytes raises ``ValueError``. ``urllib`` does not
+    transparently decompress, so the bound applies to exactly the bytes
+    Relinkra materializes.
+    """
+    declared = None
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            declared = headers.get("Content-Length")
+        except Exception:  # pragma: no cover - defensive header access
+            declared = None
+    if declared is not None:
+        try:
+            declared_bytes = int(str(declared).strip())
+        except (TypeError, ValueError):
+            declared_bytes = None
+        if declared_bytes is not None and declared_bytes > max_bytes:
+            raise EngramResponseTooLargeError(
+                "engram HTTP response declares an oversized body"
+            )
+    body = response.read(max_bytes + 1)
+    if not isinstance(body, (bytes, bytearray)):
+        raise ValueError("engram HTTP response body is not bytes")
+    if len(body) > max_bytes:
+        raise EngramResponseTooLargeError(
+            "engram HTTP response body exceeds the transport bound"
+        )
+    return bytes(body)
+
+
+class _EngramNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every HTTP redirect on the Engram transport.
+
+    Engram answers one local JSON API and never legitimately redirects.
+    Following one would let the response decide where Relinkra sends the
+    next request — exactly how a loopback endpoint could bypass the
+    loopback-only endpoint policy. The refusal surfaces as an ordinary
+    transport failure and degrades to the next read tier; redirect
+    support is deliberately NOT added.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Close the redirect response before refusing it: its body is
+        # never read (it could be unbounded) and the socket is released
+        # deterministically instead of at GC time. A plain URLError is
+        # raised instead of HTTPError so no response wrapper survives the
+        # refusal.
+        if fp is not None:
+            try:
+                fp.close()
+            except OSError:
+                pass
+        raise urllib.error.URLError(
+            f"engram transport refuses HTTP redirects ({code})"
+        )
+
+
+#: One process-wide opener for every Engram HTTP request (configured
+#: endpoint and internal loopback alike): redirects are refused so no
+#: response can move the transport off the validated destination.
+_ENGRAM_OPENER = urllib.request.build_opener(_EngramNoRedirectHandler())
+
+
+def _engram_http_open(url: str, timeout: float):
+    """Open an Engram HTTP request with redirects disabled."""
+    return _ENGRAM_OPENER.open(url, timeout=timeout)
+
+
+def _close_http_error(exc: urllib.error.HTTPError) -> None:
+    """Release an HTTPError response wrapper instead of leaking it to GC.
+
+    An error-status response never contributes data; closing it here keeps
+    the transport deterministic (and warning-free under
+    ``-W error::ResourceWarning``) instead of leaving the socket to the
+    garbage collector.
+    """
+    try:
+        exc.close()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Engram CLI adapter
 # ---------------------------------------------------------------------------
 
@@ -519,6 +716,14 @@ class EngramCLIAdapter:
     Isolation is preserved: the R1C policy layer always re-filters parsed
     envelopes by the logical ``project_id``, so an aliased search can
     never leak another project's memories into a query result.
+
+    TSC-02: the HTTP transport is local-only. A configured endpoint that
+    is not an accepted loopback form is never contacted (the search
+    degrades to the loopback/CLI tiers and records an
+    ``engram_endpoint_rejected`` retrieval diagnostic), redirects are
+    refused, and every response body is size-bounded. ``read_mode``
+    reports the OBSERVED transport (http/loopback/cli) — it is not an
+    authenticated provenance claim.
     """
 
     def __init__(
@@ -912,20 +1117,47 @@ class EngramCLIAdapter:
         Serves both read tiers with identical logic and timeouts: the
         configured endpoint (default ``base_url``) or a loopback server
         over the CLI's own data dir. Returns full untruncated records.
-        Any failure (server down, timeout, bad payload) returns None so
-        the caller falls back — HTTP is strictly an optional read
-        accelerator over the same physical backend.
+
+        TSC-02: the endpoint must be an accepted LOCAL form before a
+        request is sent, redirects are refused by the shared opener, and
+        the response body is size-bounded. Any failure — endpoint
+        refused, server down, timeout, redirect, oversized body, bad
+        payload — returns None so the caller falls back; HTTP is
+        strictly an optional read accelerator over the same physical
+        backend.
         """
         base = (base_url if base_url is not None else self.http_url).rstrip("/")
         if not base:
+            return None
+        rejection = validate_engram_endpoint(base)
+        if rejection is not None:
+            # Never contact a refused endpoint: the reason is a fixed,
+            # credential-free phrase and the URL itself is not echoed.
+            self._set_retrieval_diagnostic(
+                {"code": "engram_endpoint_rejected", "reason": rejection}
+            )
             return None
         params = {"q": query, "limit": str(limit)}
         if project:
             params["project"] = project
         url = f"{base}/search?{urllib.parse.urlencode(params)}"
         try:
-            with urllib.request.urlopen(url, timeout=self.http_timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+            with _engram_http_open(url, timeout=self.http_timeout) as resp:
+                try:
+                    body = _read_bounded_response_body(resp)
+                except EngramResponseTooLargeError:
+                    self._set_retrieval_diagnostic(
+                        {
+                            "code": "engram_response_rejected",
+                            "reason": "oversized_response",
+                            "max_bytes": ENGRAM_HTTP_MAX_RESPONSE_BYTES,
+                        }
+                    )
+                    return None
+                payload = json.loads(body.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            _close_http_error(exc)
+            return None
         except (OSError, ValueError, urllib.error.URLError):
             return None
         # Engram marshals an EMPTY result set as JSON null (a nil list).
