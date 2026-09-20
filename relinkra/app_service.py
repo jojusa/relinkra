@@ -43,6 +43,7 @@ from .context_budget import (
     settle_delivered_status,
 )
 from .context_builder import (
+    WARN_PROJECT_BINDING_UNVERIFIED,
     ContextBuildError,
     ContextBuilder,
     ContextRequest,
@@ -51,6 +52,7 @@ from .context_builder import (
 from .context_packet import (
     PACKET_VERSION,
     PACKET_VERSION_V1,
+    PacketWarning,
     strip_portable_cbm_labels,
 )
 from .explainability import attach_budget, attach_relevance, explain_record
@@ -107,6 +109,15 @@ ERR_NOT_FOUND = "not_found"
 ERR_PROJECT_MISMATCH = "project_mismatch"
 ERR_UNAVAILABLE = "unavailable"
 ERR_INTERNAL = "internal_error"
+
+#: Structural binding states for the active CBM adapter, derived from the
+#: shared effective-identity resolver plus the workspace's registered CBM
+#: record. See ``RelinkraServices._structural_binding_state``.
+_BINDING_ABSENT = "absent"
+_BINDING_VERIFIED = "verified"
+_BINDING_UNVERIFIED = "unverified"
+_BINDING_INVALID = "invalid"
+_BINDING_MISMATCH = "mismatch"
 
 
 def sanitize_wire_text(text: str) -> str:
@@ -540,6 +551,143 @@ class RelinkraServices:
             f"project is not registered: {project_id}",
         )
 
+    # -- structural provenance (RIC-04) -----------------------------------
+
+    def _registered_cbm_slug(self) -> Optional[str]:
+        """The CBM project slug recorded for the bound workspace, if any.
+
+        Read-only registry lookup; never raises and never returns a path.
+        """
+        if self.registry is None:
+            return None
+        root = self.config.workspace_root or ""
+        if not root:
+            return None
+        try:
+            matches = self.registry.find_workspaces_by_canonical_path(root)
+        except (OSError, ValueError):
+            return None
+        for workspace in matches:
+            slug = str((workspace.cbm or {}).get("project_name") or "").strip()
+            if slug:
+                return slug
+        return None
+
+    def _structural_binding_state(
+        self,
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Classify what project the active CBM adapter can be verified to serve.
+
+        Returns ``(state, effective_project_id, live_project_id)``:
+
+        - ``absent``: no CBM adapter is attached; structural reads are
+          already degraded and make no evidence claim.
+        - ``verified``: a valid registration governs the bound workspace;
+          ``effective_project_id`` is the identity the adapter's evidence is
+          bound to (the live derivation stays a candidate).
+        - ``unverified``: no verified registration exists for the bound
+          workspace (no root, no registry, or an unregistered workspace), so
+          no project identity can be attested; structural reads disclose
+          that provenance is unverified instead of fabricating it.
+        - ``invalid``: the registration is ambiguous or failed integrity
+          validation; structural evidence fails closed.
+        - ``mismatch``: a valid registration exists, but the adapter
+          self-identifies with a different CBM index than the workspace's
+          registered record; its evidence cannot be attributed.
+
+        Read-only: registry and workspace state are never mutated.
+        """
+        if self.cbm_adapter is None:
+            return _BINDING_ABSENT, None, None
+        if not self.config.workspace_root:
+            # No workspace boundary exists to attest against; the adapter
+            # is an explicitly injected backend with no verifiable binding.
+            return _BINDING_UNVERIFIED, None, None
+        identity = self._effective_identity()
+        if identity.identity_state in (
+            IDENTITY_STATE_REGISTERED,
+            IDENTITY_STATE_MIGRATION_AVAILABLE,
+        ):
+            effective = identity.effective_project_id
+            if not effective:
+                return _BINDING_INVALID, None, identity.live_project_id
+            adapter_slug = str(
+                getattr(self.cbm_adapter, "cbm_project_name", "") or ""
+            ).strip()
+            recorded_slug = self._registered_cbm_slug()
+            if adapter_slug and recorded_slug and adapter_slug != recorded_slug:
+                return _BINDING_MISMATCH, effective, identity.live_project_id
+            return _BINDING_VERIFIED, effective, identity.live_project_id
+        if identity.identity_state == IDENTITY_STATE_UNKNOWN:
+            return _BINDING_INVALID, None, identity.live_project_id
+        # No valid registration for this workspace (or no registry at all):
+        # no project identity can be attested for adapter evidence, so the
+        # requested label is returned with an explicit disclosure instead
+        # of being presented as verified provenance.
+        return _BINDING_UNVERIFIED, None, identity.live_project_id
+
+    def _resolve_structural_project_id(
+        self, project_id: Optional[str]
+    ) -> tuple[str, Optional[dict]]:
+        """Resolve the project label for one CBM-backed structural call.
+
+        Explicit ids remain requests, not provenance: a caller-supplied
+        label may only be used when it matches the project identity the
+        active adapter is verifiably bound to. A different effective or
+        candidate identity is rejected before the adapter is queried, so
+        backend A's evidence can never be returned as project B's. When no
+        binding can be established, the requested label is returned with an
+        explicit unverified-provenance warning instead of a silent claim.
+
+        Returns ``(project_id, binding_warning_or_None)``.
+        """
+        requested = self._resolve_project_id(project_id)
+        state, effective, live = self._structural_binding_state()
+        if state in (_BINDING_ABSENT, _BINDING_UNVERIFIED):
+            if state == _BINDING_UNVERIFIED:
+                return requested, ServiceWarning(
+                    WARN_PROJECT_BINDING_UNVERIFIED,
+                    "the active code backend's project binding is not "
+                    "verified for this workspace; project_id is the requested "
+                    "label, not verified backend provenance",
+                ).to_dict()
+            return requested, None
+        if state == _BINDING_INVALID:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project_id cannot be verified: the workspace registration "
+                "is ambiguous or failed integrity validation; structural "
+                "code evidence cannot be attributed to a project",
+            )
+        if state == _BINDING_MISMATCH:
+            raise ServiceError(
+                ERR_PROJECT_MISMATCH,
+                "the active code backend is not bound to the registered "
+                "project of this workspace; structural code evidence cannot "
+                "be attributed to a project",
+            )
+        if effective and requested != effective:
+            message = (
+                f"requested project {requested} does not match the effective "
+                f"project {effective} bound to this workspace; structural "
+                "code evidence cannot be relabeled across projects"
+            )
+            if live and requested == live:
+                message += (
+                    "; the live Git derivation is a diagnostic candidate, not "
+                    "an authority; run 'relinkra init' to migrate explicitly"
+                )
+            raise ServiceError(ERR_PROJECT_MISMATCH, message)
+        return requested, None
+
+    @staticmethod
+    def _packet_carries_cbm_evidence(packet) -> bool:
+        """True when a built packet contains CBM-derived code evidence."""
+        for item in list(packet.code_references) + list(packet.code_facts):
+            if getattr(item.provenance, "source", "") == "cbm":
+                return True
+        return False
+
     # -- tools ------------------------------------------------------------
 
     def project_resolve(
@@ -856,6 +1004,28 @@ class RelinkraServices:
             if packet.explainability:
                 settle_packet_status(packet)
 
+        # RIC-04 disclosure: when the packet carries CBM-derived evidence
+        # but no valid registration can attest the adapter's project, say
+        # so explicitly instead of presenting the requested label as
+        # verified backend provenance. (In the verified case a mismatched
+        # request already failed closed inside the builder; the builder may
+        # already have disclosed the same condition.)
+        if self._packet_carries_cbm_evidence(packet):
+            binding_state, _, _ = self._structural_binding_state()
+            already_disclosed = any(
+                warning.code == WARN_PROJECT_BINDING_UNVERIFIED
+                for warning in packet.warnings
+            )
+            if binding_state == _BINDING_UNVERIFIED and not already_disclosed:
+                packet.warnings.append(
+                    PacketWarning(
+                        WARN_PROJECT_BINDING_UNVERIFIED,
+                        "the active code backend's project binding is not "
+                        "verified for this workspace; project_id is the "
+                        "requested label, not verified backend provenance",
+                    )
+                )
+
         # Metrics are a local, best-effort side channel.  Capture only after
         # every budget/status settlement so CPT1 values describe the exact
         # final packet, and before any portable serialization occurs.
@@ -1138,7 +1308,9 @@ class RelinkraServices:
     ) -> dict:
         """Resolve a file/symbol to a portable CodeReference via R1D."""
         auto_workspace = not bool(project_id or self.config.default_project_id)
-        project_id = self._resolve_project_id(project_id)
+        # RIC-04: the label attached to CBM-derived evidence must match the
+        # project the bound adapter actually represents.
+        project_id, binding_warning = self._resolve_structural_project_id(project_id)
         workspace_id = self._resolve_workspace_id(
             workspace_id, auto=auto_workspace
         )
@@ -1185,6 +1357,13 @@ class RelinkraServices:
         if packet.code_references:
             state = packet.code_references[0].data.get("resolution_state")
 
+        warnings = [w.to_dict() for w in packet.warnings]
+        if binding_warning is not None and not any(
+            warning["code"] == binding_warning["code"]
+            for warning in warnings
+        ):
+            warnings.append(binding_warning)
+
         return strip_portable_cbm_labels({
             "project_id": project_id,
             "focus": packet.focus,
@@ -1194,7 +1373,7 @@ class RelinkraServices:
             "linked_memories": [
                 item.to_dict() for item in packet.memories
             ],
-            "warnings": [w.to_dict() for w in packet.warnings],
+            "warnings": warnings,
             "contradictions": packet.contradictions,
             "explainability": packet.explainability,
         })
@@ -1208,7 +1387,9 @@ class RelinkraServices:
     ) -> dict:
         """Return compact optional architecture evidence, never raw CBM."""
         auto_workspace = not bool(project_id or self.config.default_project_id)
-        project_id = self._resolve_project_id(project_id)
+        # RIC-04: architecture evidence comes from the single bound adapter;
+        # its label must match the project that adapter represents.
+        project_id, binding_warning = self._resolve_structural_project_id(project_id)
         self._resolve_workspace_id(workspace_id, auto=auto_workspace)
         normalized_path = None
         if path:
@@ -1220,7 +1401,11 @@ class RelinkraServices:
             path=normalized_path, limit=min(5, ARCHITECTURE_MAX_LIMIT)
         )
         return self._structural_response(
-            project_id, result, "architecture_fact", "architecture"
+            project_id,
+            result,
+            "architecture_fact",
+            "architecture",
+            binding_warning=binding_warning,
         )
 
     def code_relationships(
@@ -1236,7 +1421,9 @@ class RelinkraServices:
     ) -> dict:
         """Return high-level callers/dependencies for one resolved symbol."""
         auto_workspace = not bool(project_id or self.config.default_project_id)
-        project_id = self._resolve_project_id(project_id)
+        # RIC-04: relationship evidence comes from the single bound adapter;
+        # its label must match the project that adapter represents.
+        project_id, binding_warning = self._resolve_structural_project_id(project_id)
         self._resolve_workspace_id(workspace_id, auto=auto_workspace)
         symbol = str(symbol or "").strip()
         if not symbol:
@@ -1279,6 +1466,7 @@ class RelinkraServices:
                 },
                 "bounded_path",
                 "relationships",
+                binding_warning=binding_warning,
             )
         target, warning = self._resolve_structural_target(symbol)
         if target is None:
@@ -1292,6 +1480,7 @@ class RelinkraServices:
                 },
                 "bounded_path",
                 "relationships",
+                binding_warning=binding_warning,
             )
         result = linkage.trace_relationships(
             function_name=target,
@@ -1301,7 +1490,11 @@ class RelinkraServices:
             include_tests=bool(include_tests),
         )
         return self._structural_response(
-            project_id, result, "bounded_path", "relationships"
+            project_id,
+            result,
+            "bounded_path",
+            "relationships",
+            binding_warning=binding_warning,
         )
 
     def _resolve_structural_target(self, symbol: str):
@@ -1340,7 +1533,12 @@ class RelinkraServices:
 
     @staticmethod
     def _structural_response(
-        project_id: str, result: dict, kind: str, label: str
+        project_id: str,
+        result: dict,
+        kind: str,
+        label: str,
+        *,
+        binding_warning: Optional[dict] = None,
     ) -> dict:
         warnings = []
         if result.get("warning"):
@@ -1349,6 +1547,8 @@ class RelinkraServices:
                     "cbm_structural_unavailable", result["warning"]
                 ).to_dict()
             )
+        if binding_warning is not None:
+            warnings.append(binding_warning)
         evidence = result.get("evidence")
         payload = {
             "project_id": project_id,

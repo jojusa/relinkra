@@ -140,6 +140,16 @@ application service at all.
   live identity is a diagnostic candidate and is never promoted, aliased,
   or relabeled without an explicit `relinkra init`. An explicit
   `project_id` is always honored verbatim and never silently replaced.
+  The one refinement is structural provenance: the CBM-backed code
+  surfaces (`code_resolve`, `code_architecture`, `code_relationships`,
+  and the code evidence inside `context_get`) attach only the project
+  identity the active code backend is verified to represent. An explicit
+  or configured id that differs from the effective project of the bound
+  workspace — including the live Git candidate under
+  `migration_available` — is rejected with `project_mismatch` before
+  backend evidence is returned, because caller-supplied labels are
+  requests, not provenance. Memory and handoff scoping keep the verbatim
+  explicit-id behavior.
 - Auto-resolution is **fail-closed**. When no effective identity governs
   the workspace — no workspace root, no registry, failed identity
   discovery, no valid registration (an unregistered repository, or a

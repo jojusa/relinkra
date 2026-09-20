@@ -183,6 +183,24 @@ Identity surfaces, all read-only:
   identity is accepted; the unregistered live candidate is rejected until
   an explicit `relinkra init`.
 
+### Structural code evidence binding (RIC-04)
+
+Caller-supplied `project_id` values are requests, not provenance. The
+structural code surfaces (`code_resolve`, `code_architecture`,
+`code_relationships`, and the CBM-derived items inside a context packet)
+return only evidence bound to the project identity the active code backend
+is verified to represent: the effective project of the bound workspace
+(`registered`/`migration_available`), corroborated against the workspace's
+recorded CBM index when both expose one. A requested id that differs —
+including the live Git candidate — is rejected with `project_mismatch`
+before backend evidence is returned. Memory-only packets keep their
+explicit-id scoping semantics. When no valid registration exists (for
+example a programmatically injected adapter with no registry), the
+response discloses `project_binding_unverified` instead of presenting the
+requested label as attestation. Nothing here selects, rebinds, or creates
+adapters: the single startup-bound backend is preserved, and an explicit
+request for another project fails rather than switching backends.
+
 ## Internal/legacy implementation detail
 
 The registry API and module-level CLI below are retained for internal and

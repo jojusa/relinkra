@@ -47,6 +47,12 @@ from .code_reference import (
     CodeReference,
     normalize_repo_path,
 )
+from .effective_identity import (
+    IDENTITY_STATE_MIGRATION_AVAILABLE,
+    IDENTITY_STATE_REGISTERED,
+    IDENTITY_STATE_UNKNOWN,
+    resolve_effective_identity,
+)
 from .context_packet import (
     PACKET_VERSION,
     PACKET_VERSION_V1,
@@ -110,6 +116,10 @@ WARN_ITEMS_OMITTED = "items_omitted"
 WARN_CONTENT_TRUNCATED = "content_truncated"
 WARN_GIT_CONFLICTS = "git_conflicts"
 WARN_GIT_UNAVAILABLE = "git_unavailable"
+#: RIC-04: the code backend's project binding could not be verified, so
+#: the packet's project_id is the requested label, not verified backend
+#: provenance.
+WARN_PROJECT_BINDING_UNVERIFIED = "project_binding_unverified"
 
 # Git-fact cap priority (quality-first, handoff Phase 18): essential repo
 # state and focused-file/anchored kinds outrank bulk listing kinds when
@@ -302,6 +312,12 @@ class ContextBuilder:
                 warnings,
                 omitted,
             )
+        )
+        # RIC-04: CBM-derived evidence is verified against the project the
+        # bound workspace actually represents before it can be attributed
+        # to the request label. See _verify_code_evidence_project_binding.
+        self._verify_code_evidence_project_binding(
+            project_id, code_ref_items, code_fact_items, warnings
         )
 
         try:
@@ -508,6 +524,126 @@ class ContextBuilder:
                     )
                 )
         return project, workspace
+
+    @staticmethod
+    def _carries_cbm_evidence(code_ref_items, code_fact_items) -> bool:
+        """True when any collected code item is CBM-derived evidence."""
+        for item in list(code_ref_items) + list(code_fact_items):
+            if getattr(item.provenance, "source", "") == "cbm":
+                return True
+        return False
+
+    def _verify_code_evidence_project_binding(
+        self, project_id: str, code_ref_items, code_fact_items, warnings
+    ) -> None:
+        """Fail closed when CBM evidence would cross a project boundary.
+
+        RIC-04: caller-supplied ``project_id`` is a request, not provenance.
+        The active CBM adapter is bound to the workspace's own code index, so
+        any CBM-derived item may carry only the project identity the bound
+        workspace is verified to represent. When a registry and a workspace
+        root are available, this re-derives that identity through the shared
+        effective-identity resolver and refuses to label the evidence with
+        anything else:
+
+        - a valid registration is authoritative; the requested id must equal
+          its effective project (the live derivation stays a diagnostic
+          candidate and is never accepted as an authority);
+        - an ambiguous or integrity-failed registration fails closed;
+        - a workspace with no valid registration cannot attest a project
+          identity, so the packet explicitly discloses that the requested
+          label is unverified instead of presenting it as attestation
+          (the implicit-resolution path already fails closed upstream);
+        - the adapter's own recorded CBM index must match the workspace's
+          registered CBM record when both expose one.
+
+        Only invoked when the build actually carries CBM evidence, so a
+        memory-only packet keeps its explicit-id scoping semantics.
+        """
+        if not self._carries_cbm_evidence(code_ref_items, code_fact_items):
+            return
+        if self.registry is None or not self.workspace_root:
+            return
+        try:
+            identity = resolve_effective_identity(
+                self.workspace_root, registry=self.registry
+            )
+        except (OSError, ValueError):
+            return
+        if identity.identity_state in (
+            IDENTITY_STATE_REGISTERED,
+            IDENTITY_STATE_MIGRATION_AVAILABLE,
+        ):
+            effective = identity.effective_project_id
+            if effective and project_id != effective:
+                raise ContextBuildError(
+                    "requested project "
+                    f"{project_id} does not match the effective project "
+                    f"{effective} bound to this workspace; structural code "
+                    "evidence cannot be relabeled across projects"
+                    + (
+                        "; the live Git derivation is a diagnostic candidate, "
+                        "not an authority; run 'relinkra init' to migrate "
+                        "explicitly"
+                        if identity.live_project_id == project_id
+                        else ""
+                    ),
+                    exit_code=2,
+                )
+            self._verify_recorded_cbm_binding()
+            return
+        if identity.identity_state == IDENTITY_STATE_UNKNOWN:
+            raise ContextBuildError(
+                "project_id cannot be verified: the workspace registration "
+                "is ambiguous or failed integrity validation; structural "
+                "code evidence cannot be attributed to a project",
+                exit_code=2,
+            )
+        # No valid registration for this workspace: no project identity can
+        # be attested for the adapter's evidence, so disclose that the
+        # requested label is unverified instead of presenting it as one.
+        # (The implicit-resolution path fails closed before reaching here.)
+        message = (
+            "the active code backend's project binding is not verified for "
+            "this workspace; project_id is the requested label, not verified "
+            "backend provenance"
+        )
+        if not any(
+            warning.code == WARN_PROJECT_BINDING_UNVERIFIED
+            for warning in warnings
+        ):
+            warnings.append(
+                PacketWarning(WARN_PROJECT_BINDING_UNVERIFIED, message)
+            )
+
+    def _verify_recorded_cbm_binding(self) -> None:
+        """The adapter's CBM index must match the workspace's record.
+
+        The production adapter is certified from the workspace's registered
+        CBM record; when an injected adapter self-identifies with a
+        different CBM project, it is not the registered backend and its
+        evidence cannot be attributed to the registered project.
+        """
+        adapter_slug = str(
+            getattr(self.cbm, "cbm_project_name", "") or ""
+        ).strip()
+        if not adapter_slug:
+            return
+        try:
+            matches = self.registry.find_workspaces_by_canonical_path(
+                self.workspace_root
+            )
+        except (OSError, ValueError):
+            return
+        for workspace in matches:
+            recorded = str((workspace.cbm or {}).get("project_name") or "").strip()
+            if recorded and recorded != adapter_slug:
+                raise ContextBuildError(
+                    "the active code backend is not bound to the workspace's "
+                    "registered code index; structural code evidence cannot "
+                    "be attributed to a project",
+                    exit_code=2,
+                )
 
     @staticmethod
     def _project_facts(project, workspace, revision_snapshot=None) -> dict:
