@@ -28,11 +28,17 @@ import re
 import tempfile
 import unittest
 from copy import copy
+from pathlib import Path
 
 from relinkra.app_service import RelinkraServices, ServiceConfig
+from relinkra.effective_identity import (
+    IDENTITY_STATE_MIGRATION_AVAILABLE,
+    resolve_effective_identity,
+)
 from relinkra.engram_adapter import InMemoryStore
 from relinkra.identity import (
     LogicalProject,
+    derive_project_id,
     discover_repository_identity,
 )
 from relinkra.mcp_server import TOOLS, MCPServer
@@ -48,6 +54,7 @@ from test_mcp_server import RecordingGitService
 REMOTE_A = "https://github.com/org/repo-a.git"
 REMOTE_B = "https://github.com/org/repo-b.git"
 REMOTE_C = "https://github.com/org/repo-c.git"
+REMOTE_D = "https://github.com/org/legacy-repo.git"
 
 FIXED_NOW = "2026-02-01T00:00:00+00:00"
 
@@ -274,6 +281,159 @@ class ExplicitProjectIdTests(WorkspaceCase):
         self.assertNotEqual(payload["project_id"], self.project_id_a)
 
 
+class EffectiveIdentityDriftTests(WorkspaceCase):
+    """Section-12 regression: a valid weak registration stays effective.
+
+    The Kisouma-like scenario: a workspace is registered while it has no
+    remote (weak ``local_root`` identity) and a strong ``origin`` remote
+    appears afterwards, so the live Git derivation drifts away from the
+    registered identity. Every MCP read surface must keep routing through
+    the registered (effective) identity via the shared resolver: the live
+    derivation is a diagnostic candidate, never a binding source.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo_d = gf.make_repo(os.path.join(self.tmp.name, "repo-d"))
+        gf.commit_file(self.repo_d, "README.md", "# repo-d\n", "init")
+        # Register while weak (no remote): the persisted identity is the
+        # local_root derivation.
+        ws_d = self.registry.register_workspace(
+            self.repo_d, discover_repository_identity(self.repo_d)
+        )
+        self.project_id_d = ws_d.project_id
+        self.workspace_id_d = ws_d.workspace_id
+        # The remote appears later: the live derivation is now stronger.
+        gf.git(self.repo_d, "remote", "add", "origin", REMOTE_D)
+        self.live_project_id_d = derive_project_id(
+            discover_repository_identity(self.repo_d).value
+        )
+        self.services = self._services_for(workspace_root=self.repo_d)
+        self.server = MCPServer(self.services)
+        identity = resolve_effective_identity(
+            self.repo_d, registry=self.registry
+        )
+        self.assertEqual(
+            identity.identity_state, IDENTITY_STATE_MIGRATION_AVAILABLE
+        )
+        self.assertNotEqual(self.live_project_id_d, self.project_id_d)
+
+    def test_kisouma_like_drift_project_resolve_uses_registered_effective_identity(self):
+        payload = self.ok("project_resolve")
+        self.assertEqual(payload["project_id"], self.project_id_d)
+        self.assertEqual(payload["workspace_id"], self.workspace_id_d)
+        self.assertEqual(
+            payload["workspace"]["workspace_id"], self.workspace_id_d
+        )
+        self.assertEqual(
+            payload["repository_identity"]["value"],
+            self.registry.projects[
+                self.project_id_d
+            ].repository_identity.value,
+        )
+        self.assertNotEqual(payload["project_id"], self.live_project_id_d)
+
+    def test_kisouma_like_drift_context_get_auto_resolves_without_ids(self):
+        payload = self.ok("context_get", task="drift")
+        self.assertEqual(payload["packet"]["project_id"], self.project_id_d)
+
+    def test_live_candidate_is_not_promoted(self):
+        payload = self.ok("project_resolve")
+        self.assertNotEqual(payload["project_id"], self.live_project_id_d)
+        self.assertNotIn(
+            self.live_project_id_d, self.services.registry.projects
+        )
+        identity = resolve_effective_identity(
+            self.repo_d, registry=self.registry
+        )
+        self.assertEqual(
+            identity.identity_state, IDENTITY_STATE_MIGRATION_AVAILABLE
+        )
+
+    def test_registry_is_byte_identical_after_mcp_reads(self):
+        registry_path = Path(self.registry_path)
+        before = registry_path.read_bytes()
+        self.ok("project_resolve")
+        self.ok("context_get", task="drift")
+        self.ok("memory_search", query="drift")
+        self.ok("handoff_get")
+        self.assertEqual(registry_path.read_bytes(), before)
+        # The file is still a loadable registry, not a corrupted one.
+        self.assertIsNotNone(Registry(str(registry_path)))
+
+    def test_memory_routes_use_effective_identity(self):
+        saved = self.ok(
+            "memory_save",
+            memory_type="decision",
+            title="drift memory",
+            body="b",
+        )
+        self.assertEqual(saved["project_id"], self.project_id_d)
+        found = self.ok("memory_search", query="drift memory")
+        self.assertEqual(found["project_id"], self.project_id_d)
+        self.assertIn(
+            saved["memory_id"],
+            [m["memory_id"] for m in found["memories"]],
+        )
+        fetched = self.ok("memory_get", memory_id=saved["memory_id"])
+        self.assertEqual(fetched["project_id"], self.project_id_d)
+        self.assertTrue(fetched["found"])
+
+    def test_handoff_routes_use_effective_identity(self):
+        created = self.ok(
+            "handoff_create", source_agent="opencode", task="drift handoff"
+        )
+        self.assertEqual(created["handoff"]["project_id"], self.project_id_d)
+        listed = self.ok("handoff_get")
+        self.assertEqual(listed["project_id"], self.project_id_d)
+        self.assertIn(
+            created["handoff"]["handoff_id"],
+            [h["handoff_id"] for h in listed["handoffs"]],
+        )
+
+    def test_code_routes_use_effective_identity(self):
+        architecture = self.ok("code_architecture")
+        self.assertEqual(architecture["project_id"], self.project_id_d)
+        resolved = self.ok("code_resolve", file="README.md")
+        self.assertEqual(resolved["project_id"], self.project_id_d)
+
+    def test_git_context_uses_effective_identity(self):
+        payload = self.ok("git_context")
+        self.assertEqual(payload["project_id"], self.project_id_d)
+
+    def test_health_reports_resolved_project(self):
+        payload = self.ok("health")
+        self.assertEqual(payload["project"]["status"], "resolved")
+        self.assertEqual(payload["project"]["project_id"], self.project_id_d)
+
+    def test_explicit_effective_ids_continue_to_work(self):
+        context = self.ok(
+            "context_get",
+            project_id=self.project_id_d,
+            workspace_id=self.workspace_id_d,
+            task="drift",
+        )
+        self.assertEqual(context["packet"]["project_id"], self.project_id_d)
+        memories = self.ok(
+            "memory_search",
+            project_id=self.project_id_d,
+            workspace_id=self.workspace_id_d,
+            query="drift",
+        )
+        self.assertEqual(memories["project_id"], self.project_id_d)
+
+    def test_explicit_live_candidate_id_is_rejected(self):
+        error = self.err(
+            "memory_save",
+            project_id=self.live_project_id_d,
+            memory_type="decision",
+            title="t",
+            body="b",
+        )
+        self.assertEqual(error["code"], "not_found")
+        self.assertIn(self.live_project_id_d, error["message"])
+
+
 class FailClosedTests(WorkspaceCase):
     """D/E — unresolved or ambiguous workspaces fail closed, actionably."""
 
@@ -321,6 +481,33 @@ class FailClosedTests(WorkspaceCase):
         error = self.err("project_resolve")
         self.assertEqual(error["code"], "not_found")
         self.assertIn("multiple registered workspaces", error["message"])
+
+    def test_tampered_workspace_record_fails_closed(self):
+        """A record that fails integrity re-derivation is never trusted."""
+        self.services.registry.workspaces[
+            self.workspace_id_a
+        ].workspace_id = "ws_" + "e" * 32
+        error = self.err("context_get", task="x")
+        self.assertEqual(error["code"], "not_found")
+        self.assertIn("integrity", error["message"])
+        resolved = self.err("project_resolve")
+        self.assertEqual(resolved["code"], "not_found")
+
+    def test_copied_registration_for_another_path_fails_closed(self):
+        """A registration for other paths never covers this checkout."""
+        repo_e = gf.make_repo(os.path.join(self.tmp.name, "repo-e"))
+        gf.commit_file(repo_e, "README.md", "# repo-e\n", "init")
+        services = self._services_for(workspace_root=repo_e)
+        server = MCPServer(services)
+        result = self.call_raw("project_resolve", {}, server=server)
+        self.assertTrue(result["isError"])
+        error = result["structuredContent"]["error"]
+        self.assertEqual(error["code"], "not_found")
+        self.assertNotIn(self.project_id_a, error["message"])
+        self.assertNotIn(self.project_id_b, error["message"])
+        text = result["content"][0]["text"]
+        self.assertNotIn(self.project_id_a, text)
+        self.assertNotIn(self.project_id_b, text)
 
     def test_missing_workspace_root_fails_closed_actionably(self):
         services = self._services_for(workspace_root=None)

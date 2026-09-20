@@ -74,9 +74,16 @@ from .handoff import (
     HandoffValidationError,
     scrub_absolute_paths,
 )
-from .identity import AmbiguousIdentityError, canonicalize_path
+from .identity import AmbiguousIdentityError, LogicalProject, canonicalize_path
 from .identity import GitError as IdentityGitError
 from .identity import discover_repository_identity
+from .effective_identity import (
+    IDENTITY_STATE_MIGRATION_AVAILABLE,
+    IDENTITY_STATE_REGISTERED,
+    IDENTITY_STATE_UNKNOWN,
+    EffectiveIdentity,
+    resolve_effective_identity,
+)
 from .memory import (
     ENVELOPE_VERSION,
     MEMORY_TYPES,
@@ -338,6 +345,57 @@ class RelinkraServices:
             dirty=context.dirty,
         )
 
+    def _effective_identity(self) -> EffectiveIdentity:
+        """Effective identity of the bound workspace, via the shared resolver.
+
+        One resolver owns the registered-vs-live contract: a valid
+        persisted registration stays EFFECTIVE until an explicit
+        migration, and the live Git derivation is only ever a candidate.
+        Read-only: nothing here mutates the registry or the workspace.
+        """
+        root = self.config.workspace_root
+        if not root:
+            return EffectiveIdentity()
+        return resolve_effective_identity(root, registry=self.registry)
+
+    def _effective_project_for_workspace(
+        self, identity: EffectiveIdentity
+    ) -> Optional[LogicalProject]:
+        """The registered project governing this workspace, or None.
+
+        Only a validated registration is authoritative: `registered` and
+        `migration_available` are the two states a valid registration can
+        produce. `unregistered` deliberately yields no project even though
+        it carries a live project id — the live derivation is never
+        promoted without an explicit migration. A degenerate registry
+        where several projects share the registered identity fails closed
+        exactly as before.
+        """
+        if identity.identity_state not in (
+            IDENTITY_STATE_REGISTERED,
+            IDENTITY_STATE_MIGRATION_AVAILABLE,
+        ):
+            return None
+        project = None
+        if self.registry is not None and identity.effective_project_id:
+            project = self.registry.projects.get(identity.effective_project_id)
+        if project is None:
+            return None
+        matches = [
+            candidate
+            for candidate in self.registry.projects.values()
+            if candidate.repository_identity.value
+            == project.repository_identity.value
+        ]
+        if len(matches) > 1:
+            raise ServiceError(
+                ERR_NOT_FOUND,
+                "project_id could not be auto-resolved: "
+                f"{len(matches)} registered projects share this "
+                "repository identity; pass an explicit project_id",
+            )
+        return project
+
     def _resolve_project_id(self, project_id: Optional[str]) -> str:
         """Resolve project identity for one tool call.
 
@@ -370,11 +428,14 @@ class RelinkraServices:
     def _auto_resolve_project_id(self) -> str:
         """Derive the current project from the bound workspace context.
 
-        Uses the same discovery machinery ``project_resolve`` uses — the
-        server-owned workspace root and registry, never a caller-supplied
-        path — narrowed to a strict single-match contract: zero matches
-        and multiple matches both fail closed instead of guessing, so
-        auto-resolution can never bind another repository's identity.
+        The shared effective-identity resolver decides which project
+        governs: a valid persisted registration stays EFFECTIVE even when
+        the live Git derivation drifted (``migration_available``), and the
+        live derivation is only ever a diagnostic candidate — it is never
+        promoted without an explicit migration. The server-owned workspace
+        root and registry are the only inputs; a caller-supplied path is
+        never accepted, and zero matches and multiple matches both fail
+        closed instead of guessing.
         """
         binding_error = self._workspace_binding_error()
         if binding_error:
@@ -394,6 +455,10 @@ class RelinkraServices:
                 f"registry is unavailable{detail}; pass an explicit "
                 "project_id or call project_resolve",
             )
+        identity = self._effective_identity()
+        project = self._effective_project_for_workspace(identity)
+        if project is not None:
+            return project.project_id
         discovered, discovery_warning = self._discover_identity()
         if discovered is None:
             reason = (
@@ -407,19 +472,13 @@ class RelinkraServices:
                 f"identity discovery failed ({reason}); pass an explicit "
                 "project_id or call project_resolve",
             )
-        matches = [
-            project
-            for project in self.registry.projects.values()
-            if project.repository_identity.value == discovered.value
-        ]
-        if len(matches) == 1:
-            return matches[0].project_id
-        if len(matches) > 1:
+        if identity.identity_state == IDENTITY_STATE_UNKNOWN:
             raise ServiceError(
                 ERR_NOT_FOUND,
-                "project_id could not be auto-resolved: "
-                f"{len(matches)} registered projects share this "
-                "repository identity; pass an explicit project_id",
+                "project_id could not be auto-resolved: the workspace "
+                "registration is ambiguous or failed integrity validation; "
+                "pass an explicit project_id or call project_resolve for "
+                "diagnostics",
             )
         raise ServiceError(
             ERR_NOT_FOUND,
@@ -511,6 +570,7 @@ class RelinkraServices:
         wanted = (project_id or self.config.default_project_id or "").strip()
         project = None
         discovered = None
+        identity = None
         if wanted:
             if self.registry is not None:
                 project = self.registry.projects.get(wanted)
@@ -520,25 +580,42 @@ class RelinkraServices:
                     f"project_id is not registered: {wanted}",
                 )
         elif self.registry is not None:
-            discovered, discovery_warning = self._discover_identity()
+            _discovered, discovery_warning = self._discover_identity()
             if discovery_warning is not None:
                 warnings.append(discovery_warning)
-            if discovered is not None:
-                matches = [
-                    candidate
-                    for candidate in self.registry.projects.values()
-                    if candidate.repository_identity.value == discovered.value
-                ]
+            # The shared effective-identity resolver decides which project
+            # governs. A valid registration stays effective even when the
+            # live Git derivation drifted; the live derivation is never a
+            # binding source.
+            identity = self._effective_identity()
+            project = self._effective_project_for_workspace(identity)
+
+        if project is None:
+            if (
+                self.registry is not None
+                and not (workspace_id or self.config.default_workspace_id)
+            ):
+                matches = self.registry.find_workspaces_by_canonical_path(
+                    self.config.workspace_root or ""
+                )
                 if len(matches) > 1:
                     raise ServiceError(
                         ERR_NOT_FOUND,
-                        "project_id could not be auto-resolved: "
-                        f"{len(matches)} registered projects share this "
-                        "repository identity; pass an explicit project_id",
+                        "workspace_id could not be auto-resolved: multiple "
+                        "registered workspaces have the active canonical "
+                        "root; pass an explicit workspace_id",
                     )
-                project = matches[0] if matches else None
-
-        if project is None:
+            if (
+                identity is not None
+                and identity.identity_state == IDENTITY_STATE_UNKNOWN
+            ):
+                raise ServiceError(
+                    ERR_NOT_FOUND,
+                    "no registered project resolved: the workspace "
+                    "registration is ambiguous or failed integrity "
+                    "validation; pass an explicit project_id or re-register "
+                    "this workspace",
+                )
             raise ServiceError(
                 ERR_NOT_FOUND,
                 "no registered project resolved; register a workspace first",

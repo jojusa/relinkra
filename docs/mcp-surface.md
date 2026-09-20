@@ -132,13 +132,18 @@ application service at all.
   back to the server's configured defaults (`--project-id` /
   `--workspace-id`). When `project_id` is omitted and no default is
   configured, project-scoped tools **auto-resolve** the current project
-  deterministically from the bound workspace root and registry — the same
-  discovery `project_resolve` performs, narrowed to a strict single-match
-  contract. An explicit `project_id` is always honored verbatim and never
-  silently replaced.
-- Auto-resolution is **fail-closed**. When the workspace cannot be
-  matched to exactly one registered project — no workspace root, no
-  registry, failed identity discovery, an unregistered repository, or a
+  deterministically from the bound workspace root and registry through
+  the shared effective-identity resolver
+  (`relinkra/effective_identity.py`) — the same contract
+  `project_resolve` reports. A valid registration stays **effective**
+  even when the live Git derivation drifted (`migration_available`): the
+  live identity is a diagnostic candidate and is never promoted, aliased,
+  or relabeled without an explicit `relinkra init`. An explicit
+  `project_id` is always honored verbatim and never silently replaced.
+- Auto-resolution is **fail-closed**. When no effective identity governs
+  the workspace — no workspace root, no registry, failed identity
+  discovery, no valid registration (an unregistered repository, or a
+  registration that is ambiguous or fails integrity validation), or a
   degenerate registry where several projects share one identity — the
   call returns a typed `not_found` error whose message names the remedy:
   initialize/register the workspace (`relinkra init`), pass an explicit

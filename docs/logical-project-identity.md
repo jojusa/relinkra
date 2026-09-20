@@ -149,7 +149,7 @@ registration and the live remote. The contract is:
   `unregistered` (no valid registration), or `unknown` (unresolvable or
   ambiguous, fail closed). One shared resolver
   (`relinkra/effective_identity.py`) owns these semantics for the viewer,
-  doctor, metrics, and the CLI.
+  doctor, metrics, the CLI, and the MCP surface.
 - **The explicit transition is `relinkra init`.** It derives the strong
   identity, appends the new project/workspace, and rewrites the config
   while preserving the old registry records. Nothing migrates
