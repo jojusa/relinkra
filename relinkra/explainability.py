@@ -14,6 +14,7 @@ from .freshness import (
     evaluate_freshness,
     normalize_git_revision,
 )
+from .memory import display_memory_id
 from .salience import attach_salience
 
 
@@ -27,6 +28,13 @@ _SECTIONS = (
     "handoffs",
     "git_facts",
 )
+
+#: Sections whose packet source id is a shape-validated code/git identifier
+#: (``ref_`` shape or the fixed fact-kind vocabulary) rather than a stored
+#: ``memory_id``.  M5B flattens only the memory path when rendering Markdown,
+#: mirroring the split already used for the ContextPacket provenance key, so
+#: code identifiers stay byte-identical.
+_CODE_ID_SECTIONS = ("code_references", "code_facts", "git_facts")
 
 
 def _json_mapping(value: Any) -> dict:
@@ -841,11 +849,23 @@ def human_summary(packet: Any) -> str:
             reasons = selection.get("reasons") or [
                 item.provenance.why_included or "selected by context policy"
             ]
-            lines.append(f"- {source_id(section, item) or section}: {reasons[0]}")
+            # M5B: a memory_id is source-authoritative identity but untrusted
+            # DISPLAY data, so the Markdown form is flattened to one line and
+            # a hostile raw id cannot start a column-0 heading here (this is
+            # the same boundary ContextPacket.to_markdown enforces).
+            identifier = source_id(section, item)
+            if identifier and section not in _CODE_ID_SECTIONS:
+                identifier = display_memory_id(identifier)
+            lines.append(f"- {identifier or section}: {reasons[0]}")
     lines.extend(["", "## Freshness warnings", ""])
     if notices:
         for notice in notices:
-            ref = notice.get("evidence_ref") or "unknown evidence"
+            # M5B: an evidence_ref embeds the source id
+            # (``section:<id>:<occurrence>``); flatten the rendered form so
+            # a hostile raw memory_id cannot break out of this line.
+            ref = display_memory_id(
+                notice.get("evidence_ref") or "unknown evidence"
+            )
             state = notice.get("state") or "unknown"
             reason = notice.get("reason_code") or "freshness warning"
             action = notice.get("recommended_action") or (
@@ -859,10 +879,17 @@ def human_summary(packet: Any) -> str:
     lines.extend(["", "## Conflicts", ""])
     if packet.contradictions:
         for contradiction in packet.contradictions:
-            subject = contradiction.get("subject") or "unknown subject"
+            # M5B: subject and evidence refs can carry a stored memory_id;
+            # flatten them so a hostile raw id stays inside this one line.
+            subject = display_memory_id(
+                contradiction.get("subject") or "unknown subject"
+            )
             key = contradiction.get("key") or "unknown fact"
             sources = ", ".join(contradiction.get("source_systems") or [])
-            refs = ", ".join(contradiction.get("evidence_refs") or [])
+            refs = ", ".join(
+                display_memory_id(ref)
+                for ref in (contradiction.get("evidence_refs") or [])
+            )
             action = contradiction.get("recommended_action") or (
                 "Inspect the referenced sources and resolve the conflict."
             )

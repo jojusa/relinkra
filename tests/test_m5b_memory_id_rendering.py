@@ -35,7 +35,12 @@ import json
 import unittest
 
 from relinkra.app_service import RelinkraServices, ServiceConfig
-from relinkra.context_packet import ContextPacket
+from relinkra.context_packet import ContextPacket, PacketItem, Provenance
+from relinkra.explainability import (
+    explanation_document,
+    human_summary,
+    source_id,
+)
 from relinkra.memory import (
     ENGRAM_SCOPE,
     ENVELOPE_VERSION,
@@ -134,6 +139,27 @@ def untrusted_headings(markdown):
         line
         for line in markdown.splitlines()
         if line.startswith("#") and line not in TRUSTED_HEADINGS
+    ]
+
+
+# The trusted heading grammar of ``explainability.human_summary`` — the
+# second Markdown renderer over the same packet, reached through
+# ``relinkra context --explain --format markdown``.
+TRUSTED_EXPLAIN_HEADINGS = {
+    "# RELINKRA CONTEXT EXPLANATION",
+    "## Why selected",
+    "## Freshness warnings",
+    "## Conflicts",
+    "## What to verify",
+}
+
+
+def untrusted_explain_headings(markdown):
+    """Any rendered heading outside the trusted human_summary grammar."""
+    return [
+        line
+        for line in markdown.splitlines()
+        if line.startswith("#") and line not in TRUSTED_EXPLAIN_HEADINGS
     ]
 
 
@@ -593,6 +619,164 @@ class TestExplainabilityRenderingBoundary(unittest.TestCase):
             packet.contradictions[0]["evidence_refs"][0],
             f"memories:{HOSTILE_ID}:0",
         )
+
+
+class TestHumanSummaryRenderingBoundary(unittest.TestCase):
+    """The ``--explain --format markdown`` surface is inert too.
+
+    ``explainability.human_summary`` is a SECOND Markdown renderer over the
+    same packet.  It renders ``source_id`` (the stored memory_id for memory
+    sections), notice ``evidence_ref`` and contradiction
+    ``subject``/``evidence_refs`` — all of which carry the raw id verbatim
+    in packet data.  M5B hardens the rendering, never the stored value.
+    """
+
+    def _packet(self, **overrides):
+        contradiction = {
+            "type": "identity_conflict",
+            "subject": HOSTILE_ID,
+            "key": "workspace_id",
+            "source_systems": ["engram", "engram"],
+            "evidence_refs": [
+                f"memories:{HOSTILE_ID}:0",
+                f"memories:{HOSTILE_ID}:1",
+            ],
+            "recommended_action": "Inspect the referenced sources.",
+        }
+        memory_item = PacketItem(
+            data={
+                "memory_id": HOSTILE_ID,
+                "title": "m5b summary repro",
+                "memory_type": "bug",
+            },
+            provenance=Provenance(
+                source="engram",
+                why_included="baseline active bug (shared channel)",
+                memory_id=HOSTILE_ID,
+            ),
+            explain={
+                "freshness": {"state": "fresh"},
+                "selection": {"reasons": ["baseline active bug (shared channel)"]},
+            },
+        )
+        fields = {
+            "packet_id": "pkt_" + "0" * 32,
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "mode": "project",
+            "project_id": PID,
+            "memories": [memory_item],
+            "contradictions": [contradiction],
+            "explainability": {
+                "version": "r4d-v1",
+                "notices": [
+                    {
+                        "evidence_ref": f"memories:{HOSTILE_ID}:0",
+                        "state": "fresh",
+                        "reason_code": "freshness warning",
+                        "recommended_action": "Inspect the referenced source.",
+                    }
+                ],
+            },
+        }
+        fields.update(overrides)
+        return ContextPacket(**fields)
+
+    def test_human_summary_is_structurally_inert(self):
+        text = human_summary(self._packet())
+        self.assertEqual(structural_breakouts(text), [])
+        self.assertEqual(untrusted_explain_headings(text), [])
+        self.assertNotIn(HOSTILE_ID, text)
+
+    def test_every_id_bearing_line_is_flattened_in_place(self):
+        text = human_summary(self._packet())
+        # Why selected — source_id path.
+        self.assertIn(
+            "- safe-part ## FORGED VIA ID: baseline active bug (shared channel)",
+            text,
+        )
+        # Freshness warnings — notice evidence_ref path.
+        self.assertIn(
+            "- memories:safe-part ## FORGED VIA ID:0 is fresh (freshness"
+            " warning). Recommended action: Inspect the referenced source.",
+            text,
+        )
+        # Conflicts — subject plus every evidence ref.
+        self.assertIn(
+            "- safe-part ## FORGED VIA ID.workspace_id conflicts across"
+            " sources engram, engram (evidence: memories:safe-part"
+            " ## FORGED VIA ID:0, memories:safe-part ## FORGED VIA ID:1)."
+            " Recommended action: Inspect the referenced sources.",
+            text,
+        )
+
+    def test_summary_rendering_does_not_rewrite_identity(self):
+        packet = self._packet()
+        human_summary(packet)
+        # Contradiction data keeps the exact raw id.
+        self.assertEqual(packet.contradictions[0]["subject"], HOSTILE_ID)
+        self.assertEqual(
+            packet.contradictions[0]["evidence_refs"][0],
+            f"memories:{HOSTILE_ID}:0",
+        )
+        # The semantic source id — and the machine JSON sidecar — keep it too.
+        self.assertEqual(source_id("memories", packet.memories[0]), HOSTILE_ID)
+        document = explanation_document(packet)
+        self.assertEqual(document["items"][0]["source_id"], HOSTILE_ID)
+
+    def test_single_line_ids_render_unchanged_in_human_summary(self):
+        for single_line in ("mem_" + "a" * 16, "legacy-id-1"):
+            with self.subTest(memory_id=single_line):
+                item = PacketItem(
+                    data={"memory_id": single_line, "memory_type": "decision"},
+                    provenance=Provenance(
+                        source="engram",
+                        why_included="baseline active decision",
+                        memory_id=single_line,
+                    ),
+                    explain={"selection": {"reasons": ["baseline active decision"]}},
+                )
+                text = human_summary(self._packet(memories=[item]))
+                self.assertIn(f"- {single_line}: baseline active decision", text)
+                self.assertEqual(untrusted_explain_headings(text), [])
+
+    def test_code_source_ids_stay_byte_identical(self):
+        # Only the memory path is flattened; a shape-validated ref_ id must
+        # render exactly as before (same split as the packet provenance key).
+        code_id = "ref_" + "3" * 32
+        item = PacketItem(
+            data={"code_reference_id": code_id, "kind": "symbol"},
+            provenance=Provenance(
+                source="cbm",
+                why_included="focused symbol (mode=project)",
+                code_reference_id=code_id,
+            ),
+            explain={"selection": {"reasons": ["focused symbol (mode=project)"]}},
+        )
+        packet = self._packet(memories=[], code_references=[item])
+        self.assertIn(
+            f"- {code_id}: focused symbol (mode=project)",
+            human_summary(packet),
+        )
+
+
+class TestHumanSummaryEndToEnd(unittest.TestCase):
+    """Raw store -> builder -> human_summary, exactly as the CLI renders it."""
+
+    def test_raw_planted_hostile_id_renders_inertly(self):
+        env = Env(seed=False)
+        self.addCleanup(env.cleanup)
+        plant_raw(env, HOSTILE_ID, title="m5b summary e2e")
+        packet = env.builder().build(env.request(include_explain=True))
+        text = human_summary(packet)
+        self.assertEqual(structural_breakouts(text), [])
+        self.assertEqual(untrusted_explain_headings(text), [])
+        self.assertNotIn(HOSTILE_ID, text)
+        # The id is still addressable and unrewritten after rendering.
+        got = env.service.get(
+            project_id=env.project_id, memory_id=HOSTILE_ID
+        )
+        self.assertIsNotNone(got)
+        self.assertEqual(got.memory_id, HOSTILE_ID)
 
 
 if __name__ == "__main__":  # pragma: no cover
