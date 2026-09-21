@@ -459,6 +459,11 @@ def _install_condition_detail(resolution) -> str:
             f"an installed distribution{shaped} is also visible to this "
             "interpreter, but the import resolved to the checkout"
         ),
+        install_resolution.CONDITION_EDITABLE_MISMATCH: (
+            "installation metadata declares an editable install, but the "
+            "imported package does not come from the editable target that "
+            "metadata names"
+        ),
         install_resolution.CONDITION_AMBIGUOUS: (
             "this interpreter did not disclose its library directories, so "
             "the origin of the running code cannot be classified"
@@ -510,6 +515,25 @@ def _install_condition_action(resolution) -> str:
             "Run the installed console script from an unrelated directory "
             "to verify the installed artifact instead of the checkout."
         )
+    if primary == install_resolution.CONDITION_EDITABLE_MISMATCH:
+        if resolution.pythonpath_contributes_imported:
+            return (
+                "PYTHONPATH points at the checkout that actually imported, "
+                "not at the editable target. Clear it, or reinstall editable "
+                "from the checkout you intend to verify with "
+                "'python -m pip install -e .'."
+            )
+        if resolution.pythonpath_set:
+            return (
+                "PYTHONPATH is set and the imported package is still not the "
+                "editable target; clear it, or reinstall editable from the "
+                "checkout you intend to verify."
+            )
+        return (
+            "The imported package is not the editable target; reinstall "
+            "editable from the checkout you intend to verify with "
+            "'python -m pip install -e .'."
+        )
     if primary == install_resolution.CONDITION_AMBIGUOUS:
         return (
             "Run 'relinkra version --paths' and include its output in a "
@@ -526,10 +550,11 @@ def check_install_resolution(resolution=None) -> Check:
     rather than a soft option. Every state this check can observe leaves
     the engine itself working; what is degraded is either reachability (a
     console script no PATH entry reaches) or verification honesty (a
-    checkout winning the import race against a real install). The
-    documented contract — a WARN never changes the exit code — is exactly
-    the right severity for a diagnostic that must not turn "your
-    environment is unusual" into "Relinkra is broken".
+    checkout winning the import race against a real install, or an
+    editable installation whose configured target is not the code that
+    actually imported). The documented contract — a WARN never changes the
+    exit code — is exactly the right severity for a diagnostic that must
+    not turn "your environment is unusual" into "Relinkra is broken".
 
     Nothing here mutates PATH, PYTHONPATH, a shell profile, an
     environment variable, an installed package, or a process.

@@ -9,6 +9,13 @@ B. SOURCE-TREE SHADOWING. The repository checkout wins the import race
    against an installed distribution, so a verification the operator
    believes is testing the installed artifact is really testing source.
 
+M7B adds a third, sharper variant the independent review found reachable:
+an editable installation whose PEP 610 metadata names checkout A, while
+the import actually resolved to a different checkout B, with ``PYTHONPATH``
+contributing B. Editable metadata proves the CONFIGURED target; it never
+proves what imported, so that state must not be reported as a healthy
+editable installation.
+
 Every test here is deterministic and hermetic. The classification matrix
 injects its facts, so it never depends on the developer machine's real
 ``PATH``, its real site-packages, or an installed Relinkra. The probing
@@ -30,6 +37,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Optional
 from unittest import mock
 
 from relinkra import install_resolution as ir
@@ -42,6 +50,11 @@ from relinkra.product_cli import (
     check_install_resolution,
 )
 
+try:
+    from tests import git_fixtures as gf
+except ImportError:  # pragma: no cover - discover vs module invocation
+    import git_fixtures as gf
+
 #: Synthetic interpreter layout. Never the developer's real one, and
 #: deliberately free of any home-directory prefix that the CI hygiene
 #: audit would flag as a leaked machine path.
@@ -52,21 +65,46 @@ OTHER_SCRIPTS_DIR = "D:/other/tools/Scripts"
 CHECKOUT = "C:/work/relinkra"
 INSTALLED_ROOT = LIB_DIR + "/relinkra"
 
+#: The M7B state: the editable install configures one checkout while the
+#: import resolves to a sibling that shares only a name prefix.
+CHECKOUT_A = "C:/work/relinkra-editable"
+CHECKOUT_B = "C:/work/relinkra-shadow"
+
 #: A module file inside the package, which is what an import reports.
 CHECKOUT_FILE = CHECKOUT + "/relinkra/__init__.py"
 INSTALLED_FILE = INSTALLED_ROOT + "/__init__.py"
+FOREIGN_FILE = CHECKOUT_B + "/relinkra/__init__.py"
+
+#: Distinguishes "no target supplied" from an explicit ``None``, so a
+#: test can build the malformed-in-the-wild record that says editable
+#: without naming any target.
+_UNSET_TARGET = object()
 
 
 def installed_metadata(
     lib_dir: str = LIB_DIR,
     version: str = "0.1.4",
     editable: bool = False,
+    editable_target: Any = _UNSET_TARGET,
 ) -> ir.LibMetadata:
-    """Metadata as the library-directory probe would report it."""
+    """Metadata as the library-directory probe would report it.
+
+    A real PEP 610 editable record names the checkout it configures, so
+    an editable record built here carries ``CHECKOUT`` as its target by
+    default. Tests override the target to build a mismatch, or pass
+    ``None`` for the record that is not promoted at all.
+    """
+    if not editable:
+        target: Optional[str] = None
+    elif editable_target is _UNSET_TARGET:
+        target = CHECKOUT
+    else:
+        target = editable_target
     return ir.LibMetadata(
         lib_dir=lib_dir,
         kind=ir.SHAPE_DIST_INFO,
         editable=editable,
+        editable_target=target,
         version=version,
         metadata_dir=f"{lib_dir}/relinkra-{version}.dist-info",
     )
@@ -112,6 +150,23 @@ def classify(**kwargs) -> ir.InstallResolution:
 def resolved_at(directory: str, name: str = "relinkra"):
     """A ``which`` stub that resolves a console script into ``directory``."""
     return lambda candidate: f"{directory}/{name}.exe"
+
+
+def mismatch_resolution() -> ir.InstallResolution:
+    """The reviewer's compound state, injected and deterministic.
+
+    Editable metadata names checkout A, the import resolved to checkout B,
+    and PYTHONPATH contributes B.
+    """
+    return classify(
+        imported_file=FOREIGN_FILE,
+        lib_metadata=(
+            installed_metadata(editable=True, editable_target=CHECKOUT_A),
+        ),
+        expected_script_present=True,
+        which=resolved_at(SCRIPTS_DIR),
+        environ={"PYTHONPATH": CHECKOUT_B, "PATH": SCRIPTS_DIR},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +278,436 @@ class ExecutionModeTests(unittest.TestCase):
                 ir.RUNNING_AMBIGUOUS,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Editable target vs import origin (M7B cases A-C)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDistribution:
+    """The ``importlib.metadata`` record, reduced to what gather reads."""
+
+    def __init__(
+        self,
+        direct_url: Optional[str],
+        path: str = LIB_DIR,
+    ):
+        self.version = "0.1.4"
+        self.files = ["relinkra-0.1.4.dist-info/METADATA"]
+        self._path = path + "/relinkra-0.1.4.dist-info"
+        self._direct_url = direct_url
+
+    def read_text(self, name):
+        if name == "direct_url.json" and self._direct_url is not None:
+            return self._direct_url
+        raise FileNotFoundError(name)
+
+    def locate_file(self, path):
+        return Path(LIB_DIR)
+
+
+def _editable_document(target: str, editable: bool = True) -> str:
+    return json.dumps(
+        {"url": target, "dir_info": {"editable": editable}}
+    )
+
+
+class EditableTargetTests(unittest.TestCase):
+    """PEP 610 names the configured target; the import origin is separate.
+
+    An editable claim is healthy only while the imported package root sits
+    inside the checkout that metadata names. When it does not, the state
+    is a source checkout carrying an explicit mismatch condition — never a
+    healthy editable installation, because that would invent provenance.
+    """
+
+    def test_a_editable_target_matching_the_imported_root_is_unchanged(self):
+        resolution = classify(
+            lib_metadata=(installed_metadata(editable=True),),
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+        self.assertEqual(resolution.conditions, ())
+        self.assertTrue(resolution.editable_evidence)
+
+    def test_a2_the_package_root_equal_to_the_target_is_inside_it(self):
+        # The module-file convention makes the root two levels up, so the
+        # equality branch is exercised with evidence built directly: a
+        # package root that IS the checkout still belongs to it.
+        resolution = ir.classify_install(
+            ir.InstallEvidence(
+                imported_root=CHECKOUT,
+                interpreter="C:/py/python.exe",
+                interpreter_version="3.14.6",
+                lib_dirs=(LIB_DIR,),
+                lib_metadata=(
+                    installed_metadata(editable=True, editable_target=CHECKOUT),
+                ),
+                cwd="C:/tmp",
+            )
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_b_pythonpath_shadow_of_an_editable_target_is_not_healthy(self):
+        """The reviewer's compound state, injected and deterministic."""
+        resolution = classify(
+            imported_file=FOREIGN_FILE,
+            lib_metadata=(
+                installed_metadata(editable=True, editable_target=CHECKOUT_A),
+            ),
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PYTHONPATH": CHECKOUT_B, "PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertNotEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+        self.assertEqual(
+            resolution.conditions, (ir.CONDITION_EDITABLE_MISMATCH,)
+        )
+        self.assertEqual(
+            resolution.primary_condition, ir.CONDITION_EDITABLE_MISMATCH
+        )
+        self.assertTrue(resolution.pythonpath_contributes_imported)
+        # The metadata still declares an editable install for this
+        # interpreter; what it must not do is describe the imported code.
+        self.assertTrue(resolution.editable_evidence)
+
+    def test_c_mismatch_without_pythonpath_contribution_is_still_not_editable(self):
+        resolution = classify(
+            imported_file=FOREIGN_FILE,
+            lib_metadata=(
+                installed_metadata(editable=True, editable_target=CHECKOUT_A),
+            ),
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PYTHONPATH": "D:/unrelated", "PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertIn(ir.CONDITION_EDITABLE_MISMATCH, resolution.conditions)
+        self.assertTrue(resolution.pythonpath_set)
+        self.assertFalse(resolution.pythonpath_contributes_imported)
+
+    def test_c2_a_mismatch_with_no_pythonpath_at_all_is_still_reported(self):
+        resolution = classify(
+            imported_file=FOREIGN_FILE,
+            lib_metadata=(
+                installed_metadata(editable=True, editable_target=CHECKOUT_A),
+            ),
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertIn(ir.CONDITION_EDITABLE_MISMATCH, resolution.conditions)
+        self.assertFalse(resolution.pythonpath_set)
+
+    def test_the_importlib_record_alone_can_establish_the_mismatch(self):
+        """No probe hit: the distribution record is evidence too."""
+        document = _FakeDistribution(
+            _editable_document(Path(CHECKOUT_A).as_uri())
+        )
+        resolution = classify(
+            imported_file=FOREIGN_FILE,
+            lib_metadata=(),
+            distribution_lookup=lambda name: document,
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PYTHONPATH": CHECKOUT_B, "PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertEqual(
+            resolution.conditions, (ir.CONDITION_EDITABLE_MISMATCH,)
+        )
+
+    def test_the_importlib_record_with_a_matching_target_is_editable(self):
+        document = _FakeDistribution(
+            _editable_document(Path(CHECKOUT).as_uri())
+        )
+        resolution = classify(
+            lib_metadata=(),
+            distribution_lookup=lambda name: document,
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_one_matching_target_among_several_is_enough(self):
+        resolution = classify(
+            lib_metadata=(
+                installed_metadata(
+                    editable=True, editable_target=CHECKOUT_A
+                ),
+                installed_metadata(
+                    lib_dir="D:/py/user/Lib/site-packages",
+                    editable=True,
+                    editable_target=CHECKOUT,
+                ),
+            ),
+            expected_script_present=True,
+            which=resolved_at(SCRIPTS_DIR),
+            environ={"PATH": SCRIPTS_DIR},
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_a_sibling_checkout_sharing_a_name_prefix_is_not_inside(self):
+        # relinkra-shadow must never be read as a child of relinkra.
+        self.assertFalse(ir._within(CHECKOUT_B + "/relinkra", CHECKOUT))
+        self.assertFalse(ir._within("C:/work/relinkra2", CHECKOUT))
+
+    def test_the_shadow_condition_is_not_double_reported_on_a_mismatch(self):
+        # A mismatch is its own condition; folding it into
+        # source_shadows_installed would name two causes for one state.
+        resolution = classify(
+            imported_file=FOREIGN_FILE,
+            lib_metadata=(
+                installed_metadata(editable=True, editable_target=CHECKOUT_A),
+            ),
+            environ={"PYTHONPATH": CHECKOUT_B},
+        )
+        self.assertNotIn(ir.CONDITION_SHADOWED, resolution.conditions)
+
+    def test_a_targetless_editable_record_is_not_promoted(self):
+        # PEP 610 requires the url; without it there is nothing to compare,
+        # so the record is not authority and the state stays a checkout.
+        resolution = classify(
+            lib_metadata=(
+                installed_metadata(editable=True, editable_target=None),
+            ),
+            environ={"PYTHONPATH": CHECKOUT_B},
+            imported_file=FOREIGN_FILE,
+        )
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertFalse(resolution.editable_evidence)
+        self.assertNotIn(ir.CONDITION_EDITABLE_MISMATCH, resolution.conditions)
+        self.assertIn(ir.CONDITION_SHADOWED, resolution.conditions)
+
+    def test_editable_target_count_is_bounded(self):
+        flood = tuple(
+            installed_metadata(
+                lib_dir=f"C:/lib{index}",
+                editable=True,
+                editable_target=f"C:/work/target{index}",
+            )
+            for index in range(ir.MAX_EDITABLE_TARGETS + 6)
+        )
+        resolution = classify(lib_metadata=flood)
+        # Bounded work, and none of the flooded targets contains the
+        # imported root, so the honest answer is still a mismatch.
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertIn(ir.CONDITION_EDITABLE_MISMATCH, resolution.conditions)
+
+
+class DirectUrlParsingTests(unittest.TestCase):
+    """PEP 610 parsing: fail-honest, and target-aware (cases D-H)."""
+
+    def test_a_file_url_yields_its_local_target(self):
+        self.assertEqual(
+            ir._local_target_from_url("file:///C:/work/relinkra"),
+            "C:/work/relinkra",
+        )
+        self.assertEqual(
+            ir._local_target_from_url("file:///home/user/relinkra"),
+            "/home/user/relinkra",
+        )
+
+    def test_e_percent_escapes_are_decoded(self):
+        self.assertEqual(
+            ir._local_target_from_url("file:///C:/work/my%20project"),
+            "C:/work/my project",
+        )
+
+    def test_f_percent_encoded_unicode_is_decoded(self):
+        self.assertEqual(
+            ir._local_target_from_url(
+                "file:///home/user/%D0%94%D0%BE%D0%BA%D1%83%D0%BC%D0%B5%D0%BD%D1%82%D1%8B"
+            ),
+            "/home/user/Документы",
+        )
+
+    def test_a_bare_local_path_is_accepted_when_it_is_absolute(self):
+        self.assertEqual(
+            ir._local_target_from_url("C:/work/relinkra"),
+            "C:/work/relinkra",
+        )
+        self.assertEqual(
+            ir._local_target_from_url("\\\\server\\share\\relinkra"),
+            "\\\\server\\share\\relinkra",
+        )
+        self.assertEqual(
+            ir._local_target_from_url("/home/user/relinkra"),
+            "/home/user/relinkra",
+        )
+
+    def test_remote_and_relative_targets_are_not_authority(self):
+        for url in (
+            "https://example.invalid/relinkra",
+            "git+https://example.invalid/relinkra.git",
+            "file:relative/relinkra",
+            "relative/relinkra",
+            "",
+            None,
+            7,
+        ):
+            self.assertIsNone(ir._local_target_from_url(url), url)
+
+    def test_d_editable_without_a_usable_target_is_not_promoted(self):
+        for document in (
+            json.dumps({"dir_info": {"editable": True}}),
+            json.dumps({"url": "https://x.invalid/y", "dir_info": {"editable": True}}),
+            json.dumps({"url": "file:rel", "dir_info": {"editable": True}}),
+            "not json at all",
+            json.dumps(["not", "a", "document"]),
+            json.dumps({"url": "file:///C:/x", "dir_info": {"editable": False}}),
+            json.dumps({"url": "file:///C:/x"}),
+        ):
+            self.assertEqual(ir._parse_direct_url(document), (False, None), document)
+
+    def test_a_valid_document_yields_its_target(self):
+        self.assertEqual(
+            ir._parse_direct_url(
+                json.dumps(
+                    {
+                        "url": "file:///C:/work/relinkra",
+                        "dir_info": {"editable": True},
+                    }
+                )
+            ),
+            (True, "C:/work/relinkra"),
+        )
+
+    def test_a_local_host_and_a_network_share_are_read_literally(self):
+        self.assertEqual(
+            ir._local_target_from_url("file://localhost/C:/work/relinkra"),
+            "C:/work/relinkra",
+        )
+        self.assertEqual(
+            ir._local_target_from_url("file://server/share/relinkra"),
+            "//server/share/relinkra",
+        )
+
+    def test_target_dedupe_folds_duplicates_and_is_bounded(self):
+        values = [
+            "C:/work/relinkra",
+            "C:/work/relinkra",
+            "C:/work/relinkra/",
+        ] + [
+            f"C:/work/target{index}"
+            for index in range(ir.MAX_EDITABLE_TARGETS + 6)
+        ]
+        bounded = ir._unique_paths(values, ir.MAX_EDITABLE_TARGETS)
+        self.assertEqual(len(bounded), ir.MAX_EDITABLE_TARGETS)
+        self.assertEqual(len(ir._unique_paths([], 4)), 0)
+        self.assertEqual(ir._unique_paths([None, ""], 4), ())
+
+    def test_g_windows_case_only_differences_are_equal_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("Windows path semantics only")
+        self.assertTrue(
+            ir._within("C:/Work/Relinkra/relinkra", "c:/work/relinkra")
+        )
+
+    def test_h_case_is_distinct_on_posix(self):
+        if os.name == "nt":
+            self.skipTest("POSIX path semantics only")
+        self.assertFalse(
+            ir._within("C:/Work/Relinkra/relinkra", "c:/work/relinkra")
+        )
+
+
+class EditableMetadataProbeTests(unittest.TestCase):
+    """The filesystem-facing half of the editable claim, on a temp tree."""
+
+    @staticmethod
+    def _write_direct_url(lib_dir: Path, document: str) -> None:
+        dist_info = lib_dir / "relinkra-0.1.4.dist-info"
+        dist_info.mkdir(parents=True, exist_ok=True)
+        (dist_info / "direct_url.json").write_text(document, encoding="utf-8")
+
+    def _probe(self, lib_dir: Path) -> ir.LibMetadata:
+        found = ir._probe_lib_metadata([str(lib_dir)])
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_e_a_target_path_with_spaces_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "site-packages"
+            project = Path(tmp) / "my project"
+            (project / "relinkra").mkdir(parents=True)
+            self._write_direct_url(
+                lib,
+                json.dumps(
+                    {
+                        "url": project.as_uri(),
+                        "dir_info": {"editable": True},
+                    }
+                ),
+            )
+            metadata = self._probe(lib)
+            self.assertTrue(metadata.editable)
+            self.assertTrue(
+                ir._within(str(project / "relinkra"), metadata.editable_target)
+            )
+
+    def test_f_a_unicode_target_path_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "site-packages"
+            project = Path(tmp) / "Документы" / "проект"
+            (project / "relinkra").mkdir(parents=True)
+            self._write_direct_url(
+                lib,
+                json.dumps(
+                    {
+                        "url": project.as_uri(),
+                        "dir_info": {"editable": True},
+                    }
+                ),
+            )
+            metadata = self._probe(lib)
+            self.assertTrue(metadata.editable)
+            self.assertTrue(
+                ir._within(str(project / "relinkra"), metadata.editable_target)
+            )
+
+    def test_d_a_malformed_document_is_not_editable_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "site-packages"
+            self._write_direct_url(lib, "{ not json")
+            metadata = self._probe(lib)
+            self.assertFalse(metadata.editable)
+            self.assertIsNone(metadata.editable_target)
+
+    def test_a_targetless_document_is_not_editable_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "site-packages"
+            self._write_direct_url(
+                lib, json.dumps({"dir_info": {"editable": True}})
+            )
+            metadata = self._probe(lib)
+            self.assertFalse(metadata.editable)
+            self.assertIsNone(metadata.editable_target)
+
+    def test_an_oversized_direct_url_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "site-packages"
+            self._write_direct_url(
+                lib,
+                json.dumps(
+                    {
+                        "url": "file:///C:/work/relinkra",
+                        "dir_info": {"editable": True},
+                        "padding": "x" * (ir.MAX_DIRECT_URL_BYTES + 1024),
+                    }
+                ),
+            )
+            metadata = self._probe(lib)
+            self.assertFalse(metadata.editable)
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +1166,51 @@ class InstallCheckRenderingTests(unittest.TestCase):
             self.assertFalse(contains_absolute_path(check.detail))
             self.assertFalse(contains_absolute_path(check.action))
 
+    def test_an_editable_target_mismatch_warns_and_is_path_free(self):
+        check = check_install_resolution(mismatch_resolution())
+        self.assertEqual(check.status, WARN)
+        self.assertIn("editable target", check.detail)
+        self.assertIn("PYTHONPATH", check.action)
+        self.assertFalse(contains_absolute_path(check.detail))
+        self.assertFalse(contains_absolute_path(check.action))
+        lowered = check.detail.lower()
+        self.assertNotIn("pypi", lowered)
+        self.assertNotIn("site-packages", lowered)
+
+    def test_a_mismatch_without_pythonpath_offers_a_different_action(self):
+        check = check_install_resolution(
+            classify(
+                imported_file=FOREIGN_FILE,
+                lib_metadata=(
+                    installed_metadata(
+                        editable=True, editable_target=CHECKOUT_A
+                    ),
+                ),
+                expected_script_present=True,
+                which=resolved_at(SCRIPTS_DIR),
+                environ={"PATH": SCRIPTS_DIR},
+            )
+        )
+        self.assertEqual(check.status, WARN)
+        self.assertNotIn("PYTHONPATH points", check.action)
+        self.assertIn("editable", check.action)
+
+    def test_a_targetless_editable_record_reads_as_a_shadow_not_a_mismatch(self):
+        check = check_install_resolution(
+            classify(
+                imported_file=FOREIGN_FILE,
+                lib_metadata=(
+                    installed_metadata(editable=True, editable_target=None),
+                ),
+                expected_script_present=True,
+                which=resolved_at(SCRIPTS_DIR),
+                environ={"PYTHONPATH": CHECKOUT_B, "PATH": SCRIPTS_DIR},
+            )
+        )
+        self.assertEqual(check.status, WARN)
+        self.assertIn("resolved to the checkout", check.detail)
+        self.assertNotIn("editable target", check.detail)
+
 
 class DoctorAndVersionIntegrationTests(unittest.TestCase):
     """The real CLI wiring, driven through ``main(argv)``."""
@@ -800,6 +1330,94 @@ class DoctorAndVersionIntegrationTests(unittest.TestCase):
             payload["install"]["conditions"],
             [ir.CONDITION_SHADOWED],
         )
+
+    def test_i_doctor_renders_a_mismatch_and_keeps_the_payload_portable(self):
+        with mock.patch.object(
+            product_cli.install_resolution,
+            "resolve_install",
+            return_value=mismatch_resolution(),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, out, _ = self._run(["doctor", "--json", "--path", tmp])
+        payload = json.loads(out)
+        row = [
+            check
+            for check in payload["checks"]
+            if check["name"] == "Install resolution"
+        ][0]
+        self.assertEqual(row["status"], WARN)
+        self.assertTrue(row["action"])
+        self.assertEqual(
+            payload["install"]["conditions"],
+            [ir.CONDITION_EDITABLE_MISMATCH],
+        )
+        # The mismatch classification must not smuggle a local path into
+        # the payload: the self-audit row still has to pass.
+        portable = [
+            check
+            for check in payload["checks"]
+            if check["name"] == "Portable output"
+        ][0]
+        self.assertEqual(portable["status"], PASS)
+
+    def test_j_version_paths_stays_an_explicit_opt_in(self):
+        _, default_out, _ = self._run(["version"])
+        self.assertNotIn("local resolution", default_out)
+        _, paths_out, _ = self._run(["version", "--paths"])
+        self.assertIn("package_origin:", paths_out)
+        _, json_out, _ = self._run(["version", "--json"])
+        self.assertNotIn("local_paths", json.loads(json_out))
+
+    def test_m_a_mismatch_warning_never_moves_the_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain_code, plain_out, _ = self._run(
+                ["doctor", "--json", "--path", tmp]
+            )
+            with mock.patch.object(
+                product_cli.install_resolution,
+                "resolve_install",
+                return_value=mismatch_resolution(),
+            ):
+                code, out, _ = self._run(
+                    ["doctor", "--json", "--path", tmp]
+                )
+        # The WARN is real, and it is still not a FAIL: same exit code and
+        # same FAIL count as the very same machine without the mismatch.
+        self.assertEqual(code, plain_code)
+        mismatch_payload = json.loads(out)
+        plain_payload = json.loads(plain_out)
+        self.assertEqual(
+            mismatch_payload["summary"]["fail"],
+            plain_payload["summary"]["fail"],
+        )
+        row = [
+            check
+            for check in mismatch_payload["checks"]
+            if check["name"] == "Install resolution"
+        ][0]
+        self.assertEqual(row["status"], WARN)
+
+    def test_n_an_install_warning_never_outranks_onboarding(self):
+        """The install row is appended last, so onboarding keeps Next.
+
+        The compact "Next:" line takes the first warning in check order,
+        and cmd_doctor appends the install check after every workspace
+        row. A mismatch must never displace "Run 'relinkra init'.".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = gf.make_repo(tmp)
+            with mock.patch.object(
+                product_cli.install_resolution,
+                "resolve_install",
+                return_value=mismatch_resolution(),
+            ):
+                _, out, _ = self._run(["doctor", "--path", repo])
+        self.assertIn("Install resolution", out)
+        next_lines = [
+            line for line in out.splitlines() if line.startswith("Next: ")
+        ]
+        self.assertEqual(len(next_lines), 1)
+        self.assertIn("relinkra init", next_lines[0])
 
 
 class GathererTests(unittest.TestCase):

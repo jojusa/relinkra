@@ -89,11 +89,21 @@ installed distribution is also visible to the same interpreter. The
 - `pythonpath.set` and `pythonpath.contributes_imported_package` — whether
   `PYTHONPATH` is what decided the import.
 
-An **editable installation** is deliberately not treated as shadowing: its
-metadata describes that very checkout, so importing from it is correct.
-Relinkra claims an editable install only when the distribution's own PEP
-610 `direct_url.json` says so; otherwise the state is reported as a plain
+An **editable installation** is deliberately not treated as shadowing *when
+it describes the running code*: its metadata names the checkout it
+configures, and the imported package sits inside that checkout, so
+importing from it is correct. Relinkra claims an editable install only
+when the distribution's own PEP 610 `direct_url.json` says so and names
+an absolute local target; otherwise the state is reported as a plain
 source checkout, because that is all the local filesystem proves.
+
+The metadata proves the CONFIGURED target, never what imported. When the
+imported package is **not** inside the checkout the editable install
+names — a second checkout shadowing the editable target, often through
+`PYTHONPATH` — the state is reported as a source checkout with an
+`editable_target_mismatch` warning instead of a healthy editable
+installation. The wording stays path-free; `relinkra version --paths`
+prints the imported package location when you need the exact path.
 
 **Fix:** run the installed console script from an unrelated directory with
 `PYTHONPATH` cleared, and verify the JSON fields:

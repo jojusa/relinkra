@@ -23,9 +23,17 @@ Honesty rules this module holds to:
     it. The import location and the metadata location are compared
     before anything is said about them.
   * An editable installation is claimed only when its own PEP 610
-    ``direct_url.json`` says ``dir_info.editable`` is true. Without that
-    evidence the state is reported as a plain source checkout, because
-    that is all the local filesystem can prove.
+    ``direct_url.json`` says ``dir_info.editable`` is true AND names the
+    absolute local target it configures. Without that evidence the state
+    is reported as a plain source checkout, because that is all the
+    local filesystem can prove.
+  * The editable target is the CONFIGURED target, never proof of what
+    imported. The imported package root must sit at or below the named
+    target before this module attributes the running code to the
+    editable install; when the target is elsewhere, the state is a
+    source checkout carrying the explicit ``editable_target_mismatch``
+    condition. Claiming a healthy editable installation there would
+    invent provenance the evidence does not support.
   * Every filesystem probe is bounded to a fixed list of interpreter
     library directories. No parent directory is ever walked, no
     recursive scan is performed, and no Git command is invoked.
@@ -52,6 +60,7 @@ import os
 import shutil
 import sys
 import sysconfig
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -66,7 +75,8 @@ RUNNING_INSTALLED = "installed_distribution"
 #: The imported package sits outside every library directory, which means
 #: ``sys.path`` was pointed at a checkout.
 RUNNING_SOURCE = "source_checkout"
-#: A source checkout whose metadata declares an editable install.
+#: A source checkout whose metadata declares an editable install, and
+#: whose package root sits inside the target that metadata names.
 RUNNING_EDITABLE = "editable_installation"
 #: The import location could not be established at all.
 RUNNING_AMBIGUOUS = "ambiguous"
@@ -90,6 +100,10 @@ CONDITION_CLI_NOT_ON_PATH = "console_script_not_on_path"
 CONDITION_CLI_ELSEWHERE = "console_script_elsewhere"
 CONDITION_CLI_MISSING = "console_script_missing"
 CONDITION_SHADOWED = "source_shadows_installed"
+#: An editable install is declared, but the imported package root is not
+#: at or below the target that editable metadata names. The metadata
+#: proves the configured target, not the import origin.
+CONDITION_EDITABLE_MISMATCH = "editable_target_mismatch"
 CONDITION_AMBIGUOUS = "origin_ambiguous"
 
 #: Display order for conditions, lowest index wins the single "next
@@ -99,6 +113,7 @@ _CONDITION_PRIORITY = (
     CONDITION_CLI_ELSEWHERE,
     CONDITION_CLI_MISSING,
     CONDITION_SHADOWED,
+    CONDITION_EDITABLE_MISMATCH,
     CONDITION_AMBIGUOUS,
 )
 
@@ -134,6 +149,8 @@ SHAPE_EGG_INFO = "egg-info"
 MAX_LIB_DIRS = 8
 #: Metadata directories examined per library directory.
 MAX_METADATA_PER_DIR = 4
+#: Editable targets compared against the imported package root.
+MAX_EDITABLE_TARGETS = 8
 #: ``PYTHONPATH`` entries resolved.
 MAX_PYTHONPATH_ENTRIES = 64
 #: ``PATH`` entries scanned.
@@ -226,6 +243,58 @@ def _same(left: Optional[str], right: Optional[str]) -> bool:
     return bool(left_key) and left_key == right_key
 
 
+def _unique_paths(values: Sequence[Optional[str]], limit: int) -> Tuple[str, ...]:
+    """Non-empty values with duplicates folded, capped.
+
+    Purely lexical, like every comparison built on :func:`_key`: the
+    values are already resolved when they arrive, so nothing here reads
+    the filesystem.
+    """
+    seen: List[str] = []
+    keys = set()
+    for value in values:
+        if not value:
+            continue
+        folded = _key(value)
+        if not folded or folded in keys:
+            continue
+        keys.add(folded)
+        seen.append(value)
+        if len(seen) >= limit:
+            break
+    return tuple(seen)
+
+
+def _within(imported: Optional[str], target: Optional[str]) -> bool:
+    """Whether an imported package root sits at or below a target path.
+
+    This is the comparison that keeps PEP 610 metadata in its lane: the
+    metadata names the checkout an editable install CONFIGURES, and only
+    an imported root inside that checkout can be attributed to it.
+
+    Case folding and separator handling come from :func:`_key`, so a
+    Windows comparison folds case the way the OS does while POSIX keeps
+    it, exactly like the other path comparisons in this module. The
+    target is compared with its separator attached, so a sibling
+    directory that merely shares a prefix (``relinkra-b`` against
+    ``relinkra``) is never mistaken for a child.
+    """
+    imported_key, target_key = _key(imported), _key(target)
+    if not imported_key or not target_key:
+        return False
+    if imported_key == target_key:
+        return True
+    prefix = target_key.rstrip("\\/")
+    if not prefix:
+        # The target is a filesystem root, which contains every
+        # absolute path by definition.
+        return True
+    return any(
+        imported_key.startswith(prefix + separator)
+        for separator in ("\\", "/")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gathered facts
 # ---------------------------------------------------------------------------
@@ -238,6 +307,11 @@ class LibMetadata:
     lib_dir: str
     kind: str
     editable: bool = False
+    #: Resolved local target a PROMOTABLE PEP 610 editable claim names.
+    #: Only ever set together with ``editable``: a document that says
+    #: editable without a usable absolute target proves nothing this
+    #: module can compare, so it is not promoted to an editable claim.
+    editable_target: Optional[str] = None
     #: Version read from this metadata directory, not from any other one.
     version: Optional[str] = None
     #: The metadata directory itself, when it was located on disk.
@@ -277,25 +351,105 @@ class InstallEvidence:
     lib_metadata: Tuple[LibMetadata, ...] = ()
 
 
-def _declares_editable(metadata_dir: Path) -> bool:
-    """Whether a PEP 610 ``direct_url.json`` marks this install editable.
+def _local_target_from_url(url: Any) -> Optional[str]:
+    """Absolute local path named by a PEP 610 ``url``, or ``None``.
 
-    Absent, unreadable, oversized or malformed all mean "no evidence",
-    which is reported as plain source rather than promoted to a claim.
+    Only ``file:`` URLs and bare absolute paths are accepted; a remote or
+    version-control URL, a relative path, or anything that does not yield
+    an absolute local directory is not authority this module can compare,
+    so it returns ``None`` rather than a guess. Percent escapes are
+    decoded and the leading slash a Windows drive URL carries is removed,
+    so the value can be compared on any host without touching the disk.
     """
-    candidate = metadata_dir / "direct_url.json"
-    try:
-        raw = read_bounded_text(candidate, max_bytes=MAX_DIRECT_URL_BYTES)
-    except (OSError, SafeWriteError, ValueError):
-        return False
+    if not isinstance(url, str):
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    if text.lower().startswith("file:"):
+        try:
+            parts = urllib.parse.urlsplit(text)
+        except ValueError:
+            return None
+        path = urllib.parse.unquote(parts.path or "")
+        host = parts.netloc
+        if host and host.lower() != "localhost":
+            # A network share: file://server/share/x.
+            path = "//" + host + path
+    else:
+        # ``urlsplit`` would read a bare Windows drive path ("C:/x") as a
+        # one-letter scheme, so only text with an explicit "scheme://" is
+        # rejected here; everything else is treated as a plain path.
+        if "://" in text:
+            return None
+        path = urllib.parse.unquote(text)
+    # A Windows drive URL carries a leading slash: /C:/work -> C:/work.
+    if len(path) >= 3 and path[0] == "/" and path[1].isalpha() and path[2] == ":":
+        path = path[1:]
+    if path.startswith(("/", "\\")):
+        return path or None
+    # A drive-absolute Windows path ("C:/x", "C:\\x") is local too; a
+    # relative path is not, because there is no trustworthy base to
+    # resolve it against.
+    if (
+        len(path) >= 3
+        and path[0].isalpha()
+        and path[1] == ":"
+        and path[2] in ("/", "\\")
+    ):
+        return path
+    return None
+
+
+def _parse_direct_url(raw: Any) -> Tuple[bool, Optional[str]]:
+    """Editable claim and local target from a PEP 610 document.
+
+    Absent, unreadable, oversized, malformed, or target-less all mean "no
+    evidence", which is reported as plain source rather than promoted to
+    a claim. ``dir_info.editable`` alone is not enough: PEP 610 requires
+    an absolute local ``url``, and without the named target the claim can
+    never be compared against what actually imported.
+    """
+    if not isinstance(raw, str) or len(raw) > MAX_DIRECT_URL_BYTES:
+        return False, None
     try:
         document = json.loads(raw)
     except (ValueError, TypeError):
-        return False
+        return False, None
     if not isinstance(document, dict):
-        return False
+        return False, None
     dir_info = document.get("dir_info")
-    return isinstance(dir_info, dict) and dir_info.get("editable") is True
+    if not isinstance(dir_info, dict) or dir_info.get("editable") is not True:
+        return False, None
+    target = _local_target_from_url(document.get("url"))
+    if target is None:
+        return False, None
+    return True, target
+
+
+def _resolved_editable_evidence(raw: Any) -> Tuple[bool, Optional[str]]:
+    """Editable claim plus the RESOLVED target it configures.
+
+    Resolution happens once, where the rest of the evidence is gathered,
+    so classification stays a pure string comparison over resolved paths
+    — exactly like the imported root it is compared against.
+    """
+    editable, target = _parse_direct_url(raw)
+    if not editable:
+        return False, None
+    resolved = _resolved(target) if target else None
+    return (True, resolved) if resolved else (False, None)
+
+
+def _read_direct_url_evidence(metadata_dir: Path) -> Tuple[bool, Optional[str]]:
+    """Read a metadata directory's ``direct_url.json``, bounded."""
+    try:
+        raw = read_bounded_text(
+            metadata_dir / "direct_url.json", max_bytes=MAX_DIRECT_URL_BYTES
+        )
+    except (OSError, SafeWriteError, ValueError):
+        return False, None
+    return _resolved_editable_evidence(raw)
 
 
 #: Metadata files that carry the version, one per shape.
@@ -385,13 +539,17 @@ def _probe_lib_metadata(lib_dirs: Sequence[str]) -> Tuple[LibMetadata, ...]:
             except OSError:
                 continue
         for kind, entry in matches[:MAX_METADATA_PER_DIR]:
-            editable = kind == SHAPE_DIST_INFO and _declares_editable(entry)
+            editable = False
+            editable_target: Optional[str] = None
+            if kind == SHAPE_DIST_INFO:
+                editable, editable_target = _read_direct_url_evidence(entry)
             metadata_dir = _resolved(entry)
             found.append(
                 LibMetadata(
                     lib_dir=lib_dir,
                     kind=kind,
                     editable=editable,
+                    editable_target=editable_target,
                     version=read_metadata_version(metadata_dir, kind),
                     metadata_dir=metadata_dir,
                 )
@@ -486,25 +644,16 @@ def _read_distribution_version(document: Any) -> Optional[str]:
     return str(version) if version is not None else None
 
 
-def _direct_url_editable(document: Any) -> bool:
+def _direct_url_evidence(document: Any) -> Tuple[bool, Optional[str]]:
     """Editable evidence carried by the distribution object itself."""
     reader = getattr(document, "read_text", None)
     if not callable(reader):
-        return False
+        return False, None
     try:
         raw = reader("direct_url.json")
     except Exception:
-        return False
-    if not isinstance(raw, str) or len(raw) > MAX_DIRECT_URL_BYTES:
-        return False
-    try:
-        document_json = json.loads(raw)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(document_json, dict):
-        return False
-    dir_info = document_json.get("dir_info")
-    return isinstance(dir_info, dict) and dir_info.get("editable") is True
+        return False, None
+    return _resolved_editable_evidence(raw)
 
 
 def gather_install_evidence(
@@ -585,10 +734,12 @@ def gather_install_evidence(
             except (OSError, TypeError, ValueError):
                 metadata_root = None
         if shape is not None:
+            editable, editable_target = _direct_url_evidence(document)
             distribution = LibMetadata(
                 lib_dir=metadata_root or "",
                 kind=shape,
-                editable=_direct_url_editable(document),
+                editable=editable,
+                editable_target=editable_target,
                 version=_read_distribution_version(document),
                 metadata_dir=_resolved(getattr(document, "_path", None)),
             )
@@ -800,10 +951,35 @@ def classify_install(evidence: InstallEvidence) -> InstallResolution:
     imported_key = _key(evidence.imported_root)
     imported_in_lib = bool(imported_key) and imported_key in lib_keys
 
-    editable = any(entry.editable for entry in evidence.lib_metadata)
-    if evidence.distribution is not None and evidence.distribution.editable:
-        editable = True
+    # An editable claim and the target it names travel together: the
+    # claim is only promotable when the document names an absolute local
+    # target, because that target is the only thing the claim can be
+    # honestly compared against.
+    editable_entries = [
+        entry
+        for entry in evidence.lib_metadata
+        if entry.editable and entry.editable_target
+    ]
+    if (
+        evidence.distribution is not None
+        and evidence.distribution.editable
+        and evidence.distribution.editable_target
+    ):
+        editable_entries.append(evidence.distribution)
+    editable_targets = _unique_paths(
+        [entry.editable_target for entry in editable_entries],
+        MAX_EDITABLE_TARGETS,
+    )
+    editable = bool(editable_targets)
     installed = bool(evidence.lib_metadata)
+
+    # PEP 610 proves the CONFIGURED editable target; it says nothing
+    # about where the import resolved. The imported package root must sit
+    # at or below the named target before this execution can be called
+    # that editable installation.
+    editable_matches_import = bool(imported_key) and any(
+        _within(evidence.imported_root, target) for target in editable_targets
+    )
 
     if not imported_key:
         # No import location at all: nothing can be said about the code.
@@ -816,7 +992,7 @@ def classify_install(evidence: InstallEvidence) -> InstallResolution:
         # "source checkout" here would be a guess, and this module does
         # not guess.
         running_from = RUNNING_AMBIGUOUS
-    elif editable:
+    elif editable and editable_matches_import:
         running_from = RUNNING_EDITABLE
     else:
         running_from = RUNNING_SOURCE
@@ -847,8 +1023,11 @@ def classify_install(evidence: InstallEvidence) -> InstallResolution:
 
     # A checkout winning the import race against a separate installed
     # distribution is the state that makes "am I testing the installed
-    # artifact?" unanswerable. An editable install is not that state: its
-    # metadata describes this very checkout, so imports are correct.
+    # artifact?" unanswerable. A MATCHING editable install is not that
+    # state: its metadata describes this very checkout, so imports are
+    # correct. An editable install whose target is not what imported is a
+    # different and sharper failure of the same kind, and gets its own
+    # condition below instead of being folded into this one.
     if (
         running_from == RUNNING_SOURCE
         and installed
@@ -856,6 +1035,16 @@ def classify_install(evidence: InstallEvidence) -> InstallResolution:
         and not imported_in_lib
     ):
         conditions.append(CONDITION_SHADOWED)
+
+    # Editable metadata names a target; the imported package root is not
+    # at or below it. The configured editable install is not the code
+    # that is running, and saying otherwise would invent provenance.
+    if (
+        running_from == RUNNING_SOURCE
+        and editable
+        and not editable_matches_import
+    ):
+        conditions.append(CONDITION_EDITABLE_MISMATCH)
 
     if installed:
         if cli_status == CLI_PRESENT_NOT_ON_PATH:

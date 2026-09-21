@@ -188,10 +188,15 @@ indistinguishable from inside the interpreter, so the check says
 *installed distribution* and stops there. Distribution metadata alone
 never proves the imported code belongs to it — the import location and
 the metadata location are compared first. An *editable installation* is
-claimed only when its own PEP 610 `direct_url.json` says so; without that
-evidence the state is reported as a plain source checkout. A location
-outside the interpreter's library directories is never promoted to a
-verified checkout identity.
+claimed only when its own PEP 610 `direct_url.json` says so and names the
+absolute local checkout it configures; without that evidence the state is
+reported as a plain source checkout. The configured target is compared
+against the imported package root, because PEP 610 proves what the
+metadata targets and never what actually imported: when the imported
+package is not at or below the named target, the state is a source
+checkout carrying the `editable_target_mismatch` condition — a warning,
+never a healthy editable claim. A location outside the interpreter's
+library directories is never promoted to a verified checkout identity.
 
 `doctor --json` carries the same classification as a top-level `install`
 section:
