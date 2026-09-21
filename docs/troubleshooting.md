@@ -20,14 +20,33 @@ without being tripped by optional components.
 
 ## `relinkra: command not found`
 
-**Cause:** the environment you installed into is not active, or its
-script directory is not on `PATH`.
+**Symptom:** `relinkra` does not resolve, yet `python -m relinkra.product_cli`
+works and the package imports.
 
-**Fix:** activate the virtual environment you installed into, then retry.
-If you installed without a virtual environment, make sure Python's script
-directory is on `PATH` (`Scripts\` on Windows, `bin/` on macOS/Linux).
-As a fallback from a source checkout, `python -m relinkra.product_cli`
-is equivalent to `relinkra`.
+**Cause:** the environment you installed into is not active, or its
+script directory is not on `PATH`. On Windows the scripts live in
+`Scripts\`; on macOS and Linux, in `bin/`.
+
+**Diagnose it, don't guess:** `doctor` reports this as an `Install
+resolution` warning naming the condition, and `relinkra version --paths`
+prints the exact directory that is missing from `PATH`:
+
+```bash
+relinkra version --paths
+```
+
+Read `expected_scripts_dir` (where this interpreter's console scripts
+belong), `resolved_console_script` (`null` when nothing on `PATH`
+resolves), and `interpreter` (the Python that owns them).
+
+**Fix:** add that directory to `PATH` and open a **new terminal** — `PATH`
+changes do not reach already-open windows. Activating the virtual
+environment you installed into also puts its script directory on `PATH`,
+which is usually the cleaner fix. As a fallback from a source checkout,
+`python -m relinkra.product_cli` is equivalent to `relinkra`.
+
+Relinkra never edits `PATH` for you. It reports the state and leaves the
+change to you.
 
 ## Relinkra runs, but under the wrong Python
 
@@ -39,19 +58,42 @@ different installations.
 
 **Fix:** install with the interpreter you actually want:
 `python -m pip install .`. The `python -m pip` form always targets the
-Python that runs it, unlike a bare `pip`.
+Python that runs it, unlike a bare `pip`. To see which interpreter is
+actually in play, `relinkra version --paths` prints `interpreter` — the
+exact executable — and `doctor` reports it as the interpreter in the
+`Install resolution` row.
 
 ## Source-tree import shadowing
 
 **Symptom:** an installed verification reports `install_mode: "source"`,
 missing installed metadata, or a version different from the package you just
-installed.
+installed. More generally: you believe you are exercising the installed
+artifact, and you are exercising the checkout.
 
 **Cause:** Python imported the checkout before the installed package. This
 usually happens when running from the source tree, leaving `PYTHONPATH` set,
 or invoking `python -m relinkra.product_cli` while validating an install.
 An editable/source distribution is correctly reported as `source`; a wheel
 must have nearby `.dist-info` metadata.
+
+**Diagnose it:** `doctor` reports this as an `Install
+resolution` warning that says the import resolved to the checkout while an
+installed distribution is also visible to the same interpreter. The
+`install` section of `doctor --json` says which one it was:
+
+- `running_from` — `installed_distribution`, `source_checkout`,
+  `editable_installation`, or `ambiguous`.
+- `distribution.installed_for_interpreter` and
+  `distribution.installed_version` — the installed copy this interpreter
+  can see, if any.
+- `pythonpath.set` and `pythonpath.contributes_imported_package` — whether
+  `PYTHONPATH` is what decided the import.
+
+An **editable installation** is deliberately not treated as shadowing: its
+metadata describes that very checkout, so importing from it is correct.
+Relinkra claims an editable install only when the distribution's own PEP
+610 `direct_url.json` says so; otherwise the state is reported as a plain
+source checkout, because that is all the local filesystem proves.
 
 **Fix:** run the installed console script from an unrelated directory with
 `PYTHONPATH` cleared, and verify the JSON fields:
@@ -68,6 +110,18 @@ without importing from the checkout:
 ```bash
 python -c "import relinkra; print(relinkra.__file__)"
 ```
+
+Relinkra never clears `PYTHONPATH` for you; it tells you that it is the
+cause and leaves the change to you.
+
+Two further limits are worth stating plainly. First, nothing here claims
+where a wheel came from: a locally built wheel and one fetched from an
+index are indistinguishable from inside the interpreter, so the
+diagnostics say *installed distribution* and never "PyPI". Second, a
+stale host process can keep serving old code after an install or a source
+change — that is a runtime question, not an install-resolution one, and
+`doctor`'s runtime-evidence and integration-trust rows are where it
+surfaces. Relinkra does not enumerate or kill processes.
 
 The command intentionally does not recover the original archive SHA-256 or
 source commit; those are exact-release-head report evidence, not runtime
@@ -211,13 +265,19 @@ restores it.
 ## Windows: install succeeded but `relinkra` is not found
 
 **Cause:** the Python `Scripts\` directory is not on `PATH`, or the
-terminal predates the PATH change.
+terminal predates the `PATH` change. This is the Windows shape of
+`relinkra: command not found` above.
 
-**Fix:** close and reopen the terminal first — PATH changes do not reach
-already-open windows. If it persists, try the `py` launcher:
-`py -m pip install .` then check `py -m relinkra.product_cli --version`.
-Installing into an activated virtual environment avoids the system PATH
-question entirely.
+**Fix:** close and reopen the terminal first — `PATH` changes do not reach
+already-open windows. `relinkra version --paths` prints
+`expected_scripts_dir`, which is the directory to add. If it persists,
+try the `py` launcher: `py -m pip install .` then check
+`py -m relinkra.product_cli --version`. Installing into an activated
+virtual environment avoids the system `PATH` question entirely.
+
+When `doctor` reports the script directory as absent from `PATH` while the
+file itself exists, the launcher is there and only the `PATH` entry is
+missing — reinstalling will not help. Adding the directory is the fix.
 
 ## Stale verification proof
 
@@ -260,4 +320,6 @@ git intelligence — works fully offline.
 
 Collect `relinkra version --json` and `relinkra doctor --json` (both are
 guaranteed free of local paths and credentials) and attach them to your
-report.
+report. If the problem is how Relinkra is installed or reached, add
+`relinkra version --paths` — it is machine-local **because you asked for
+it**, so read it before attaching it.

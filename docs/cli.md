@@ -169,7 +169,49 @@ always carries the full detail.
 
 Checks: Python runtime, git executable, git repository, Relinkra config,
 registry integrity, Engram, CBM, git intelligence, MCP constructability,
-project identity, registered revision, and a **portable-output self-audit**.
+project identity, registered revision, install resolution, and a
+**portable-output self-audit**.
+
+The **Install resolution** check answers "which Relinkra is this?" for the
+interpreter that is running: whether the imported package is an installed
+distribution, a source checkout, or an editable installation; which
+interpreter and virtual environment own it; whether the `relinkra`
+console script is reachable from `PATH`; and whether `PYTHONPATH` or the
+working directory is what decided the import. It is `WARN` at worst and
+never `FAIL`, because every state it can observe leaves the engine
+working — what is degraded is reachability or verification honesty, and a
+`WARN` does not move the exit code.
+
+Its wording is deliberately narrow. `site-packages` is never reported as
+"PyPI": a wheel built locally and a wheel fetched from an index are
+indistinguishable from inside the interpreter, so the check says
+*installed distribution* and stops there. Distribution metadata alone
+never proves the imported code belongs to it — the import location and
+the metadata location are compared first. An *editable installation* is
+claimed only when its own PEP 610 `direct_url.json` says so; without that
+evidence the state is reported as a plain source checkout. A location
+outside the interpreter's library directories is never promoted to a
+verified checkout identity.
+
+`doctor --json` carries the same classification as a top-level `install`
+section:
+
+| Field | Meaning |
+|---|---|
+| `running_from` | `installed_distribution`, `source_checkout`, `editable_installation`, or `ambiguous`. |
+| `interpreter.name` / `.version` / `.in_virtualenv` / `.virtualenv_name` | The owning interpreter, without its path. |
+| `distribution.visible` / `.version` / `.shape` | The `importlib.metadata` record, which can describe a checkout. |
+| `distribution.matches_imported_package` | Whether that record's location is the imported package's location. |
+| `distribution.installed_for_interpreter` / `.installed_version` / `.installed_shape` | Metadata found in this interpreter's own library directories — the actual installed copy. |
+| `distribution.editable_evidence` / `.checkout_evidence` | What was verified, and what was only observed (a project marker beside the package). |
+| `console_script.status` | `resolved`, `resolved_elsewhere`, `present_not_on_path`, `absent`, or `unknown`. |
+| `console_script.scripts_dir_name` / `.scripts_dir_exists` / `.scripts_dir_on_path` | The interpreter's script directory, by name and reachability. |
+| `pythonpath.set` / `.contributes_imported_package` | Presence, and whether it is what decided the import. |
+| `conditions` | The machine-readable trigger list the human sentence is rendered from. |
+
+The `install` section is additive and path-free, so the portable-output
+self-audit keeps passing: it carries classification tokens, booleans,
+versions and basenames only.
 
 That last one is unusual and deliberate: `doctor` runs
 `contains_absolute_path` over the payload it is about to print and
@@ -201,13 +243,32 @@ detached state. No absolute paths.
 
 ## `relinkra version`
 
-Version and compatibility, deliberately path-free: Relinkra version, the
-Python it runs on (with the minimum supported), the MCP contract version,
-whether it runs from an installed package or a source checkout, and the
-installed wheel metadata check. Takes `--json` but no `--path` — it answers
-about the tool, not a workspace.
+Version and compatibility, deliberately path-free by default: Relinkra
+version, the Python it runs on (with the minimum supported), the MCP
+contract version, whether it runs from an installed package or a source
+checkout, and the installed wheel metadata check. Takes `--json` and
+`--paths` but no `--path` — it answers about the tool, not a workspace.
 
-The JSON contract is:
+`--paths` is an explicit opt-in that lifts the path-free guarantee for
+one invocation and adds a `local_paths` object:
+
+| Field | Meaning |
+|---|---|
+| `interpreter` | The full path of the running interpreter. |
+| `package_origin` | Where `relinkra` was actually imported from. |
+| `distribution_metadata` | The metadata directory `importlib.metadata` resolved, if any. |
+| `expected_scripts_dir` / `_exists` | Where this interpreter's console scripts belong, and whether that directory exists. |
+| `resolved_console_script` | What `PATH` resolves for `relinkra`, or `null`. |
+| `pythonpath` | The configured `PYTHONPATH` entries, echoed verbatim so they can be found, bounded in count and length. |
+
+It exists because "which interpreter owns this, and where is its console
+script?" cannot be answered without real paths. Asking is read-only: the
+flag never changes `PATH`, `PYTHONPATH`, a shell profile, an environment
+variable, or an installed package, and it never dumps the environment —
+only the paths this diagnostic reasons about. Text output renders the
+same facts under a `local resolution` heading.
+
+The default JSON contract is unchanged and stays path-free:
 
 | Field | Meaning |
 |---|---|
@@ -238,9 +299,12 @@ Example shape:
 }
 ```
 
-The command has no runtime Git or current-working-directory dependency and
-never embeds a source commit or archive digest. Those values belong in the
-maintainer's exact-release-head artifact report.
+The default payload carries exactly the fields above and nothing else —
+adding a key to the default answer would break scripts that consume it, so
+the machine-local detail lives behind `--paths` instead. The command has
+no runtime Git or current-working-directory dependency and never embeds a
+source commit or archive digest. Those values belong in the maintainer's
+exact-release-head artifact report.
 
 ## `--json`
 

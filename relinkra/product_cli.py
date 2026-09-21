@@ -55,6 +55,7 @@ from . import (
     cbm_support,
     context_metrics,
     effective_identity,
+    install_resolution,
     viewer,
     viewer_graph,
 )
@@ -418,6 +419,164 @@ def check_git_executable() -> Check:
             "Install git and make sure it is on your PATH.",
         )
     return Check("Git executable", PASS, "found on PATH")
+
+
+#: Human labels for the execution modes :mod:`relinkra.install_resolution`
+#: can establish. The vocabulary deliberately never says "PyPI": a locally
+#: built wheel and an index-downloaded wheel are indistinguishable from
+#: inside the interpreter, so the origin of the bytes is not claimed.
+_INSTALL_MODE_LABELS = {
+    install_resolution.RUNNING_INSTALLED: "installed distribution",
+    install_resolution.RUNNING_SOURCE: "source checkout",
+    install_resolution.RUNNING_EDITABLE: "editable installation",
+    install_resolution.RUNNING_AMBIGUOUS: "ambiguous origin",
+}
+
+
+def _install_condition_detail(resolution) -> str:
+    """One path-free sentence per condition, in priority order."""
+    # The installed distribution's own record is quoted where the sentence
+    # is about an install. The importlib-visible version is a different
+    # fact — it can describe a checkout — so it is never substituted.
+    installed = (
+        resolution.installed_distribution_version
+        or resolution.distribution_version
+    )
+    shaped = f" {installed}" if installed else ""
+    details = {
+        install_resolution.CONDITION_CLI_NOT_ON_PATH: (
+            "the 'relinkra' console script exists for this interpreter but "
+            "no PATH entry reaches its directory"
+        ),
+        install_resolution.CONDITION_CLI_ELSEWHERE: (
+            "the 'relinkra' that PATH resolves is outside every script "
+            "directory belonging to this interpreter"
+        ),
+        install_resolution.CONDITION_CLI_MISSING: (
+            "no 'relinkra' console script exists for this interpreter"
+        ),
+        install_resolution.CONDITION_SHADOWED: (
+            f"an installed distribution{shaped} is also visible to this "
+            "interpreter, but the import resolved to the checkout"
+        ),
+        install_resolution.CONDITION_AMBIGUOUS: (
+            "this interpreter did not disclose its library directories, so "
+            "the origin of the running code cannot be classified"
+        ),
+    }
+    return "; ".join(
+        details[condition]
+        for condition in resolution.conditions
+        if condition in details
+    )
+
+
+def _install_condition_action(resolution) -> str:
+    """The one corrective action for the highest-priority condition."""
+    primary = resolution.primary_condition
+    if primary == install_resolution.CONDITION_CLI_NOT_ON_PATH:
+        return (
+            "Add this interpreter's script directory to PATH and open a new "
+            "terminal, or activate the environment you installed into — "
+            "'relinkra version --paths' prints the directory."
+        )
+    if primary == install_resolution.CONDITION_CLI_ELSEWHERE:
+        return (
+            "Run the console script that belongs to this interpreter, or "
+            "reinstall with 'python -m pip install .' so the script and the "
+            "interpreter agree. 'relinkra version --paths' prints both "
+            "locations."
+        )
+    if primary == install_resolution.CONDITION_CLI_MISSING:
+        return (
+            "The distribution is installed but its console script is "
+            "missing; reinstall with 'python -m pip install .'."
+        )
+    if primary == install_resolution.CONDITION_SHADOWED:
+        if resolution.pythonpath_contributes_imported:
+            return (
+                "PYTHONPATH points at the checkout, so it wins over the "
+                "installed distribution. Clear it, then run the installed "
+                "console script from an unrelated directory to verify the "
+                "installed artifact."
+            )
+        if resolution.pythonpath_set:
+            return (
+                "PYTHONPATH is set; clear it and run the installed console "
+                "script from an unrelated directory to verify the installed "
+                "artifact."
+            )
+        return (
+            "Run the installed console script from an unrelated directory "
+            "to verify the installed artifact instead of the checkout."
+        )
+    if primary == install_resolution.CONDITION_AMBIGUOUS:
+        return (
+            "Run 'relinkra version --paths' and include its output in a "
+            "report — this interpreter did not disclose enough to classify "
+            "the running code."
+        )
+    return ""
+
+
+def check_install_resolution(resolution=None) -> Check:
+    """Report which Relinkra runs here, and whether PATH reaches it.
+
+    WARN at worst, never FAIL, and that is a deliberate design decision
+    rather than a soft option. Every state this check can observe leaves
+    the engine itself working; what is degraded is either reachability (a
+    console script no PATH entry reaches) or verification honesty (a
+    checkout winning the import race against a real install). The
+    documented contract — a WARN never changes the exit code — is exactly
+    the right severity for a diagnostic that must not turn "your
+    environment is unusual" into "Relinkra is broken".
+
+    Nothing here mutates PATH, PYTHONPATH, a shell profile, an
+    environment variable, an installed package, or a process.
+    """
+    if resolution is None:
+        resolution = install_resolution.resolve_install()
+
+    label = _INSTALL_MODE_LABELS.get(
+        resolution.running_from, resolution.running_from
+    )
+    visible_version = (
+        resolution.installed_distribution_version
+        or resolution.distribution_version
+    )
+    origin = label
+    if (
+        resolution.running_from == install_resolution.RUNNING_INSTALLED
+        and visible_version
+    ):
+        origin = f"{label} {visible_version}"
+    elif resolution.running_from == install_resolution.RUNNING_SOURCE:
+        origin = f"{label} (no project metadata detected)"
+        if resolution.checkout_evidence:
+            origin = label
+
+    interpreter = resolution.interpreter_name or "an unnamed interpreter"
+    where = f"{interpreter} {resolution.interpreter_version}".strip()
+    if resolution.virtualenv_name:
+        where = f"{where} in virtualenv {resolution.virtualenv_name}"
+
+    detail = f"{origin}; running under {where}"
+    condition_detail = _install_condition_detail(resolution)
+    if condition_detail:
+        detail = f"{detail}; {condition_detail}"
+
+    if not resolution.conditions:
+        return Check("Install resolution", PASS, detail)
+    action = _install_condition_action(resolution)
+    if not action:
+        # Unreachable while every condition token has a sentence, and kept
+        # anyway: a non-PASS check with no action would violate the
+        # doctor-wide contract that every warning tells you what to do.
+        action = (
+            "Run 'relinkra version --paths' and include its output in a "
+            "report — this install could not be classified."
+        )
+    return Check("Install resolution", WARN, detail, action)
 
 
 def check_repository(root: Optional[Path]) -> Check:
@@ -1791,6 +1950,14 @@ def cmd_doctor(args) -> int:
     not a failure, so it does not change the exit code.
     """
     resolved = resolve(args.path)
+    # Which code is running is an interpreter-level fact, not a
+    # workspace-level one, so it is established up front and survives a
+    # missing or broken workspace. It is APPENDED to the check list below
+    # rather than placed at the front: the compact "Next:" line takes the
+    # first warning, and "this workspace is not initialized" must keep
+    # outranking an install-path nicety. The compact view still shows this
+    # row first, because that ordering comes from the core-group table.
+    install_facts = install_resolution.resolve_install()
     checks: List[Check] = [
         check_runtime(),
         check_git_executable(),
@@ -1865,6 +2032,11 @@ def cmd_doctor(args) -> int:
         "relinkra_version": __version__,
         "contract_version": CONTRACT_VERSION,
         "checks": [check.to_dict() for check in checks],
+        # Additive, portable section: classification tokens, booleans,
+        # versions and basenames only. The machine-local paths that back
+        # this classification live behind 'relinkra version --paths', so
+        # the documented no-local-paths guarantee of this payload holds.
+        "install": install_facts.to_dict(),
     }
     if identity is not None:
         payload["identity"] = identity.to_dict()
@@ -1923,6 +2095,7 @@ def cmd_doctor(args) -> int:
         payload["agent_instructions"] = backend_policy.agent_instruction_document()
     # Audit the payload we are about to print, then report the result
     # alongside it.
+    checks.append(check_install_resolution(install_facts))
     portable = check_portable_output(payload)
     checks.append(portable)
     payload["checks"] = [check.to_dict() for check in checks]
@@ -1984,6 +2157,9 @@ def cmd_doctor(args) -> int:
 #: row shows the WORST status in the group and that check's detail, so
 #: a compact row can always be expanded by re-running with --verbose.
 _COMPACT_CORE_GROUPS = [
+    # First, because "which Relinkra is this?" is the question every other
+    # row assumes an answer to.
+    ("Install resolution", ("Install resolution",)),
     ("Git", ("Git executable", "Git repository")),
     ("Project identity", ("Project identity",)),
     ("Registered revision", ("Registered revision",)),
@@ -3419,15 +3595,41 @@ def cmd_cbm_open(args) -> int:
     return EXIT_OK
 
 
+def _render_local_paths(local: Dict[str, Any]) -> str:
+    """Machine-local resolution detail, rendered only on explicit request."""
+    lines = ["local resolution (machine-local paths):"]
+    for key in (
+        "interpreter",
+        "package_origin",
+        "distribution_metadata",
+        "expected_scripts_dir",
+        "resolved_console_script",
+    ):
+        lines.append(f"  {key}: {local.get(key) or '(none)'}")
+    pythonpath = local.get("pythonpath") or []
+    if pythonpath:
+        lines.append("  pythonpath:")
+        lines.extend(f"    {entry}" for entry in pythonpath)
+    else:
+        lines.append("  pythonpath: (not set)")
+    return "\n".join(lines)
+
+
 def cmd_version(args) -> int:
     """Show the Relinkra version and basic compatibility information.
 
-    Deliberately path-free: a version answer must never leak local
-    directories into bug reports or screenshots.
+    Deliberately path-free by default: a version answer must never leak
+    local directories into bug reports or screenshots. ``--paths`` is the
+    explicit opt-in that lifts that guarantee for one invocation, because
+    "which interpreter owns this, and where is its console script?" is a
+    question that can only be answered with the real paths. Nothing is
+    changed by asking — the flag is read-only, and the environment is
+    never dumped, only the paths this diagnostic reasons about.
     """
     install_mode, metadata_version, metadata_consistent = (
         _runtime_version_metadata()
     )
+    resolution = install_resolution.resolve_install()
     payload = {
         "relinkra_version": __version__,
         "contract_version": CONTRACT_VERSION,
@@ -3449,6 +3651,10 @@ def cmd_version(args) -> int:
         f"· contract {payload['contract_version']} "
         f"· {payload['install_mode']}"
     )
+    if getattr(args, "paths", False):
+        local = resolution.local_paths()
+        payload["local_paths"] = local
+        text = text + "\n" + _render_local_paths(local)
     _emit(payload, args.json, text)
     return EXIT_OK
 
@@ -3589,6 +3795,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     version_cmd.add_argument(
         "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    version_cmd.add_argument(
+        "--paths",
+        action="store_true",
+        help=(
+            "include machine-local resolution paths (interpreter, imported "
+            "origin, script directory, resolved console script, PYTHONPATH); "
+            "off by default because the default answer stays path-free"
+        ),
     )
     version_cmd.set_defaults(func=cmd_version)
 
