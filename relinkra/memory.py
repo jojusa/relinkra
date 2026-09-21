@@ -223,8 +223,11 @@ def validate_code_refs(code_refs: Any, project_id: Optional[str] = None) -> list
 
 _REDACTED = "[REDACTED]"
 
+_PRIVATE_KEY_HEADER = r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+_PRIVATE_KEY_TRAILER = r"-----END [A-Z0-9 ]*PRIVATE KEY-----"
+_BEGIN_PRIVATE_KEY_RE = re.compile(_PRIVATE_KEY_HEADER)
 _PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    _PRIVATE_KEY_HEADER + r".*?" + _PRIVATE_KEY_TRAILER,
     re.DOTALL,
 )
 _URL_PASSWORD_RE = re.compile(
@@ -252,6 +255,124 @@ _KV_SECRET_RE = re.compile(
     r")(\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&`]+)"
 )
 
+# M6: explicit ASCII scheme/domain alphabets for the anchored URL scan. The
+# sets mirror the regex character classes exactly (``[A-Za-z]`` start, then
+# ``[A-Za-z0-9+.-]``); membership tests in a frozenset are O(1).
+_URL_SCHEME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-"
+)
+_URL_SCHEME_START_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _redact_private_key_blocks(text: str) -> str:
+    """Redact PEM private-key blocks in linear time (M6).
+
+    Byte-identical to ``_PRIVATE_KEY_RE.sub(_REDACTED, text)``, but bounded:
+    ``re.sub`` re-attempts the pattern at every ``-----BEGIN`` marker, and
+    each attempt without a following ``-----END`` lazily expands to the end
+    of the text before failing, so K markers cost O(K * N). Anchoring the
+    scan makes the total work O(N):
+
+    - candidates are visited left to right with ``str.find`` over the
+      ``-----BEGIN`` literal;
+    - a candidate whose header does not match costs only its own bounded
+      header scan (the ``[A-Z0-9 ]*`` runs between markers are disjoint);
+    - the first candidate whose full match fails proves that no matching
+      ``-----END`` header exists after it, so every later candidate must
+      fail too and the scan stops — at most one failed expansion ever runs;
+    - successful expansions stay inside the replaced span, and the scan
+      resumes after it, exactly like ``re.sub``.
+
+    A match is only skipped when the regex itself cannot match there, so no
+    truncation, early slicing, or length cap is involved.
+    """
+    if "-----BEGIN" not in text or "-----END" not in text:
+        return text
+    pos = 0  # last emitted index (flush origin)
+    scan = 0  # search cursor, may skip candidates ahead of pos
+    parts = None
+    while True:
+        begin = text.find("-----BEGIN", scan)
+        if begin < 0:
+            break
+        if _BEGIN_PRIVATE_KEY_RE.match(text, begin) is None:
+            scan = begin + 1
+            continue
+        match = _PRIVATE_KEY_RE.match(text, begin)
+        if match is None:
+            break
+        if parts is None:
+            parts = []
+        parts.append(text[pos:match.start()])
+        parts.append(_REDACTED)
+        pos = match.end()
+        scan = pos
+    if parts is None:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _redact_url_passwords(text: str) -> str:
+    """Redact URL userinfo passwords in linear time (M6).
+
+    Byte-identical to
+    ``_URL_PASSWORD_RE.sub(lambda m: f"{m.group(1)}...{_REDACTED}@", text)``,
+    but bounded: the pattern starts with an unbounded greedy scheme class
+    and is not anchored by a literal, so ``re.sub`` retries it at every
+    character of a long unbroken ``[A-Za-z0-9+.-]`` run, and each retry
+    scans to the end of the run before failing — O(N^2) for a single huge
+    word, hash, base64 blob, or marker repetition.
+
+    A match must contain ``://``, and its scheme is exactly the maximal
+    run of scheme characters immediately before that ``://``; the pattern
+    can only match starting at the first ASCII letter of that run (every
+    later start shares the identical suffix after ``://``, so if the first
+    fails they all fail). Anchoring the scan to ``str.find("://")`` and
+    that first letter therefore visits each candidate exactly once and
+    costs O(N) overall: the runs before successive ``://`` occurrences are
+    disjoint because ``:`` is not a scheme character.
+
+    No truncation, early slicing, or length cap is involved: the result is
+    identical to the regex pass for every input, including schemes of any
+    length.
+    """
+    pos = 0  # last emitted index (flush origin)
+    scan = 0  # search cursor, may skip candidates ahead of pos
+    parts = None
+    while True:
+        stop = text.find("://", scan)
+        if stop < 0:
+            break
+        # Walk back over the scheme run, remembering the leftmost letter.
+        anchor = -1
+        index = stop
+        while index > 0:
+            char = text[index - 1]
+            if char not in _URL_SCHEME_CHARS:
+                break
+            index -= 1
+            if char in _URL_SCHEME_START_CHARS:
+                anchor = index
+        match = None
+        if anchor >= 0:
+            match = _URL_PASSWORD_RE.match(text, anchor)
+        if match is None:
+            scan = stop + 1
+            continue
+        if parts is None:
+            parts = []
+        parts.append(text[pos:match.start()])
+        parts.append(f"{match.group(1)}{match.group(2)}:{_REDACTED}@")
+        pos = match.end()
+        scan = pos
+    if parts is None:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
+
 
 def redact_text(text: str) -> str:
     """Best-effort secret redaction applied before persistence.
@@ -260,11 +381,18 @@ def redact_text(text: str) -> str:
     PEM private key blocks, and generic ``token=`` / ``api_key=`` /
     ``password=`` style key-values. This is defense in depth, not a
     guarantee: do not put secrets in memories.
+
+    M6: every pass runs in time linear in the input length. The PEM-block
+    and URL-credential passes are anchored scans (see the helpers above)
+    rather than backtracking ``re.sub`` passes, so an arbitrarily large
+    attacker-controlled title cannot make redaction superlinear. Output is
+    byte-identical to the historical regex passes: no truncation, no early
+    slicing, no reduced redaction coverage.
     """
     if not isinstance(text, str) or not text:
         return text
-    out = _PRIVATE_KEY_RE.sub(_REDACTED, text)
-    out = _URL_PASSWORD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}:{_REDACTED}@", out)
+    out = _redact_private_key_blocks(text)
+    out = _redact_url_passwords(out)
     out = _BEARER_RE.sub(lambda m: m.group(1) + _REDACTED, out)
     out = _KNOWN_TOKEN_RE.sub(_REDACTED, out)
 
