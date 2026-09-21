@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
 
-from .memory import normalize_title
+from .memory import display_memory_id, normalize_title
 
 
 def _strip_local_diagnostics(value: Any) -> Any:
@@ -435,11 +435,14 @@ class ContextPacket:
             for item in other:
                 # Memory titles are untrusted data (RIC-03): always render
                 # them flattened to one line so a stored legacy title can
-                # never start a new packet-level Markdown line.
+                # never start a new packet-level Markdown line. The same
+                # holds for memory_id (M5B): raw/legacy records may carry
+                # multi-line ids, so the rendered form is flattened too.
+                # Identity itself is never rewritten.
                 lines.append(
                     f"  - [{item.data.get('memory_type')}] "
                     f"{normalize_title(item.data.get('title'))} "
-                    f"({item.data.get('memory_id')})"
+                    f"({display_memory_id(item.data.get('memory_id'))})"
                 )
         lines.append("")
 
@@ -467,7 +470,7 @@ class ContextPacket:
                 lines.append(
                     f"- [{item.data.get('memory_type')}] "
                     f"{normalize_title(item.data.get('title'))} "
-                    f"({item.data.get('memory_id')})"
+                    f"({display_memory_id(item.data.get('memory_id'))})"
                 )
         else:
             lines.append("- (none)")
@@ -484,7 +487,7 @@ class ContextPacket:
             for item in constraints:
                 lines.append(
                     f"- {normalize_title(item.data.get('title'))} "
-                    f"({item.data.get('memory_id')})"
+                    f"({display_memory_id(item.data.get('memory_id'))})"
                 )
         else:
             lines.append("- (none)")
@@ -525,13 +528,13 @@ class ContextPacket:
             for item in self.pending:
                 lines.append(
                     f"- [pending] {normalize_title(item.data.get('title'))} "
-                    f"({item.data.get('memory_id')})"
+                    f"({display_memory_id(item.data.get('memory_id'))})"
                 )
         if self.handoffs:
             for item in self.handoffs:
                 lines.append(
                     f"- [handoff] {normalize_title(item.data.get('title'))} "
-                    f"({item.data.get('memory_id')})"
+                    f"({display_memory_id(item.data.get('memory_id'))})"
                 )
         if not self.pending and not self.handoffs:
             lines.append("- (none)")
@@ -606,7 +609,12 @@ class ContextPacket:
             else:
                 lines.append("- freshness: no selected evidence")
             for notice in self.explainability.get("notices") or []:
-                ref = notice.get("evidence_ref") or "unknown evidence"
+                # M5B: an evidence_ref embeds the source memory_id
+                # (``section:<id>:<occurrence>``); flatten it so a hostile
+                # raw id cannot break out of this line either.
+                ref = display_memory_id(
+                    notice.get("evidence_ref") or "unknown evidence"
+                )
                 state = notice.get("state") or "unknown"
                 action = notice.get("recommended_action") or (
                     "Inspect the referenced source before relying on it."
@@ -617,12 +625,19 @@ class ContextPacket:
             lines.append(f"- contradictions: {len(self.contradictions)}")
             lines.append("- advisory only: independent inspection remains available")
             for contradiction in self.contradictions:
-                subject = contradiction.get("subject") or "unknown subject"
+                # M5B: subject/refs can carry a stored memory_id; flatten
+                # them so a hostile raw id stays inside this one line.
+                subject = display_memory_id(
+                    contradiction.get("subject") or "unknown subject"
+                )
                 key = contradiction.get("key") or "unknown fact"
                 sources = ", ".join(
                     contradiction.get("source_systems") or []
                 )
-                refs = ", ".join(contradiction.get("evidence_refs") or [])
+                refs = ", ".join(
+                    display_memory_id(ref)
+                    for ref in (contradiction.get("evidence_refs") or [])
+                )
                 action = contradiction.get("recommended_action") or (
                     "Inspect the referenced sources and resolve the conflict."
                 )
@@ -649,7 +664,14 @@ class ContextPacket:
             + self.code_facts
         ):
             prov = item.provenance
-            key = prov.memory_id or prov.code_reference_id or "item"
+            # M5B: a raw/legacy memory_id is untrusted display data; only
+            # the memory_id path is flattened (code_reference_id is
+            # shape-validated at its own parse boundary).
+            key = (
+                display_memory_id(prov.memory_id)
+                if prov.memory_id
+                else (prov.code_reference_id or "item")
+            )
             lines.append(
                 f"- {key}: source={prov.source} why={prov.why_included}"
             )

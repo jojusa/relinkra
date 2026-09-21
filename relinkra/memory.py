@@ -315,6 +315,45 @@ def normalize_title(title: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# memory_id presentation (M5B: id structural-injection defense)
+# ---------------------------------------------------------------------------
+
+
+def display_memory_id(memory_id: Any) -> str:
+    """Render-safe single-line presentation of a stored memory_id.
+
+    M5B: a memory_id is source-authoritative IDENTITY, and it is never
+    rewritten: ``Memory.from_envelope`` deliberately accepts non-canonical
+    raw/legacy ids, ``get``/history/supersede keep addressing the exact
+    stored value, and this helper is NOT applied to any stored or
+    serialized field.  But when an id is rendered into ContextPacket
+    Markdown it is DATA, not structure: any line separator inside the id
+    would start a new column-0 Markdown line and counterfeit packet-level
+    headings, sibling list items, fenced blocks, metadata lines, or fake
+    provenance sections.
+
+    The defense is render-time only and purely structural: Unicode
+    ``\\s`` covers every separator ``str.splitlines`` treats as a break
+    (LF, CRLF, CR, NEL, LINE/PARAGRAPH SEPARATOR, and the C0 file/group/
+    record/unit separators), so collapsing whitespace runs to one space
+    and stripping the edges makes the rendered form physically unable to
+    leave its own line.  Canonical ``mem_`` ids — and every other
+    already-single-line id — pass through byte-identical; a hostile id is
+    neutralized in place without being transformed into a different valid
+    id, and a safe rendered form never claims the underlying id is
+    canonical.
+
+    The same flattening is applied at render time to composite evidence
+    tokens that EMBED a memory_id (``section:<id>:<occurrence>`` refs and
+    contradiction subjects), so an embedded hostile id cannot break out
+    through the explainability rendering either.  Non-string values keep
+    the exact text the renderer would have produced before (``str()``).
+    """
+    text = memory_id if isinstance(memory_id, str) else str(memory_id)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
 # Dedup
 # ---------------------------------------------------------------------------
 
