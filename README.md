@@ -426,6 +426,14 @@ accept `--path`, `--json`, and `--mode fast`.
   accounting only — never prompts, memory bodies, source snippets, task text
   or handoff bodies — and records stay under `.relinkra/` rather than being
   sent to a host.
+- **Bounded concurrency.** Routes that can launch CBM work (the status route
+  and the two graph routes) share one small concurrency gate (at most 4
+  expensive requests in flight). Under a burst, excess requests fail fast with
+  a deterministic `429 viewer_busy` JSON response (`Retry-After: 1`) instead
+  of piling up provider subprocesses; static assets and the metrics routes
+  are unaffected. A request whose `Host` header names a non-loopback
+  authority is refused (`400`) before any work. There is no authentication:
+  the viewer is loopback-only and makes no public-server claim.
 - **No automatic lifecycle.** Opening the viewer never indexes or refreshes;
   stale or missing indexes are reported with the exact command to run.
 - **Options.** `--path`, `--port PORT` (default `0`: the OS picks a free

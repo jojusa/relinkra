@@ -21,6 +21,17 @@ Boundaries that are intentional and tested:
   raising or malformed provider becomes a fixed 500 JSON body, never a
   traceback, and never kills the server; a graph route without a
   provider is a fixed 503.
+- expensive work is bounded (M4/TSC-03): routes whose providers can
+  launch CBM subprocesses (status, graph search, graph node) share one
+  small concurrency gate (``MAX_EXPENSIVE_REQUESTS``). The excess is a
+  fixed 429 ``viewer_busy`` response emitted BEFORE any provider runs,
+  so one local client cannot amplify into unbounded concurrent
+  provider/subprocess work. Static assets and the local-only metrics
+  routes stay outside the gate.
+- the Host header must name a loopback authority (``127.0.0.1``,
+  ``localhost``, ``::1``) when present; a foreign authority name (the
+  DNS-rebinding shape) is a plain 400 before any routing or provider
+  work. An absent Host (HTTP/1.0-style clients) stays accepted.
 
 There is no daemon mode, no PID file, no persistence, no service
 registration, and no CORS surface.
@@ -34,6 +45,7 @@ import inspect
 import json
 import os
 import socketserver
+import threading
 import urllib.parse
 import webbrowser
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -80,6 +92,62 @@ _STATUS_ERROR = {"error": "status unavailable"}
 #: Fixed, non-sensitive failure body for an absent/failing graph provider.
 _GRAPH_ERROR = {"error": "graph unavailable"}
 _METRICS_ERROR = {"error": "metrics unavailable"}
+
+#: Upper bound on concurrent requests that may run EXPENSIVE provider
+#: work (M4/TSC-03). The graph routes and the status route can each
+#: launch one or two CBM subprocesses per request, so this gate also
+#: bounds aggregate subprocess amplification to at most
+#: ``2 * MAX_EXPENSIVE_REQUESTS`` children in flight. Small and fixed on
+#: purpose: the viewer is a local single-user tool, not a shared server.
+MAX_EXPENSIVE_REQUESTS = 4
+
+#: Exact-match routes whose providers may launch provider/CBM
+#: subprocesses: the VIS-2 graph queries, and the status route (it probes
+#: the stored graph through the adapter when CBM is available). These
+#: run under the concurrency gate. Static assets and the metrics routes
+#: are cheap local reads and deliberately stay outside it.
+_GATED_PATHS = frozenset({STATUS_PATH, GRAPH_SEARCH_PATH, GRAPH_NODE_PATH})
+
+#: Deterministic overload contract: an excess expensive request is
+#: rejected fail-fast with this fixed JSON body — never queued, never a
+#: traceback, never a provider call.
+OVERLOAD_STATUS = 429
+_OVERLOAD_ERROR = {
+    "error": "viewer_busy",
+    "message": "The viewer is busy with other requests; retry shortly.",
+}
+_OVERLOAD_BODY = json.dumps(_OVERLOAD_ERROR, indent=2, sort_keys=True).encode(
+    "utf-8"
+)
+
+#: Hostnames the loopback viewer accepts in a Host header.
+_LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _loopback_host_allowed(header_value: Optional[str]) -> bool:
+    """True when the Host header names a loopback authority, or is absent.
+
+    The socket binds loopback only; this check refuses requests naming a
+    foreign authority (the DNS-rebinding shape) while keeping normal
+    browser and command-line use untouched. Only the hostname is compared
+    — the port is whatever this socket actually bound. HTTP/1.0 clients
+    may omit Host entirely; browsers always send it, and a browser driven
+    at the viewer through a rebound foreign name is exactly the case this
+    refuses.
+    """
+    if header_value is None:
+        return True
+    authority = header_value.strip()
+    if not authority:
+        return True
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end == -1:
+            return False
+        hostname = authority[1:end]
+    else:
+        hostname = authority.split(":", 1)[0]
+    return hostname.lower() in _LOOPBACK_HOSTNAMES
 
 _ASSET_CACHE: Dict[str, Optional[bytes]] = {}
 
@@ -144,6 +212,12 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
     # -- routing ---------------------------------------------------------
 
     def _serve(self) -> None:
+        if not _loopback_host_allowed(self.headers.get("Host")):
+            # A foreign authority name (the DNS-rebinding shape) is
+            # refused before any routing or provider work; nothing about
+            # the request is echoed back.
+            self._respond(400, _TEXT, b"Bad request")
+            return
         path = self._path_only()
         route = _ROUTES.get(path)
         if route is not None:
@@ -154,16 +228,49 @@ class _ViewerRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._respond(200, content_type, data)
             return
-        if path == STATUS_PATH:
-            self._serve_status()
-            return
-        if path in (GRAPH_SEARCH_PATH, GRAPH_NODE_PATH):
-            self._serve_graph(path)
+        if path in _GATED_PATHS:
+            self._serve_gated(path)
             return
         if path in (METRICS_CURRENT_PATH, METRICS_HISTORY_PATH):
             self._serve_metrics(path)
             return
         self._respond(404, _TEXT, b"Not found")
+
+    def _serve_gated(self, path: str) -> None:
+        """Serve one expensive route under the server's concurrency gate.
+
+        Fail-fast: when every slot is held, the request is rejected with
+        the fixed 429 body BEFORE the provider is invoked — no provider
+        call, no subprocess, no queue. A held slot is released in
+        ``finally``, so success, a provider failure, and a client
+        disconnect mid-response all restore capacity.
+        """
+        gate = getattr(self.server, "expensive_gate", None)
+        if gate is None:
+            # Defensive: a handler attached to a server that never ran
+            # ViewerServer.__init__ keeps the historical behavior rather
+            # than crashing the connection.
+            self._serve_expensive(path)
+            return
+        if not gate.acquire(blocking=False):
+            self._respond(
+                OVERLOAD_STATUS,
+                _JSON,
+                _OVERLOAD_BODY,
+                extra_headers=(("Retry-After", "1"),),
+            )
+            return
+        try:
+            self._serve_expensive(path)
+        finally:
+            gate.release()
+
+    def _serve_expensive(self, path: str) -> None:
+        """Dispatch one admitted expensive route to its provider."""
+        if path == STATUS_PATH:
+            self._serve_status()
+            return
+        self._serve_graph(path)
 
     def _serve_status(self) -> None:
         provider: Optional[Callable[[], Any]] = getattr(
@@ -297,6 +404,12 @@ class ViewerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     fails to bind loudly instead of silently stealing the address; on
     POSIX it stays enabled for the usual rebind robustness after
     shutdown.
+
+    Thread-per-request stays, but expensive provider work is bounded:
+    ``expensive_gate`` admits at most ``MAX_EXPENSIVE_REQUESTS``
+    concurrent requests on the gated routes (M4/TSC-03). The semaphore is
+    per instance so independent servers never share capacity, and bounded
+    so an over-release bug raises instead of silently inflating it.
     """
 
     daemon_threads = True
@@ -318,6 +431,7 @@ class ViewerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.graph_node_provider = graph_node_provider
         self.metrics_current_provider = metrics_current_provider
         self.metrics_history_provider = metrics_history_provider
+        self.expensive_gate = threading.BoundedSemaphore(MAX_EXPENSIVE_REQUESTS)
         super().__init__(server_address, RequestHandlerClass)
 
 
