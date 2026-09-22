@@ -1,8 +1,9 @@
 # R5B - continuous integration for the relinkra repository.
 #
 # Trust model: minimal top-level permissions, no untrusted triggers, no
-# secrets, every action pinned to a major tag. tests/test_ci_hygiene.py
-# enforces this contract; keep it in sync when editing this file.
+# secrets, every external action pinned to a full commit SHA (the version
+# comment is informational only). tests/test_ci_hygiene.py enforces this
+# contract; keep it in sync when editing this file.
 name: CI
 
 on:
@@ -24,8 +25,10 @@ jobs:
     name: fast / ubuntu / py3.14
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Byte-compile the package and the tools
@@ -77,8 +80,10 @@ jobs:
           - { os: macos-latest, python: "3.11" }
           - { os: macos-latest, python: "3.14" }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - name: Install the package (isolated PEP 517 build)
@@ -128,10 +133,23 @@ jobs:
           - { os: windows-latest, platform: windows }
           - { os: macos-latest, platform: macos }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
+      - name: Verify the checked-out revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          run_sha="${{ github.sha }}"
+          if [ "$head_sha" != "$run_sha" ]; then
+            echo "checked-out revision $head_sha does not match the run revision $run_sha" >&2
+            exit 1
+          fi
+          echo "checked-out revision: $head_sha"
       # Canonical full regression per R5B.10: 0 failures, 0 errors, 0
       # ResourceWarnings — the emitter promotes ResourceWarning to error
       # in-process, mirroring release_check.run_regression. The E2E suites
@@ -151,7 +169,7 @@ jobs:
       # Uploaded even when the suite failed: a passed=false fragment is
       # evidence, not noise. Ephemeral on purpose — run-scoped evidence
       # is never committed and expires with the run.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: run-evidence-${{ matrix.platform }}
@@ -167,15 +185,17 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       # R5C run-scoped evidence: full-regression cells upload SHA-bound
       # fragments (github.sha + github.run_id, retention-days: 1, never
       # committed). They are downloaded unmerged so duplicate-platform
       # fragments stay detectable, then composed into one evidence map.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: run-evidence-*
           path: run-evidence/
@@ -231,7 +251,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       # if: always(): the report artifact must exist even on degraded
       # runs so the gate evidence stays inspectable after failures.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: release-report

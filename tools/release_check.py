@@ -60,9 +60,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from tools import artifact_checks, release_gates
+    from tools import artifact_checks, ci_pin_policy, release_gates
 except ImportError:  # pragma: no cover - direct script invocation
     import artifact_checks
+    import ci_pin_policy
     import release_gates
 
 import relinkra
@@ -162,7 +163,8 @@ def collect_docs() -> Dict[str, Any]:
 
 def _scan_workflow_security(workflows: List[Path]) -> Dict[str, bool]:
     """Static workflow hygiene scan: minimal permissions, no untrusted
-    triggers, actions pinned to a major tag or a full commit SHA."""
+    triggers, actions pinned to a full 40-char lowercase commit SHA
+    (tools/ci_pin_policy.py owns the pin rule)."""
     minimal_permissions = True
     no_untrusted_triggers = True
     actions_pinned = True
@@ -175,13 +177,8 @@ def _scan_workflow_security(workflows: List[Path]) -> Dict[str, bool]:
             r"^\s+contents:\s*read\s*$", top.group(1), re.MULTILINE
         ):
             minimal_permissions = False
-        for match in re.finditer(r"uses:\s*([^\s]+)@([^\s]+)", text):
-            ref = match.group(2)
-            pinned = re.fullmatch(r"v\d+(\.\d+)*", ref) or re.fullmatch(
-                r"[0-9a-f]{40}", ref
-            )
-            if not pinned:
-                actions_pinned = False
+        if ci_pin_policy.scan_text(text, str(path)):
+            actions_pinned = False
     return {
         "workflows_minimal_permissions": minimal_permissions,
         "no_untrusted_triggers": no_untrusted_triggers,

@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools import run_core_tests
+from tools import ci_pin_policy, run_core_tests
 
 TESTS_DIR = REPO_ROOT / "tests"
 TOOLS_DIR = REPO_ROOT / "tools"
@@ -286,7 +286,6 @@ class TimeoutAudit(unittest.TestCase):
 # (d) Workflow security audit
 # ---------------------------------------------------------------------------
 
-_USES_PINNED = re.compile(r"^actions/[^@\s]+@(?:v\d+|[0-9a-f]{40})$")
 _TOP_PERMISSIONS = re.compile(r"^permissions:\n((?:^ +.*\n?)+)", re.MULTILINE)
 
 
@@ -325,14 +324,17 @@ class WorkflowSecurityAudit(unittest.TestCase):
                 self.assertNotIn("continue-on-error: true", text)
 
     def test_actions_are_pinned(self):
-        for name, text in self._workflow_texts().items():
+        # Strict M8 policy: every external uses: reference must carry a
+        # full 40-char lowercase commit SHA (the version comment is
+        # informational). ci_pin_policy owns the rule.
+        for name in REQUIRED_WORKFLOWS:
             with self.subTest(workflow=name):
-                for match in re.finditer(r"uses:\s*([^\s]+)", text):
-                    self.assertRegex(
-                        match.group(1),
-                        _USES_PINNED,
-                        f"{name}: unpinned action {match.group(1)}",
-                    )
+                violations = ci_pin_policy.scan_file(WORKFLOWS_DIR / name)
+                self.assertEqual(
+                    violations,
+                    [],
+                    ci_pin_policy.format_violations(violations),
+                )
 
     def test_no_secrets_references(self):
         # These workflows need no secrets at all; the string must be absent.
@@ -345,6 +347,184 @@ class WorkflowSecurityAudit(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertNotIn("\t", text, f"{name}: tab character")
                 self.assertNotIn("\r", text, f"{name}: CRLF line ending")
+
+
+# ---------------------------------------------------------------------------
+# (d2) Strict action pin policy (M8)
+# ---------------------------------------------------------------------------
+
+
+class ActionPinPolicyAudit(unittest.TestCase):
+    """Unit cases for the strict pin policy in tools/ci_pin_policy.py.
+
+    Every external ``uses:`` reference must carry a full 40-char lowercase
+    commit SHA; the ``# vX.Y.Z`` version comment is informational only.
+    """
+
+    SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+    def _scan_value(self, value: str):
+        return ci_pin_policy.scan_text(
+            f"      - uses: {value}\n", path="x.yml"
+        )
+
+    def _assert_rejected(self, value: str) -> None:
+        violations = self._scan_value(value)
+        self.assertTrue(
+            violations, f"expected at least one violation for {value!r}"
+        )
+
+    def _assert_accepted(self, value: str) -> None:
+        violations = self._scan_value(value)
+        self.assertEqual(
+            violations, [], ci_pin_policy.format_violations(violations)
+        )
+
+    def test_mutable_refs_are_rejected(self):
+        for value in (
+            "actions/checkout@v4",
+            "owner/action@main",
+            "owner/action@master",
+            "owner/action@v1.2.3",
+        ):
+            with self.subTest(uses=value):
+                self._assert_rejected(value)
+
+    def test_malformed_commit_lengths_are_rejected(self):
+        for length in (7, 32, 39, 41):
+            with self.subTest(length=length):
+                self._assert_rejected(f"owner/action@{'a' * length}")
+
+    def test_non_hex_and_uppercase_shas_are_rejected(self):
+        self._assert_rejected(f"owner/action@{'z' * 40}")
+        uppercase = self._scan_value(f"owner/action@{self.SHA.upper()}")
+        self.assertEqual(len(uppercase), 1)
+        self.assertIn("uppercase", uppercase[0].problem)
+
+    def test_ref_less_and_container_refs_are_rejected(self):
+        self._assert_rejected("actions/checkout")
+        self._assert_rejected("docker://alpine:latest")
+        self._assert_rejected("docker://alpine@sha256:abc")
+
+    def test_dot_segments_in_remote_refs_are_rejected(self):
+        for value in (
+            f"owner/../evil@{self.SHA}",
+            f"../evil@{self.SHA}",
+            f"owner/./x@{self.SHA}",
+        ):
+            with self.subTest(uses=value):
+                self._assert_rejected(value)
+
+    def test_parent_segments_in_local_refs_are_rejected(self):
+        for value in ("./../evil", "./a/../b"):
+            with self.subTest(uses=value):
+                self._assert_rejected(value)
+
+    def test_uppercase_digest_is_rejected_canonically(self):
+        violations = self._scan_value(
+            f"docker://alpine@sha256:{'C' * 64}"
+        )
+        self.assertEqual(len(violations), 1)
+        self.assertIn("uppercase", violations[0].problem)
+
+    def test_valueless_uses_key_fails_closed(self):
+        # A multi-line value is unverifiable by the bounded scanner, so
+        # the valueless form must be reported instead of silently skipped.
+        violations = ci_pin_policy.scan_text(
+            "      - uses:\n        actions/checkout@v4\n", path="x.yml"
+        )
+        self.assertTrue(
+            violations, "a valueless uses: key must not evade the scanner"
+        )
+        self.assertEqual(violations[0].path, "x.yml")
+        self.assertEqual(violations[0].line, 1)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_regression_accepted_refs_stay_accepted(self):
+        for value in (
+            "./local/action",
+            "./.github/workflows/foo.yml",
+            f"owner/repo/sub/path@{self.SHA}",
+            f"actions/checkout@{self.SHA} # v7.0.1",
+        ):
+            with self.subTest(uses=value):
+                self._assert_accepted(value)
+
+    def test_pinned_local_and_digest_refs_are_accepted(self):
+        for value in (
+            f"actions/checkout@{self.SHA} # v7.0.1",
+            f"owner/repo/sub/path@{'b' * 40}",
+            "./local/action",
+            "./.github/workflows/foo.yml",
+            f"docker://alpine@sha256:{'c' * 64}",
+            f'"actions/checkout@{self.SHA}"',
+        ):
+            with self.subTest(uses=value):
+                self._assert_accepted(value)
+
+    def test_scanner_ignores_comments_and_block_scalar_text(self):
+        text = (
+            "# - uses: actions/checkout@v4\n"
+            "      - name: step\n"
+            "        run: |\n"
+            "          uses: owner/action@main\n"
+            "          # - uses: owner/action@v1\n"
+            '        shell: echo "uses: owner/action@main"\n'
+        )
+        violations = ci_pin_policy.scan_text(text, path="x.yml")
+        self.assertEqual(
+            violations, [], ci_pin_policy.format_violations(violations)
+        )
+
+    def test_real_uses_after_a_block_scalar_is_detected_once(self):
+        text = (
+            "      - name: step\n"
+            "        run: |\n"
+            "          uses: owner/action@main\n"
+            "      - uses: owner/action@main\n"
+        )
+        violations = ci_pin_policy.scan_text(text, path="x.yml")
+        self.assertEqual(
+            len(violations),
+            1,
+            ci_pin_policy.format_violations(violations),
+        )
+        self.assertEqual(violations[0].path, "x.yml")
+        self.assertEqual(violations[0].line, 4)
+        self.assertEqual(violations[0].uses, "owner/action@main")
+
+    def test_inline_comment_does_not_excuse_a_mutable_ref(self):
+        violations = self._scan_value(
+            "actions/checkout@v4 # deliberately mutable"
+        )
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].uses, "actions/checkout@v4")
+
+    def test_violation_string_is_readable(self):
+        violations = self._scan_value("actions/checkout@v4")
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(
+            str(violations[0]),
+            f"x.yml:1: actions/checkout@v4 -> {violations[0].problem}",
+        )
+
+    def test_repository_workflows_are_fully_pinned(self):
+        violations = ci_pin_policy.scan_workflows_dir(WORKFLOWS_DIR)
+        self.assertEqual(
+            violations, [], ci_pin_policy.format_violations(violations)
+        )
+        scanned = sum(
+            sum(
+                1
+                for _ in ci_pin_policy.iter_uses(
+                    _read(WORKFLOWS_DIR / name)
+                )
+            )
+            for name in REQUIRED_WORKFLOWS
+        )
+        self.assertGreaterEqual(
+            scanned, 20, "too few uses: references scanned; vacuous pass risk"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +690,7 @@ class RunScopedEvidenceAudit(unittest.TestCase):
 
     def test_run_evidence_fragments_downloaded_unmerged(self):
         body = self._job_body("release-readiness")
-        self.assertIn("actions/download-artifact@v7", body)
+        self.assertIn("actions/download-artifact@", body)
         self.assertIn("pattern: run-evidence-*", body)
         # No merge-multiple: duplicate platform fragments must stay
         # detectable by the composer.
@@ -532,7 +712,7 @@ class RunScopedEvidenceAudit(unittest.TestCase):
     def test_run_evidence_artifacts_are_ephemeral(self):
         body = self._job_body("full-regression")
         match = re.search(
-            r"(?ms)^      - uses: actions/upload-artifact@v7\n"
+            r"(?ms)^      - uses: actions/upload-artifact@[^\n]*\n"
             r"(?P<body>.*?)(?=^      - |\Z)",
             body,
         )
@@ -547,7 +727,7 @@ class RunScopedEvidenceAudit(unittest.TestCase):
     def test_release_report_upload_runs_always(self):
         body = self._job_body("release-readiness")
         match = re.search(
-            r"(?ms)^      - uses: actions/upload-artifact@v7\n"
+            r"(?ms)^      - uses: actions/upload-artifact@[^\n]*\n"
             r"(?P<body>.*?)(?=^      - |\Z|\Z)",
             body,
         )

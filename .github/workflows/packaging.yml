@@ -24,13 +24,27 @@ jobs:
     name: package / build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
           # The pip cache keys on OS + python + pyproject; it never caches
           # the built relinkra tree itself.
           cache: pip
+      - name: Record the build revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          run_sha="${{ github.sha }}"
+          if [ "$head_sha" != "$run_sha" ]; then
+            echo "checked-out revision $head_sha does not match the run revision $run_sha" >&2
+            exit 1
+          fi
+          echo "build revision: $head_sha"
+          printf '%s\n' "$head_sha" > build-revision.txt
       - name: Install the build frontend
         run: python -m pip install --upgrade build
       # Produces dist/relinkra-<version>-py3-none-any.whl and
@@ -49,13 +63,14 @@ jobs:
       - name: Record artifact digests
         shell: bash
         run: cd dist && sha256sum * | tee ../SHA256SUMS.txt
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: relinkra-dist
           path: |
             dist/
             SHA256SUMS.txt
             artifact-report.json
+            build-revision.txt
           retention-days: 30
           if-no-files-found: error
 
@@ -75,14 +90,27 @@ jobs:
           - { os: macos-latest, python: "3.14" }
     steps:
       # The checkout is required: the E2E harness lives in tests/.
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: relinkra-dist
           path: artifacts/
+      - name: Verify the build revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_sha="$(cat artifacts/build-revision.txt)"
+          run_sha="${{ github.sha }}"
+          if [ "$artifact_sha" != "$run_sha" ]; then
+            echo "artifact revision $artifact_sha does not match the run revision $run_sha" >&2
+            exit 1
+          fi
+          echo "artifact revision: $artifact_sha"
       # Installs the EXACT artifact produced by the build job, never a
       # rebuild. upload-artifact preserves the dist/ directory under the
       # least common ancestor, so the wheel lands at
@@ -114,14 +142,27 @@ jobs:
           - { os: windows-latest, python: "3.14" }
           - { os: macos-latest, python: "3.14" }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: relinkra-dist
           path: artifacts/
+      - name: Verify the build revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_sha="$(cat artifacts/build-revision.txt)"
+          run_sha="${{ github.sha }}"
+          if [ "$artifact_sha" != "$run_sha" ]; then
+            echo "artifact revision $artifact_sha does not match the run revision $run_sha" >&2
+            exit 1
+          fi
+          echo "artifact revision: $artifact_sha"
       # pip builds from the sdist artifact itself (PEP 517 isolated),
       # proving the sdist is self-sufficient. The selector applies the
       # same recursive identity and checksum contract as the wheel job.

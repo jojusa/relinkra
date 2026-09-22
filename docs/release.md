@@ -103,9 +103,10 @@ gates remain authoritative when that authority is unavailable.
 ## CI map
 
 Three workflows under `.github/workflows/`. Common trust model (enforced
-by `tests/test_ci_hygiene.py`): top-level `permissions: contents: read`,
-no `pull_request_target`, no secrets, every action pinned to a major tag
-(`checkout@v7`, `setup-python@v7`, `upload/download-artifact@v7`), no
+by `tests/test_ci_hygiene.py` and `tools/release_check.py`): top-level
+`permissions: contents: read`, no `pull_request_target`, no secrets, every
+external action pinned to a full 40-character commit SHA (the `# vX.Y.Z`
+comment is informational only; mutable tags and branches are rejected), no
 `continue-on-error`.
 
 ### `ci.yml` — CI
@@ -169,7 +170,7 @@ consumed through exactly this chain; it is not current release-HEAD evidence.
 
 | Job | What it proves | What it does NOT prove |
 |---|---|---|
-| `build` (ubuntu / 3.14) | `python -m build` produces wheel + sdist; `tools/artifact_checks.py` enforces the content contract; `SHA256SUMS.txt` records digests; artifacts uploaded once. | Installability — that is the point of the downstream jobs. |
+| `build` (ubuntu / 3.14) | `python -m build` produces wheel + sdist; `tools/artifact_checks.py` enforces the content contract; `SHA256SUMS.txt` records digests; the build job records the checked-out revision (`build-revision.txt`, validated against `github.sha`) and the install journeys re-verify it; artifacts uploaded once. | Installability — that is the point of the downstream jobs. |
 | `wheel-install` (matrix) | 6 cells — ubuntu 3.9/3.14, windows 3.9/3.14, macos 3.11/3.14 — each downloads the **exact built wheel** and installs it via `test_install_e2e.py` (`RELINKRA_E2E_ARTIFACT`), sandboxing HOME/USERPROFILE/APPDATA/XDG_CONFIG_HOME/CODEX_HOME and proving source-tree independence. | Anything about other wheels — only this artifact, by design. |
 | `sdist-install` (matrix) | 3 cells — ubuntu/windows/macos × py3.14 — pip builds from the **exact built sdist** (PEP 517 isolated) via `test_sdist_install_e2e.py`, proving the sdist is self-sufficient. | Same one-artifact scope as wheel-install. |
 
@@ -243,7 +244,7 @@ possibly apply is NOT_APPLICABLE, never PASS.
 | `HOST_CERTIFICATION` | `hosts.certified_hosts` + `regenerated_in_ci` | Certified hosts **and** certification regenerated in CI; broader host/ZCode runtime certification is pending, so historical/structural evidence is PARTIAL. |
 | `DOCUMENTATION` | `docs` (release_doc, readme_sections, installation_doc) | This document, the README sections, and the installation guide all present. |
 | `LEGAL` | `legal.license_present`, `notice_complete` | LICENSE file exists. No LICENSE is BLOCKED — distribution rights undefined. |
-| `SECURITY` | Workflow hygiene scan | Minimal permissions, no untrusted triggers, actions pinned. |
+| `SECURITY` | Workflow hygiene scan | Minimal permissions, no untrusted triggers, actions pinned by full commit SHA. |
 | `CI` | `ci.workflows_present`, `remote_runs_passed` | Workflows present **and** remote runs green. Present-but-unrun is PARTIAL (`REMOTE_CI_PENDING`); runner quota/billing unavailability is infrastructure debt, not a product PASS or defect. |
 
 The mandatory installed evidence is supplied in the external mapping, for
