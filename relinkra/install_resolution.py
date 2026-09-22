@@ -22,6 +22,14 @@ Honesty rules this module holds to:
   * Distribution metadata alone never proves the imported code belongs to
     it. The import location and the metadata location are compared
     before anything is said about them.
+  * Local packaging metadata is OBSERVATION INPUT, never authority. A
+    malformed or unreadable ``RECORD``/``METADATA`` (a stray blank line
+    is enough: on Python 3.14 it makes ``importlib.metadata`` raise
+    ``TypeError``) degrades to the neutral "unavailable" value at the
+    exact probe that failed, so ``doctor`` and ``version`` keep
+    diagnosing. Corrupt metadata never becomes provenance, and
+    independent evidence — the import origin, the metadata directory's
+    own name, ``PYTHONPATH``, the console script — is never erased.
   * An editable installation is claimed only when its own PEP 610
     ``direct_url.json`` says ``dir_info.editable`` is true AND names the
     absolute local target it configures. Without that evidence the state
@@ -494,9 +502,32 @@ def read_metadata_version(
     return None
 
 
+def _distribution_files(document: Any) -> Optional[Sequence[Any]]:
+    """The ``RECORD``-derived file list, or ``None`` when it is unreadable.
+
+    ``importlib.metadata`` parses ``RECORD`` lazily, and a malformed file
+    makes that property RAISE instead of returning ``None``: a stray
+    blank line raises ``TypeError``, a non-numeric size raises
+    ``ValueError``, invalid UTF-8 raises ``UnicodeDecodeError``, and a
+    pathological field raises ``csv.Error``. The property is third-party
+    parsing over local bytes, so the failure is contained HERE — at the
+    single importlib-owned call — and reported as "the entry list is
+    unavailable", never as "the distribution is absent".
+
+    Only ``BaseException`` escapes: ``KeyboardInterrupt`` and
+    ``SystemExit`` still propagate, and nothing of this module runs
+    inside the guarded call, so a defect in our own parsing cannot hide
+    behind it.
+    """
+    try:
+        return getattr(document, "files", None)
+    except Exception:  # bounded evidence: importlib-owned parse
+        return None
+
+
 def _metadata_shape(document: Any) -> Optional[str]:
     """Distribution shape, read the same way the version command reads it."""
-    for entry in getattr(document, "files", None) or ():
+    for entry in _distribution_files(document) or ():
         parts = Path(str(entry)).parts
         if any(part.endswith(".dist-info") for part in parts):
             return SHAPE_DIST_INFO
@@ -640,7 +671,18 @@ def _distribution_document(
 
 
 def _read_distribution_version(document: Any) -> Optional[str]:
-    version = getattr(document, "version", None)
+    """The version the document declares, or ``None`` when unreadable.
+
+    The property parses ``METADATA`` on first access, so corrupt metadata
+    — invalid UTF-8 in particular — can make it raise rather than return.
+    An unreadable version is reported as unavailable; it never becomes a
+    guess, and it is read independently of the shape probe, so a broken
+    ``RECORD`` cannot erase a version that ``METADATA`` still proves.
+    """
+    try:
+        version = getattr(document, "version", None)
+    except Exception:  # bounded evidence: importlib-owned parse
+        return None
     return str(version) if version is not None else None
 
 

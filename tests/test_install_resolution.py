@@ -30,6 +30,7 @@ installed package, and nothing reads a developer-machine path.
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata as importlib_metadata
 import io
 import json
 import os
@@ -1210,6 +1211,536 @@ class InstallCheckRenderingTests(unittest.TestCase):
         self.assertEqual(check.status, WARN)
         self.assertIn("resolved to the checkout", check.detail)
         self.assertNotIn("editable target", check.detail)
+
+
+# ---------------------------------------------------------------------------
+# M7C — malformed distribution metadata must not crash the diagnostics
+# ---------------------------------------------------------------------------
+
+#: Distinguishes "use the default RECORD" from an explicit ``None``, which
+#: omits the file entirely. The default names a file that really exists
+#: beside it, so ``Distribution.files`` has something to keep.
+_RECORD_DEFAULT = object()
+
+
+def _write_dist_info(
+    root: Path,
+    *,
+    version: str = "0.1.5",
+    record: Any = _RECORD_DEFAULT,
+    metadata: Optional[str] = None,
+    direct_url: Optional[str] = None,
+) -> Path:
+    """A real dist-info directory on disk, field by field.
+
+    The exact bytes of each field are the fixture: a malformed shape is
+    written, never simulated. ``record=None`` omits RECORD, which is what
+    a metadata-only directory looks like.
+    """
+    directory = root / f"relinkra-{version}.dist-info"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "METADATA").write_text(
+        metadata
+        if metadata is not None
+        else (
+            "Metadata-Version: 2.1\n"
+            "Name: relinkra\n"
+            f"Version: {version}\n"
+        ),
+        encoding="utf-8",
+    )
+    if record is _RECORD_DEFAULT:
+        record = f"relinkra-{version}.dist-info/METADATA,,\n"
+    if record is not None:
+        (directory / "RECORD").write_text(record, encoding="utf-8")
+    if direct_url is not None:
+        (directory / "direct_url.json").write_text(
+            direct_url, encoding="utf-8"
+        )
+    return directory
+
+
+def _readable_editable_document(target: str) -> str:
+    return json.dumps({"url": target, "dir_info": {"editable": True}})
+
+
+class MalformedMetadataTests(unittest.TestCase):
+    """Corrupt metadata degrades evidence; it never crashes or lies.
+
+    ``importlib.metadata`` parses RECORD/METADATA lazily, and malformed
+    bytes make those properties RAISE instead of returning ``None``: on
+    CPython 3.14 a stray blank RECORD line raises ``TypeError``, a
+    non-numeric size raises ``ValueError``, and invalid UTF-8 raises
+    ``UnicodeDecodeError``. These tests assert the module's own contract
+    rather than importlib's per-version behavior, so they stay valid on
+    every supported interpreter: the failing probe degrades to the
+    neutral value, independent evidence survives, and doctor/version
+    keep diagnosing.
+    """
+
+    def _gather(self, document, **overrides):
+        """Hermetic gather with the corrupt document injected."""
+        kwargs = dict(
+            imported_file=CHECKOUT_FILE,
+            lib_dirs=(LIB_DIR,),
+            distribution_lookup=lambda name: document,
+            cwd="C:/tmp",
+            environ={},
+            which=lambda name: None,
+            expected_script_present=False,
+            checkout_evidence=False,
+            lib_metadata=(),
+        )
+        kwargs.update(overrides)
+        return ir.gather_install_evidence(**kwargs)
+
+    def test_a_a_valid_record_is_unchanged(self):
+        """Control: a healthy RECORD still yields the established shape."""
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(Path(tmp))
+            )
+            found = self._gather(document)
+        self.assertIsNotNone(found.distribution)
+        self.assertEqual(found.distribution.kind, ir.SHAPE_DIST_INFO)
+        self.assertEqual(found.distribution_version, "0.1.5")
+        self.assertFalse(found.distribution_matches_imported)
+
+    def test_b_a_stray_blank_record_row_is_survivable(self):
+        """The reproduced defect: blank line in RECORD, doctor's path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(
+                    Path(tmp),
+                    record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+                )
+            )
+            found = self._gather(document)
+        # The shape survives through the metadata directory's own name,
+        # and the readable version survives independently of RECORD.
+        self.assertIsNotNone(found.distribution)
+        self.assertEqual(found.distribution.kind, ir.SHAPE_DIST_INFO)
+        self.assertEqual(found.distribution_version, "0.1.5")
+        resolution = ir.classify_install(found)
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_c_an_empty_record_is_not_evidence_of_absence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(Path(tmp), record="")
+            )
+            found = self._gather(document)
+        self.assertIsNotNone(found.distribution)
+        self.assertEqual(found.distribution.kind, ir.SHAPE_DIST_INFO)
+        self.assertEqual(found.distribution_version, "0.1.5")
+
+    def test_d_malformed_csv_rows_are_survivable(self):
+        """Truncated rows parse differently; a bad size field raises."""
+        for label, record in (
+            ("truncated", "relinkra-0.1.5.dist-info\n"),
+            (
+                "non-numeric-size",
+                "relinkra/__init__.py,sha256=abc,not-a-number\n",
+            ),
+        ):
+            with self.subTest(record=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    document = importlib_metadata.PathDistribution(
+                        _write_dist_info(Path(tmp), record=record)
+                    )
+                    found = self._gather(document)
+                self.assertIsNotNone(found.distribution)
+                self.assertEqual(
+                    found.distribution.kind, ir.SHAPE_DIST_INFO
+                )
+                self.assertEqual(found.distribution_version, "0.1.5")
+
+    def test_e_a_malformed_direct_url_is_still_not_editable_evidence(self):
+        """M7B's direct_url rules are unchanged by a broken RECORD."""
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(
+                    Path(tmp),
+                    record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+                    direct_url="{not json",
+                )
+            )
+            found = self._gather(document)
+        self.assertIsNotNone(found.distribution)
+        self.assertFalse(found.distribution.editable)
+        self.assertIsNone(found.distribution.editable_target)
+        resolution = ir.classify_install(found)
+        self.assertFalse(resolution.editable_evidence)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_f_a_document_without_files_uses_the_metadata_path(self):
+        """``files is None`` is the existing neutral, not a new state."""
+
+        class NoFiles:
+            files = None
+            version = "0.1.5"
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+
+            @staticmethod
+            def locate_file(name):
+                return Path(CHECKOUT)
+
+        found = self._gather(NoFiles())
+        self.assertIsNotNone(found.distribution)
+        self.assertEqual(found.distribution.kind, ir.SHAPE_DIST_INFO)
+        self.assertEqual(found.distribution_version, "0.1.5")
+        self.assertTrue(found.distribution_matches_imported)
+
+    def test_g_raising_metadata_operations_degrade_to_neutral_values(self):
+        class UnreadableMetadata:
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+            @property
+            def version(self):
+                raise ValueError("unreadable METADATA")
+
+            @staticmethod
+            def locate_file(name):
+                return Path(CHECKOUT)
+
+            @staticmethod
+            def read_text(name):
+                raise FileNotFoundError(name)
+
+        found = self._gather(UnreadableMetadata())
+        # The directory's own name still proves the shape; the version is
+        # unavailable, never a guess.
+        self.assertIsNotNone(found.distribution)
+        self.assertEqual(found.distribution.kind, ir.SHAPE_DIST_INFO)
+        self.assertIsNone(found.distribution.version)
+        self.assertIsNone(found.distribution_version)
+
+    def test_g2_nothing_readable_at_all_stays_neutral(self):
+        class NothingReadable:
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+            @property
+            def version(self):
+                raise ValueError("unreadable METADATA")
+
+        found = self._gather(NothingReadable())
+        self.assertIsNone(found.distribution)
+        self.assertIsNone(found.distribution_version)
+        resolution = ir.classify_install(found)
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        self.assertEqual(resolution.conditions, ())
+
+    def test_g3_base_exceptions_are_not_swallowed(self):
+        """A KeyboardInterrupt/SystemExit is not "malformed metadata"."""
+
+        class Interrupted:
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+            version = "0.1.5"
+
+            @property
+            def files(self):
+                raise KeyboardInterrupt
+
+        class Exiting:
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+            version = "0.1.5"
+
+            @property
+            def files(self):
+                raise SystemExit(3)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._gather(Interrupted())
+        with self.assertRaises(SystemExit):
+            self._gather(Exiting())
+
+    def test_h_a_corrupt_candidate_cannot_poison_a_valid_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            corrupt_dir = Path(tmp) / "corrupt"
+            valid_dir = Path(tmp) / "valid"
+            corrupt_dir.mkdir()
+            valid_dir.mkdir()
+            corrupt_di = _write_dist_info(
+                corrupt_dir,
+                record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+            )
+            _write_dist_info(valid_dir, version="0.1.6")
+            found = self._gather(
+                importlib_metadata.PathDistribution(corrupt_di),
+                lib_dirs=(str(corrupt_dir), str(valid_dir)),
+                lib_metadata=None,
+            )
+        versions = sorted(entry.version for entry in found.lib_metadata)
+        self.assertEqual(versions, ["0.1.5", "0.1.6"])
+        for entry in found.lib_metadata:
+            self.assertEqual(entry.kind, ir.SHAPE_DIST_INFO)
+        # The corrupt candidate is one record; the valid one still proves
+        # the install, so the shadowing condition still fires.
+        resolution = ir.classify_install(found)
+        self.assertTrue(resolution.installed_for_interpreter)
+        self.assertIn(ir.CONDITION_SHADOWED, resolution.conditions)
+
+    def test_i_malformed_metadata_with_a_source_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(
+                    Path(tmp),
+                    record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+                )
+            )
+            found = self._gather(document)
+        resolution = ir.classify_install(found)
+        self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
+        # The portable projection stays path-free even when the record
+        # that was probed lives in a temporary machine directory.
+        rendered = json.dumps(resolution.to_dict())
+        self.assertFalse(contains_absolute_path(rendered))
+
+    def test_j_malformed_metadata_with_an_installed_library_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = importlib_metadata.PathDistribution(
+                _write_dist_info(
+                    Path(tmp),
+                    record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+                )
+            )
+            found = self._gather(document, imported_file=INSTALLED_FILE)
+        resolution = ir.classify_install(found)
+        self.assertEqual(resolution.running_from, ir.RUNNING_INSTALLED)
+
+    def test_k_editable_evidence_survives_a_malformed_record(self):
+        """The library probe reads PEP 610 from disk, not from RECORD."""
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_dir = Path(tmp)
+            _write_dist_info(
+                lib_dir,
+                record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+                direct_url=_readable_editable_document(CHECKOUT),
+            )
+            found = self._gather(
+                importlib_metadata.PathDistribution(
+                    lib_dir / "relinkra-0.1.5.dist-info"
+                ),
+                lib_dirs=(tmp,),
+                lib_metadata=None,
+            )
+        self.assertEqual(len(found.lib_metadata), 1)
+        entry = found.lib_metadata[0]
+        self.assertTrue(entry.editable)
+        self.assertIsNotNone(entry.editable_target)
+
+    def test_k2_document_level_editable_evidence_survives_a_broken_record(self):
+        class CorruptRecordWithEditable:
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+            version = "0.1.5"
+
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+            @staticmethod
+            def read_text(name):
+                if name == "direct_url.json":
+                    return _readable_editable_document(CHECKOUT)
+                raise FileNotFoundError(name)
+
+            @staticmethod
+            def locate_file(name):
+                return Path(CHECKOUT)
+
+        found = self._gather(CorruptRecordWithEditable())
+        self.assertIsNotNone(found.distribution)
+        self.assertTrue(found.distribution.editable)
+        self.assertIsNotNone(found.distribution.editable_target)
+        resolution = ir.classify_install(found)
+        self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
+
+    def test_the_version_commands_shape_probe_survives(self):
+        """product_cli's own probe reads RECORD too; same contract."""
+
+        class CorruptRecord:
+            _path = CHECKOUT + "/relinkra-0.1.5.dist-info"
+
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+        self.assertEqual(
+            product_cli._distribution_shape(CorruptRecord()), "dist-info"
+        )
+
+
+class MalformedMetadataCliTests(unittest.TestCase):
+    """doctor and version against a corrupt RECORD, end to end."""
+
+    _VERSION_KEYS = {
+        "relinkra_version",
+        "contract_version",
+        "python_version",
+        "min_python_version",
+        "install_mode",
+        "installed_metadata_version",
+        "metadata_version_consistent",
+        "build_provenance",
+    }
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = product_cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _corrupt_document(self, tmp):
+        return importlib_metadata.PathDistribution(
+            _write_dist_info(
+                Path(tmp),
+                record="relinkra-0.1.5.dist-info/METADATA,,\n\n",
+            )
+        )
+
+    def test_doctor_survives_a_corrupt_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = self._corrupt_document(tmp)
+            with mock.patch.object(
+                product_cli.importlib_metadata,
+                "distribution",
+                return_value=document,
+            ):
+                code, out, _ = self._run(
+                    ["doctor", "--json", "--path", tmp]
+                )
+        payload = json.loads(out)
+        self.assertEqual(code, EXIT_ACTION_REQUIRED)
+        self.assertIn("install", payload)
+        names = [check["name"] for check in payload["checks"]]
+        self.assertIn("Install resolution", names)
+        portable = [
+            check
+            for check in payload["checks"]
+            if check["name"] == "Portable output"
+        ][0]
+        self.assertEqual(portable["status"], PASS)
+        self.assertNotIn(str(Path(tmp).resolve()), out)
+        self.assertNotIn("relinkra-0.1.5.dist-info/METADATA", out)
+
+    def test_doctor_text_view_survives_a_corrupt_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = self._corrupt_document(tmp)
+            with mock.patch.object(
+                product_cli.importlib_metadata,
+                "distribution",
+                return_value=document,
+            ):
+                _, out, _ = self._run(["doctor", "--path", tmp])
+        self.assertIn("Install resolution", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_version_survives_a_corrupt_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = self._corrupt_document(tmp)
+            with mock.patch.object(
+                product_cli.importlib_metadata,
+                "distribution",
+                return_value=document,
+            ):
+                code_json, out_json, _ = self._run(["version", "--json"])
+                code_text, out_text, _ = self._run(["version"])
+        self.assertEqual(code_json, 0)
+        self.assertEqual(code_text, 0)
+        payload = json.loads(out_json)
+        self.assertEqual(set(payload), self._VERSION_KEYS)
+        # The temp record does not match this checkout, so source mode is
+        # the honest answer — and it is reached instead of a traceback.
+        self.assertEqual(payload["install_mode"], "source")
+        self.assertIsNone(payload["installed_metadata_version"])
+        self.assertIsNone(payload["metadata_version_consistent"])
+        self.assertNotIn(str(Path(tmp).resolve()), out_json + out_text)
+        self.assertNotIn("Traceback", out_json + out_text)
+
+    def test_version_reports_installed_when_only_the_version_is_unreadable(
+        self,
+    ):
+        checkout_root = Path(product_cli.__file__).resolve().parent.parent
+
+        class CorruptMetadata:
+            _path = str(checkout_root / "relinkra-0.1.5.dist-info")
+
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+            @property
+            def version(self):
+                raise ValueError("unreadable METADATA")
+
+            @staticmethod
+            def locate_file(name):
+                return checkout_root / Path(str(name))
+
+        with mock.patch.object(
+            product_cli.importlib_metadata,
+            "distribution",
+            return_value=CorruptMetadata(),
+        ):
+            code, out, _ = self._run(["version", "--json"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        # The record matches the import, so "installed" is still proven;
+        # only the version is unavailable. "source" would be false.
+        self.assertEqual(payload["install_mode"], "installed")
+        self.assertIsNone(payload["installed_metadata_version"])
+        self.assertIsNone(payload["metadata_version_consistent"])
+
+    def test_version_keeps_a_readable_version_when_record_is_broken(self):
+        checkout_root = Path(product_cli.__file__).resolve().parent.parent
+
+        class CorruptRecord:
+            _path = str(checkout_root / "relinkra-0.1.5.dist-info")
+            version = product_cli.__version__
+
+            @property
+            def files(self):
+                raise TypeError("malformed RECORD")
+
+            @staticmethod
+            def locate_file(name):
+                return checkout_root / Path(str(name))
+
+        with mock.patch.object(
+            product_cli.importlib_metadata,
+            "distribution",
+            return_value=CorruptRecord(),
+        ):
+            code, out, _ = self._run(["version", "--json"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["install_mode"], "installed")
+        self.assertEqual(
+            payload["installed_metadata_version"],
+            product_cli.__version__,
+        )
+        self.assertTrue(payload["metadata_version_consistent"])
+
+    def test_version_paths_survives_a_corrupt_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = self._corrupt_document(tmp)
+            with mock.patch.object(
+                product_cli.importlib_metadata,
+                "distribution",
+                return_value=document,
+            ):
+                code, out, _ = self._run(["version", "--paths", "--json"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn("local_paths", payload)
+        self.assertIn("package_origin", payload["local_paths"])
 
 
 class DoctorAndVersionIntegrationTests(unittest.TestCase):

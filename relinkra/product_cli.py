@@ -120,7 +120,16 @@ _BUILD_PROVENANCE_STATEMENT = (
 
 def _distribution_shape(distribution: Any) -> Optional[str]:
     """Return the importlib.metadata shape for a distribution."""
-    for entry in distribution.files or ():
+    # ``files`` parses RECORD lazily, and a malformed record makes that
+    # property raise instead of return (a stray blank line raises
+    # TypeError on Python 3.14). The failure is contained at this single
+    # importlib-owned call, and the metadata path below — also
+    # importlib.metadata-owned, but independent of RECORD — still answers.
+    try:
+        entries = getattr(distribution, "files", None) or ()
+    except Exception:  # bounded evidence: importlib-owned parse
+        entries = ()
+    for entry in entries:
         parts = Path(str(entry)).parts
         if any(part.endswith(".dist-info") for part in parts):
             return "dist-info"
@@ -165,7 +174,16 @@ def _runtime_version_metadata() -> Tuple[str, Optional[str], Optional[bool]]:
     ):
         return "source", None, None
 
-    metadata_version = str(distribution.version)
+    try:
+        raw_version = distribution.version
+    except Exception:  # bounded evidence: importlib-owned parse
+        # The record exists and matches this import; only its version is
+        # unreadable. Reporting "source" would be a false statement, and
+        # reporting a version would be a guess.
+        return "installed", None, None
+    if raw_version is None:
+        return "installed", None, None
+    metadata_version = str(raw_version)
     return "installed", metadata_version, metadata_version == __version__
 
 
