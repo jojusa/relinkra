@@ -126,6 +126,36 @@ array-element types. Anything a tool accepts must be declarable in that
 subset — which is what keeps malformed or hostile input from reaching an
 application service at all.
 
+### Read-only semantics (TSC-01)
+
+Tools marked read-only carry the MCP annotation `readOnlyHint: true`.
+The official protocol defines that hint as "the tool does not modify
+its environment" and explicitly labels all tool annotations as
+**hints**, not faithful guarantees; "environment" is not defined
+further. Relinkra scopes the hint to **authoritative state**: a
+successful `context_get` — like every other read tool on this surface —
+does not modify source or project files, memory records, handoff
+records, logical identity or the registry, CBM source, or any external
+system.
+
+Read-only is not "zero writes under any circumstances." Serving may
+persist **bounded local observability** under `.relinkra/`:
+`context_get` appends one allow-listed observation to
+`metrics/context/<host>.json` (ids, CPT1 accounting, composition
+counts, quality flags — never task text, memory bodies, handoff
+bodies, or source snippets), and the server records runtime evidence
+to `runtime-evidence/<host>.json` after successful calls. Both stores
+are size-bounded, lock-guarded, atomic, and best-effort: a failed or
+skipped write degrades observability only and never changes the
+returned result. These writes are diagnostic, not source-authoritative
+— metrics feed the viewer, and revision-bound runtime evidence can
+advance only operator-facing `doctor` trust stages; neither is read
+back into context selection, memory policy, or packet authority.
+Repeated calls return the same deterministic packet while bumping
+those bounded diagnostic counters, so the operation is semantically
+idempotent without being byte-idempotent; `idempotentHint` is not
+emitted (the protocol scopes it to `readOnlyHint: false` tools).
+
 ### Argument conventions
 
 - `project_id` / `workspace_id` are optional on every tool. They fall
