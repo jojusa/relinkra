@@ -23,6 +23,18 @@ tests build real temporary directories — including one with a space and
 one with non-ASCII characters — so the filesystem-facing code is exercised
 without touching anything outside the temp tree.
 
+Synthetic fixture paths are HOST-NATIVE absolute paths, and
+:class:`FixturePortabilityTests` pins that invariant on every platform.
+The module under test classifies host-native observations with host-native
+semantics — ``os.pathsep`` splitting, ``Path.resolve()`` canonicalization,
+OS case folding — so a foreign-platform literal such as ``C:/py`` is a
+cwd-relative path on POSIX: ``resolve()`` anchors it under the working
+directory and ``as_uri()`` refuses it outright. That is a fixture defect,
+not a product contract, because these tests exercise the classification
+logic rather than cross-host path interpretation. Literal Windows-flavoured
+and POSIX-flavoured lexical semantics are exercised explicitly in
+:class:`DirectUrlParsingTests`, which uses foreign strings on purpose.
+
 Nothing in this suite mutates PATH, PYTHONPATH, the environment, or an
 installed package, and nothing reads a developer-machine path.
 """
@@ -56,20 +68,37 @@ try:
 except ImportError:  # pragma: no cover - discover vs module invocation
     import git_fixtures as gf
 
-#: Synthetic interpreter layout. Never the developer's real one, and
-#: deliberately free of any home-directory prefix that the CI hygiene
-#: audit would flag as a leaked machine path.
-LIB_DIR = "C:/py/Lib/site-packages"
-SCRIPTS_DIR = "C:/py/Scripts"
-USER_SCRIPTS_DIR = "C:/Users/user/AppData/Roaming/Python/Python314/Scripts"
-OTHER_SCRIPTS_DIR = "D:/other/tools/Scripts"
-CHECKOUT = "C:/work/relinkra"
+# ---------------------------------------------------------------------------
+# Synthetic interpreter layout: HOST-NATIVE absolute paths.
+# ---------------------------------------------------------------------------
+#
+# Every generic fixture below is absolute on the CURRENT host, because the
+# module under test reads host-native observations: ``os.pathsep`` splits
+# PATH and PYTHONPATH, ``Path.resolve()`` canonicalizes, and case folds the
+# way the OS folds. A foreign-platform literal (``C:/py`` on POSIX) would be
+# RELATIVE there, so resolve() would rebase it under the working directory,
+# path-list splitting would tear it apart, and ``as_uri()`` would refuse it.
+# The root is synthetic and non-existent on purpose: deterministic, stable
+# under canonicalization (no short names, symlinks or case surprises), and
+# free of any real home-directory prefix the CI hygiene audit would flag.
+_ROOT = "C:/relinkra-fixtures" if os.name == "nt" else "/relinkra-fixtures"
+
+LIB_DIR = _ROOT + "/py/Lib/site-packages"
+USER_LIB_DIR = _ROOT + "/user-scheme/Lib/site-packages"
+SCRIPTS_DIR = _ROOT + "/py/Scripts"
+USER_SCRIPTS_DIR = _ROOT + "/user-scheme/Scripts"
+OTHER_SCRIPTS_DIR = _ROOT + "/other/tools/Scripts"
+#: A directory no probe should ever consider this interpreter's own.
+UNRELATED_DIR = _ROOT + "/unrelated"
+#: A synthetic working directory, distinct from the checkout below.
+TMP_DIR = _ROOT + "/tmp"
+CHECKOUT = _ROOT + "/work/relinkra"
 INSTALLED_ROOT = LIB_DIR + "/relinkra"
 
 #: The M7B state: the editable install configures one checkout while the
 #: import resolves to a sibling that shares only a name prefix.
-CHECKOUT_A = "C:/work/relinkra-editable"
-CHECKOUT_B = "C:/work/relinkra-shadow"
+CHECKOUT_A = _ROOT + "/work/relinkra-editable"
+CHECKOUT_B = _ROOT + "/work/relinkra-shadow"
 
 #: A module file inside the package, which is what an import reports.
 CHECKOUT_FILE = CHECKOUT + "/relinkra/__init__.py"
@@ -119,7 +148,7 @@ def evidence(
     user_scripts_dir=USER_SCRIPTS_DIR,
     environ=None,
     which=None,
-    cwd="C:/tmp",
+    cwd=TMP_DIR,
     lib_metadata=(),
     expected_script_present=False,
     checkout_evidence=True,
@@ -171,6 +200,79 @@ def mismatch_resolution() -> ir.InstallResolution:
 
 
 # ---------------------------------------------------------------------------
+# Fixture contract: the synthetic paths must be honest on EVERY host
+# ---------------------------------------------------------------------------
+
+
+class FixturePortabilityTests(unittest.TestCase):
+    """The synthetic fixtures must be native and canonicalization-stable.
+
+    These tests pin the defect that broke the POSIX and Windows runners: a
+    fixture path handed to host-native path APIs must be absolute on the
+    CURRENT host, must survive ``resolve()`` unchanged, and must round-trip
+    through path-list splitting and PEP 610 file URLs. A foreign-platform
+    literal is a cwd-relative path on the other host, so it silently fails
+    every host-native comparison; a raw temp path on Windows may carry an
+    8.3 short name that ``resolve()`` expands, so it cannot be compared
+    against a resolved observation.
+    """
+
+    #: Fixtures that any generic path comparison may hand to host APIs.
+    NATIVE_FIXTURES = (
+        LIB_DIR,
+        USER_LIB_DIR,
+        SCRIPTS_DIR,
+        USER_SCRIPTS_DIR,
+        OTHER_SCRIPTS_DIR,
+        UNRELATED_DIR,
+        TMP_DIR,
+        CHECKOUT,
+        CHECKOUT_A,
+        CHECKOUT_B,
+        INSTALLED_ROOT,
+    )
+
+    def test_every_fixture_path_is_native_absolute(self):
+        for value in self.NATIVE_FIXTURES:
+            self.assertTrue(Path(value).is_absolute(), value)
+
+    def test_every_fixture_path_survives_canonicalization(self):
+        # resolve() must not move the path: no 8.3 short-name expansion, no
+        # symlinked temp root, no case surprises. The product compares
+        # RESOLVED observations on both sides, so a fixture that changed
+        # under resolve() would stop matching on runners whose TEMP is
+        # short-named (an 8.3 tilde name, as in GitHub's hosted image) or
+        # symlinked (macOS /var).
+        for value in self.NATIVE_FIXTURES:
+            self.assertEqual(
+                ir._key(ir._resolved(value)), ir._key(value), value
+            )
+
+    def test_every_fixture_path_is_expressible_as_a_file_uri(self):
+        # Path.as_uri() raises ValueError for a relative path, which is
+        # exactly how the POSIX runner surfaced the foreign fixtures.
+        for value in (CHECKOUT, CHECKOUT_A, CHECKOUT_B):
+            self.assertTrue(Path(value).as_uri().startswith("file:"))
+
+    def test_native_fixture_uris_round_trip_through_the_url_parser(self):
+        for value in (CHECKOUT, CHECKOUT_A, CHECKOUT_B):
+            uri = Path(value).as_uri()
+            self.assertTrue(
+                ir._same(ir._local_target_from_url(uri), value), uri
+            )
+
+    def test_pathsep_joined_fixtures_split_back_honestly(self):
+        joined = os.pathsep.join([CHECKOUT, UNRELATED_DIR])
+        self.assertEqual(
+            ir._pythonpath_entries(joined), [CHECKOUT, UNRELATED_DIR]
+        )
+
+    def test_pathsep_joined_path_reaches_the_scripts_directory(self):
+        joined = os.pathsep.join([UNRELATED_DIR, SCRIPTS_DIR])
+        self.assertTrue(ir._path_contains(joined, SCRIPTS_DIR))
+
+
+# ---------------------------------------------------------------------------
 # Classification matrix (cases A-J)
 # ---------------------------------------------------------------------------
 
@@ -218,7 +320,7 @@ class ExecutionModeTests(unittest.TestCase):
     def test_d_pythonpath_presence_is_reported_as_boolean_only(self):
         resolution = classify(
             lib_metadata=(installed_metadata(),),
-            environ={"PYTHONPATH": CHECKOUT + os.pathsep + "C:/other"},
+            environ={"PYTHONPATH": CHECKOUT + os.pathsep + UNRELATED_DIR},
         )
         payload = resolution.to_dict()
         self.assertTrue(payload["pythonpath"]["set"])
@@ -228,7 +330,7 @@ class ExecutionModeTests(unittest.TestCase):
 
     def test_d2_pythonpath_that_does_not_contribute_is_still_reported(self):
         resolution = classify(
-            environ={"PYTHONPATH": "D:/unrelated"},
+            environ={"PYTHONPATH": UNRELATED_DIR},
         )
         self.assertTrue(resolution.pythonpath_set)
         self.assertFalse(resolution.pythonpath_contributes_imported)
@@ -341,13 +443,13 @@ class EditableTargetTests(unittest.TestCase):
         resolution = ir.classify_install(
             ir.InstallEvidence(
                 imported_root=CHECKOUT,
-                interpreter="C:/py/python.exe",
+                interpreter=_ROOT + "/py/python.exe",
                 interpreter_version="3.14.6",
                 lib_dirs=(LIB_DIR,),
                 lib_metadata=(
                     installed_metadata(editable=True, editable_target=CHECKOUT),
                 ),
-                cwd="C:/tmp",
+                cwd=TMP_DIR,
             )
         )
         self.assertEqual(resolution.running_from, ir.RUNNING_EDITABLE)
@@ -385,7 +487,7 @@ class EditableTargetTests(unittest.TestCase):
             ),
             expected_script_present=True,
             which=resolved_at(SCRIPTS_DIR),
-            environ={"PYTHONPATH": "D:/unrelated", "PATH": SCRIPTS_DIR},
+            environ={"PYTHONPATH": UNRELATED_DIR, "PATH": SCRIPTS_DIR},
         )
         self.assertEqual(resolution.running_from, ir.RUNNING_SOURCE)
         self.assertIn(ir.CONDITION_EDITABLE_MISMATCH, resolution.conditions)
@@ -445,7 +547,7 @@ class EditableTargetTests(unittest.TestCase):
                     editable=True, editable_target=CHECKOUT_A
                 ),
                 installed_metadata(
-                    lib_dir="D:/py/user/Lib/site-packages",
+                    lib_dir=USER_LIB_DIR,
                     editable=True,
                     editable_target=CHECKOUT,
                 ),
@@ -460,7 +562,7 @@ class EditableTargetTests(unittest.TestCase):
     def test_a_sibling_checkout_sharing_a_name_prefix_is_not_inside(self):
         # relinkra-shadow must never be read as a child of relinkra.
         self.assertFalse(ir._within(CHECKOUT_B + "/relinkra", CHECKOUT))
-        self.assertFalse(ir._within("C:/work/relinkra2", CHECKOUT))
+        self.assertFalse(ir._within(CHECKOUT + "2", CHECKOUT))
 
     def test_the_shadow_condition_is_not_double_reported_on_a_mismatch(self):
         # A mismatch is its own condition; folding it into
@@ -492,9 +594,9 @@ class EditableTargetTests(unittest.TestCase):
     def test_editable_target_count_is_bounded(self):
         flood = tuple(
             installed_metadata(
-                lib_dir=f"C:/lib{index}",
+                lib_dir=f"{_ROOT}/lib{index}",
                 editable=True,
-                editable_target=f"C:/work/target{index}",
+                editable_target=f"{_ROOT}/work/target{index}",
             )
             for index in range(ir.MAX_EDITABLE_TARGETS + 6)
         )
@@ -595,11 +697,11 @@ class DirectUrlParsingTests(unittest.TestCase):
 
     def test_target_dedupe_folds_duplicates_and_is_bounded(self):
         values = [
-            "C:/work/relinkra",
-            "C:/work/relinkra",
-            "C:/work/relinkra/",
+            CHECKOUT,
+            CHECKOUT,
+            CHECKOUT + "/",
         ] + [
-            f"C:/work/target{index}"
+            f"{_ROOT}/work/target{index}"
             for index in range(ir.MAX_EDITABLE_TARGETS + 6)
         ]
         bounded = ir._unique_paths(values, ir.MAX_EDITABLE_TARGETS)
@@ -618,7 +720,7 @@ class DirectUrlParsingTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX path semantics only")
         self.assertFalse(
-            ir._within("C:/Work/Relinkra/relinkra", "c:/work/relinkra")
+            ir._within("/Work/Relinkra/relinkra", "/work/relinkra")
         )
 
 
@@ -652,8 +754,22 @@ class EditableMetadataProbeTests(unittest.TestCase):
             )
             metadata = self._probe(lib)
             self.assertTrue(metadata.editable)
+            # The product compares RESOLVED observations on both sides: the
+            # imported root is resolved from the live module file, and the
+            # editable target is resolved from the PEP 610 URL when the
+            # document is read. The expected side must be canonicalized the
+            # same way — a runner whose TEMP carries an 8.3 short name
+            # (a "RUNNER~1"-style tilde name, as in GitHub's hosted image)
+            # would otherwise compare a short-named path against the
+            # long-named resolved target and see no match.
             self.assertTrue(
-                ir._within(str(project / "relinkra"), metadata.editable_target)
+                ir._within(
+                    ir._resolved(str(project / "relinkra")),
+                    metadata.editable_target,
+                )
+            )
+            self.assertTrue(
+                ir._same(ir._resolved(str(project)), metadata.editable_target)
             )
 
     def test_f_a_unicode_target_path_round_trips(self):
@@ -672,8 +788,18 @@ class EditableMetadataProbeTests(unittest.TestCase):
             )
             metadata = self._probe(lib)
             self.assertTrue(metadata.editable)
+            # Same canonicalization contract as the spaces case above: the
+            # Unicode characters survive the URI round trip, and only the
+            # host-side resolve() of the expectation (short names, symlinked
+            # temp roots) may differ from the raw temp path.
             self.assertTrue(
-                ir._within(str(project / "relinkra"), metadata.editable_target)
+                ir._within(
+                    ir._resolved(str(project / "relinkra")),
+                    metadata.editable_target,
+                )
+            )
+            self.assertTrue(
+                ir._same(ir._resolved(str(project)), metadata.editable_target)
             )
 
     def test_d_a_malformed_document_is_not_editable_evidence(self):
@@ -737,7 +863,7 @@ class ConsoleScriptTests(unittest.TestCase):
             lib_metadata=(installed_metadata(),),
             expected_script_present=True,
             which=None,
-            environ={"PATH": "C:/Windows"},
+            environ={"PATH": UNRELATED_DIR},
         )
         self.assertEqual(resolution.cli_status, ir.CLI_PRESENT_NOT_ON_PATH)
         self.assertIn(ir.CONDITION_CLI_NOT_ON_PATH, resolution.conditions)
@@ -776,7 +902,7 @@ class ConsoleScriptTests(unittest.TestCase):
             lib_metadata=(installed_metadata(),),
             expected_script_present=False,
             which=None,
-            environ={"PATH": "C:/Windows"},
+            environ={"PATH": UNRELATED_DIR},
         )
         self.assertEqual(resolution.cli_status, ir.CLI_ABSENT)
         self.assertIn(ir.CONDITION_CLI_MISSING, resolution.conditions)
@@ -828,12 +954,12 @@ class ExplicitNoScriptDirectoryTests(unittest.TestCase):
         resolution = ir.classify_install(
             ir.InstallEvidence(
                 imported_root=CHECKOUT,
-                interpreter="C:/py/python.exe",
+                interpreter=_ROOT + "/py/python.exe",
                 interpreter_version="3.14.6",
                 lib_dirs=(LIB_DIR,),
                 scripts_dir=None,
                 user_scripts_dir=None,
-                cwd="C:/tmp",
+                cwd=TMP_DIR,
                 expected_script_present=False,
                 checkout_evidence=True,
             )
@@ -889,7 +1015,7 @@ class ProbingTests(unittest.TestCase):
             (dist_info / "direct_url.json").write_text(
                 json.dumps(
                     {
-                        "url": "file:///work/relinkra",
+                        "url": Path(CHECKOUT).as_uri(),
                         "dir_info": {"editable": True},
                     }
                 ),
@@ -904,7 +1030,7 @@ class ProbingTests(unittest.TestCase):
             dist_info = Path(tmp) / "relinkra-0.1.4.dist-info"
             dist_info.mkdir()
             (dist_info / "direct_url.json").write_text(
-                json.dumps({"url": "file:///work/relinkra"}),
+                json.dumps({"url": Path(CHECKOUT).as_uri()}),
                 encoding="utf-8",
             )
             found = ir._probe_lib_metadata([tmp])
@@ -932,7 +1058,7 @@ class ProbingTests(unittest.TestCase):
             self.assertFalse(ir._checkout_evidence(None))
 
     def test_unreadable_metadata_directory_is_not_evidence(self):
-        missing = "C:/definitely/not/here"
+        missing = _ROOT + "/definitely/not/here"
         self.assertEqual(ir._probe_lib_metadata([missing]), ())
 
     def test_version_reader_stops_at_the_header_block(self):
@@ -950,7 +1076,7 @@ class ProbingTests(unittest.TestCase):
 
     def test_version_reader_returns_none_on_garbage_input(self):
         self.assertIsNone(ir.read_metadata_version(None, ir.SHAPE_DIST_INFO))
-        self.assertIsNone(ir.read_metadata_version("C:/nope", "unknown"))
+        self.assertIsNone(ir.read_metadata_version(_ROOT + "/nope", "unknown"))
 
     def test_oversized_metadata_is_refused_rather_than_read(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1019,20 +1145,20 @@ class PortableOutputTests(unittest.TestCase):
             environ={"PYTHONPATH": CHECKOUT},
         )
         local = resolution.local_paths()
-        # Reported in the native form, which is the form the operator can
-        # actually paste into a shell on this machine.
-        self.assertEqual(local["package_origin"], str(Path(CHECKOUT)))
+        # Reported in the native resolved form, which is the form the
+        # operator can actually paste into a shell on this machine.
+        self.assertEqual(local["package_origin"], ir._resolved(CHECKOUT))
         self.assertEqual(
-            local["expected_scripts_dir"], str(Path(SCRIPTS_DIR))
+            local["expected_scripts_dir"], ir._resolved(SCRIPTS_DIR)
         )
         # PYTHONPATH entries are echoed verbatim, not normalized: the
         # operator has to find that exact string in their environment.
         self.assertEqual(local["pythonpath"], [CHECKOUT])
 
     def test_local_paths_bounds_the_pythonpath_it_reports(self):
-        long_entry = "C:/" + ("p" * (ir.MAX_LOCAL_PATH_CHARS * 3))
+        long_entry = _ROOT + "/" + ("p" * (ir.MAX_LOCAL_PATH_CHARS * 3))
         entries = os.pathsep.join(
-            [f"C:/entry{index}" for index in range(ir.MAX_LOCAL_PATHS + 6)]
+            [f"{_ROOT}/entry{index}" for index in range(ir.MAX_LOCAL_PATHS + 6)]
             + [long_entry]
         )
         resolution = classify(environ={"PYTHONPATH": entries})
@@ -1043,7 +1169,7 @@ class PortableOutputTests(unittest.TestCase):
 
     def test_pythonpath_scan_is_bounded(self):
         flood = os.pathsep.join(
-            f"C:/p{index}" for index in range(ir.MAX_PYTHONPATH_ENTRIES + 50)
+            f"{_ROOT}/p{index}" for index in range(ir.MAX_PYTHONPATH_ENTRIES + 50)
         )
         self.assertEqual(
             len(ir._pythonpath_entries(flood)), ir.MAX_PYTHONPATH_ENTRIES
@@ -1051,9 +1177,9 @@ class PortableOutputTests(unittest.TestCase):
 
     def test_path_scan_is_bounded(self):
         flood = os.pathsep.join(
-            f"C:/b{index}" for index in range(ir.MAX_PATH_ENTRIES + 50)
+            f"{_ROOT}/b{index}" for index in range(ir.MAX_PATH_ENTRIES + 50)
         )
-        self.assertFalse(ir._path_contains(flood, "C:/elsewhere"))
+        self.assertFalse(ir._path_contains(flood, f"{_ROOT}/elsewhere"))
 
     def test_library_probe_is_bounded_per_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1098,7 +1224,7 @@ class InstallCheckRenderingTests(unittest.TestCase):
                 lib_metadata=(installed_metadata(),),
                 expected_script_present=True,
                 which=None,
-                environ={"PATH": "C:/Windows"},
+                environ={"PATH": UNRELATED_DIR},
             ),
             classify(
                 imported_file=INSTALLED_FILE,
@@ -1284,7 +1410,7 @@ class MalformedMetadataTests(unittest.TestCase):
             imported_file=CHECKOUT_FILE,
             lib_dirs=(LIB_DIR,),
             distribution_lookup=lambda name: document,
-            cwd="C:/tmp",
+            cwd=TMP_DIR,
             environ={},
             which=lambda name: None,
             expected_script_present=False,
