@@ -187,8 +187,14 @@ def _scan_workflow_security(workflows: List[Path]) -> Dict[str, bool]:
 
 
 def collect_ci_and_security() -> Dict[str, Any]:
+    """CI presence plus the static workflow security scan.
+
+    Workflow discovery is owned by ``ci_pin_policy.workflow_files`` so
+    the SECURITY scan sees the same ``*.yml`` and ``*.yaml`` files that
+    the pin policy scans: a mutable ref in either extension must block.
+    """
     workflows_dir = REPO_ROOT / ".github" / "workflows"
-    workflows = sorted(workflows_dir.glob("*.yml")) if workflows_dir.is_dir() else []
+    workflows = ci_pin_policy.workflow_files(workflows_dir)
     present = bool(workflows)
     ci = {"workflows_present": present, "remote_runs_passed": None}
     if present:

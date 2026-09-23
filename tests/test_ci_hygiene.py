@@ -528,6 +528,149 @@ class ActionPinPolicyAudit(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# (d3) Fail-closed bypass battery (M8R)
+# ---------------------------------------------------------------------------
+
+
+class ActionPinPolicyBypassAudit(unittest.TestCase):
+    """Valid YAML forms that previously escaped the line scanner (M8R).
+
+    Every case is either an executable ``uses:`` key in syntax the old
+    scanner skipped, or an unclassifiable construct: all of them must
+    produce a violation, and none may vanish from the reference count.
+    """
+
+    SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+    def _scan(self, text: str):
+        return ci_pin_policy.scan_text(text, path="x.yml")
+
+    def _refs(self, text: str):
+        return [value for _line, value in ci_pin_policy.iter_uses(text)]
+
+    def _assert_rejected(self, text: str):
+        violations = self._scan(text)
+        self.assertTrue(violations, f"no violation for:\n{text}")
+        self.assertTrue(
+            self._refs(text),
+            f"the reference vanished from the scan entirely:\n{text}",
+        )
+        return violations
+
+    def _assert_accepted_once(self, text: str, value: str) -> None:
+        violations = self._scan(text)
+        self.assertEqual(
+            violations, [], ci_pin_policy.format_violations(violations)
+        )
+        self.assertEqual(self._refs(text), [value])
+
+    def test_flow_mapping_mutable_ref_is_rejected(self):
+        for text in (
+            "      - { uses: actions/checkout@v7 }\n",
+            "      - { name: Checkout, uses: actions/checkout@v7 }\n",
+        ):
+            with self.subTest(text=text):
+                violations = self._assert_rejected(text)
+                self.assertEqual(
+                    [violation.uses for violation in violations],
+                    ["actions/checkout@v7"],
+                )
+
+    def test_flow_sequence_mutable_ref_is_rejected(self):
+        text = "      steps: [{ uses: actions/checkout@v7 }]\n"
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].uses, "actions/checkout@v7")
+
+    def test_quoted_key_mutable_ref_is_rejected(self):
+        for key in ('"uses"', "'uses'"):
+            with self.subTest(key=key):
+                text = f"      - {key}: actions/checkout@v7\n"
+                violations = self._assert_rejected(text)
+                self.assertEqual(violations[0].uses, "actions/checkout@v7")
+
+    def test_spaced_colon_mutable_ref_is_rejected(self):
+        text = "      - uses : actions/checkout@v7\n"
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].uses, "actions/checkout@v7")
+
+    def test_block_scalar_uses_value_fails_closed(self):
+        text = "      - uses: |-\n          actions/checkout@v7\n"
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].line, 1)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_unclosed_flow_uses_value_fails_closed(self):
+        text = "      - { uses:\n          actions/checkout@v7 }\n"
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].line, 1)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_explicit_key_uses_fails_closed(self):
+        text = "      - ? uses\n        : actions/checkout@v7\n"
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].line, 1)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_quoted_value_with_trailing_content_fails_closed(self):
+        text = f'      - uses: "{self.SHA}"@v7\n'
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_single_quote_escape_keeps_the_complete_value(self):
+        # The semantic YAML value is "<SHA>'@v7": accepting the clean
+        # "<SHA>" prefix would be a fail-open truncation.
+        text = f"      - uses: '{self.SHA}''@v7'\n"
+        violations = self._assert_rejected(text)
+        self.assertIn("'@v7", violations[0].uses)
+
+    def test_plain_scalar_continuation_fails_closed(self):
+        text = (
+            f"      - uses: actions/checkout@{self.SHA}\n"
+            "          @v7\n"
+        )
+        violations = self._assert_rejected(text)
+        self.assertEqual(violations[0].uses, "")
+
+    def test_flow_style_pinned_refs_are_accepted_and_counted(self):
+        for text in (
+            f"      - {{ uses: actions/checkout@{self.SHA} }}\n",
+            f"      steps: [{{ uses: actions/checkout@{self.SHA} }}]\n",
+            f"      - {{ name: Checkout, uses: actions/checkout@{self.SHA} }}\n",
+        ):
+            with self.subTest(text=text):
+                self._assert_accepted_once(
+                    text, f"actions/checkout@{self.SHA}"
+                )
+
+    def test_quoted_and_spaced_keys_accept_pins(self):
+        for text in (
+            f'      - "uses": actions/checkout@{self.SHA}\n',
+            f"      - 'uses': actions/checkout@{self.SHA}\n",
+            f"      - uses : actions/checkout@{self.SHA}\n",
+        ):
+            with self.subTest(text=text):
+                self._assert_accepted_once(
+                    text, f"actions/checkout@{self.SHA}"
+                )
+
+    def test_false_positive_controls_stay_clean(self):
+        text = (
+            "env:\n"
+            "  MY_USES: actions/checkout@v4\n"
+            "  USES: actions/checkout@v4\n"
+            "steps:\n"
+            "  - name: uses\n"
+            '  - run: echo "{ uses: owner/action@v4 }"\n'
+            '  - { os: ubuntu-latest, python: "3.9" }\n'
+            '  - shell: "echo uses: owner/action@main"\n'
+        )
+        violations = self._scan(text)
+        self.assertEqual(
+            violations, [], ci_pin_policy.format_violations(violations)
+        )
+
+
+# ---------------------------------------------------------------------------
 # (e) Workflow structural contract
 # ---------------------------------------------------------------------------
 

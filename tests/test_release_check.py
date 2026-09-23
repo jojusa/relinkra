@@ -266,5 +266,87 @@ class ReportTextTests(unittest.TestCase):
         self.assertIn("INSTALLED_CLI_MCP: PARTIAL", text)
 
 
+class WorkflowDiscoveryTests(unittest.TestCase):
+    """The release SECURITY scan must cover *.yml and *.yaml workflows.
+
+    Discovery is shared with the pin policy (ci_pin_policy.workflow_files);
+    a mutable ref in either extension must block the SECURITY gate, not
+    only the one the release check used to glob for.
+    """
+
+    PINNED = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="relinkra-wf-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.workflows = self.root / ".github" / "workflows"
+        self.workflows.mkdir(parents=True)
+        original = release_check.REPO_ROOT
+        release_check.REPO_ROOT = self.root
+        self.addCleanup(setattr, release_check, "REPO_ROOT", original)
+
+    def _write_workflow(self, name, *step_lines):
+        body = "".join(f"{line}\n" for line in step_lines)
+        (self.workflows / name).write_text(
+            "name: fixture\n"
+            "on: push\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            f"{body}",
+            encoding="utf-8",
+        )
+
+    def _security(self):
+        return release_check.collect_ci_and_security()["security"]
+
+    def _gate(self, security):
+        report = release_gates.evaluate_gates({"security": security})
+        return next(gate for gate in report.gates if gate.name == "SECURITY")
+
+    def test_mutable_ref_in_yaml_blocks_the_security_gate(self):
+        self._write_workflow("evil.yaml", "      - uses: actions/checkout@v7")
+        security = self._security()
+        self.assertFalse(security["actions_pinned"])
+        self.assertEqual(self._gate(security).status.value, "BLOCKED")
+
+    def test_flow_style_mutable_ref_in_yml_blocks_the_security_gate(self):
+        self._write_workflow(
+            "evil.yml", "      - { uses: actions/checkout@v7 }"
+        )
+        security = self._security()
+        self.assertFalse(security["actions_pinned"])
+        self.assertEqual(self._gate(security).status.value, "BLOCKED")
+
+    def test_pinned_ref_in_yaml_passes(self):
+        self._write_workflow(
+            "good.yaml", f"      - uses: actions/checkout@{self.PINNED}"
+        )
+        security = self._security()
+        self.assertTrue(security["actions_pinned"])
+        self.assertEqual(self._gate(security).status.value, "PASS")
+
+    def test_yaml_only_directory_is_discovered(self):
+        self._write_workflow(
+            "only.yaml", f"      - uses: actions/checkout@{self.PINNED}"
+        )
+        evidence = release_check.collect_ci_and_security()
+        self.assertTrue(evidence["ci"]["workflows_present"])
+        self.assertTrue(evidence["security"]["actions_pinned"])
+
+    def test_pinned_yml_does_not_mask_a_mutable_yaml(self):
+        self._write_workflow(
+            "good.yml", f"      - uses: actions/checkout@{self.PINNED}"
+        )
+        self._write_workflow("evil.yaml", "      - uses: actions/checkout@v7")
+        security = self._security()
+        self.assertFalse(security["actions_pinned"])
+        self.assertEqual(self._gate(security).status.value, "BLOCKED")
+
+
 if __name__ == "__main__":
     unittest.main()
