@@ -3,6 +3,52 @@
 All notable changes to Relinkra are documented here. The format is a
 lightweight take on [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.1.5 — 2026-09-23
+
+### Changed
+
+- Effective identity consistency: MCP request handling now honors the
+  effective workspace/project identity (resolved workspace root or
+  explicitly bound project) instead of relying only on path-derived
+  defaults, so runtime answers stay consistent across MCP and runtime
+  surfaces.
+- Structural provenance: code facts (symbols, relationships, structural
+  evidence) are bound to the effective project identity before they are
+  reported, strengthening provenance and preventing facts from being
+  attributed to the wrong project.
+- Engram transport: bounded and hardened the Engram adapter with explicit
+  provenance (payload size limits, structured failure handling) so memory
+  transport cannot grow unbounded or silently drop evidence.
+- Viewer concurrency: concurrent provider work in the local read-only
+  viewer is bounded (semaphore-guarded), capping simultaneous work instead
+  of unbounded fan-out.
+- Install/source/PATH diagnostics: the CLI now reports which code path is
+  running (source vs installed) under which interpreter, with clearer
+  PATH and resolution diagnostics.
+- CI/build provenance: all external GitHub Actions refs are pinned to full
+  commit SHAs and release/build evidence carries artifact revision/hash
+  checks (pin-policy enforcement included).
+
+### Fixed
+
+- Memory id rendering: hostile legacy/raw memory ids cannot break out of
+  Markdown structure in ContextPacket output or `--explain` summaries —
+  rendered inertly without rewriting identity.
+- `redact_text`: linearized and bounded redaction work on adversarial
+  large inputs so cost stays linear and bounded.
+- Editable install mismatch: detects when the import origin does not
+  match the editable install target and reports it explicitly.
+- Malformed distribution metadata: tolerates malformed package metadata
+  fail-honestly (explicit diagnostic instead of a crash or a silent wrong
+  answer).
+
+### Documentation
+
+- Clarified `context_get` read-only semantics: authoritative state is
+  unchanged by `context_get`; bounded observability writes (metrics and
+  runtime evidence, best-effort) are explicitly out of authoritative
+  scope.
+
 ## 0.1.4 — 2026-09-15
 
 ### Added

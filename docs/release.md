@@ -6,7 +6,7 @@ evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.4 is the current release.** Windows
+> **Status: 0.1.5 release-preparation candidate; not yet published.** Windows
 > is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
@@ -55,8 +55,8 @@ digests as external evidence:
 ```bash
 python -m build
 python tools/artifact_checks.py \
-  dist/relinkra-0.1.4-py3-none-any.whl dist/relinkra-0.1.4.tar.gz
-cd dist && sha256sum relinkra-0.1.4-py3-none-any.whl relinkra-0.1.4.tar.gz
+  dist/relinkra-0.1.5-py3-none-any.whl dist/relinkra-0.1.5.tar.gz
+cd dist && sha256sum relinkra-0.1.5-py3-none-any.whl relinkra-0.1.5.tar.gz
 ```
 
 The provenance boundary is the artifact SHA-256 plus the exact release Git
@@ -349,7 +349,7 @@ python tools/run_core_tests.py --list   # show included/excluded inventory
 python -m build
 python tools/artifact_checks.py dist/*   # bash; on PowerShell pass
 # explicit paths — PowerShell does not expand the glob:
-# python tools/artifact_checks.py dist/relinkra-0.1.4-py3-none-any.whl dist/relinkra-0.1.4.tar.gz
+# python tools/artifact_checks.py dist/relinkra-0.1.5-py3-none-any.whl dist/relinkra-0.1.5.tar.gz
 
 # Bounded release check (collectors only — fast, read-only)
 python tools/release_check.py --json
@@ -365,14 +365,14 @@ python tools/release_check.py --evidence external.json --require rc
 # retain and supply their CLI/MCP results under the external `installed` key.
 # release_check does not collect installed CLI/MCP evidence.
 # bash:
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.4-py3-none-any.whl \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.5-py3-none-any.whl \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.4.tar.gz \
+RELINKRA_E2E_ARTIFACT=/path/to/relinkra-0.1.5.tar.gz \
   python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 # PowerShell equivalents:
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.4-py3-none-any.whl"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.5-py3-none-any.whl"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_install_e2e.py" -q
-# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.4.tar.gz"
+# $env:RELINKRA_E2E_ARTIFACT = "C:\path\to\relinkra-0.1.5.tar.gz"
 # python -W error::ResourceWarning -m unittest discover -s tests -p "test_sdist_install_e2e.py" -q
 ```
 
@@ -416,7 +416,7 @@ RC realism rehearsal, not a release.
 
 ## Versioning policy
 
-- The source version is **0.1.4**. The version is single-sourced in
+- The source version is **0.1.5**. The version is single-sourced in
   `relinkra/__init__.py`
   (`__version__`); `pyproject.toml` reads it dynamically
   (`version = { attr = "relinkra.__version__" }`), guarded by

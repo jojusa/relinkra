@@ -82,7 +82,7 @@ class PyprojectTests(unittest.TestCase):
     def test_version_is_dynamic_and_single_sourced(self):
         dynamic = self.data["tool"]["setuptools"]["dynamic"]["version"]
         self.assertEqual(dynamic, {"attr": "relinkra.__version__"})
-        self.assertEqual(relinkra.__version__, "0.1.4")
+        self.assertEqual(relinkra.__version__, "0.1.5")
         self.assertRegex(relinkra.__version__, VERSION_PATTERN)
 
     def test_version_pattern_policy_table(self):
@@ -217,7 +217,7 @@ class VersionCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
         self.assertEqual(set(payload), self.EXPECTED_KEYS)
-        self.assertEqual(payload["relinkra_version"], "0.1.4")
+        self.assertEqual(payload["relinkra_version"], "0.1.5")
         self.assertEqual(payload["install_mode"], "source")
         self.assertIsNone(payload["installed_metadata_version"])
         self.assertIsNone(payload["metadata_version_consistent"])
@@ -231,9 +231,9 @@ class VersionCommandTests(unittest.TestCase):
         class FakeDistribution:
             files = (
                 Path("relinkra/product_cli.py"),
-                Path("relinkra-0.1.4.dist-info/METADATA"),
+                Path("relinkra-0.1.5.dist-info/METADATA"),
             )
-            version = "0.1.4"
+            version = "0.1.5"
 
             @staticmethod
             def locate_file(name):
@@ -249,7 +249,7 @@ class VersionCommandTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
         self.assertEqual(payload["install_mode"], "installed")
-        self.assertEqual(payload["installed_metadata_version"], "0.1.4")
+        self.assertEqual(payload["installed_metadata_version"], "0.1.5")
         self.assertTrue(payload["metadata_version_consistent"])
 
     def test_wheel_metadata_mismatch_is_explicit(self):
