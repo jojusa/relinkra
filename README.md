@@ -44,10 +44,12 @@ overhead (see [Performance and scope](#performance-and-scope)).
 
 ## Release status
 
-Relinkra **0.1.5** is the release-preparation candidate in this source
-tree; it is not yet published. **0.1.4** remains the current stable
-release — install it with `pip install relinkra`; maintainers and
-testers can exercise the 0.1.5 candidate from a source checkout
+Relinkra **0.1.5** is the current stable public release, available on
+[PyPI](https://pypi.org/project/relinkra/0.1.5/). Install it with
+`pip install relinkra` (or `pip install relinkra==0.1.5` to pin). The
+tagged release is
+[v0.1.5](https://github.com/jojusa/relinkra/releases/tag/v0.1.5);
+maintainers and contributors can still use a source checkout
 (see [Contributing](CONTRIBUTING.md)).
 
 Requirements: Python 3.9 or newer and Git. Zero runtime dependencies.
@@ -473,8 +475,7 @@ validation step is Kisouma dogfood.
 
 ## Platform and release truth
 
-- Version **0.1.5** is the release-preparation candidate in this source
-  tree; **0.1.4** remains the current stable release on PyPI.
+- Version **0.1.5** is the current stable public release on PyPI.
 - Windows is certified for the product. Linux and macOS have CI coverage, but
   exact-SHA/product certification language remains limited to the evidence
   available for each platform.

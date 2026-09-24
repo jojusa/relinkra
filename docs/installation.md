@@ -1,9 +1,8 @@
 # Install Relinkra
 
 Relinkra gives coding agents an orchestration and context layer without
-replacing their native tools. The current release-preparation candidate
-is **0.1.5** (source tree, not yet published); the current stable
-release is **0.1.4**.
+replacing their native tools. The current stable release is **0.1.5**,
+published on [PyPI](https://pypi.org/project/relinkra/0.1.5/).
 
 ## Quick path
 

@@ -6,7 +6,9 @@ evidence, and what remains open after publication. This document
 describes the verification work delivered in work units R5B, R5C, and
 R5D.
 
-> **Status: 0.1.5 release-preparation candidate; not yet published.** Windows
+> **Status: 0.1.5 is published** on [PyPI](https://pypi.org/project/relinkra/0.1.5/)
+> (tag [v0.1.5](https://github.com/jojusa/relinkra/releases/tag/v0.1.5), release
+> commit `24b2df49b33246ee16c5ece0ae8672dc62373c0a`). Windows
 > is currently certified. Linux/macOS
 > exact-SHA certification and hosted-CI exact-SHA evidence are pending;
 > runner quota/billing availability is infrastructure evidence, not a product
